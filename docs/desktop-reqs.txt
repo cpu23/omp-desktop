@@ -1,0 +1,14 @@
+omp desktop requirements:
+1. preserve the cli/tui of omp, only have gui around it, also be version agnostic, so updates are unlikely to break everything
+2. window/session split 2 and 4 ways, side by side and top and bottom
+3. remote access and syncing via the mobile web app
+4. persistent sessions when computer is restarted or app is closed. it preserves the open sessions
+5. create new sessions with 1 click, also syncs with mobile and shows up in the sidebar
+6. session auto unload after inactivity period (given no background tasks running)), state is cached so it can resume but otherwise it frees up ram
+7. session scrolling with a scroll bar
+8. tabs that cant be dragged around or to replace a side by side pane or a top session selector to swap in and out to reorganise the layout
+9. an issue i face with the current zellij setup is that model roles and also updates, when changed/done in a session dont propogate unless omp sessions are restarted, could implement an auto restart of that session if its idle.
+10. image/screenshot pasted viewing
+11. notifications only when final response is delivered (not tool call based)
+12. visual indications when a session is working like omp mobile
+13.

@@ -1,0 +1,91 @@
+:root {
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+  background: #101014;
+  color: #e8e8ec;
+  font: 13px/1.45 system-ui, "Segoe UI", sans-serif;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 34px;
+  flex: 0 0 auto;
+  padding: 0 12px;
+  background: #17171d;
+  border-bottom: 1px solid #26262e;
+  user-select: none;
+}
+
+.brand {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+#session,
+.muted {
+  color: #8b8b96;
+  font-variant-numeric: tabular-nums;
+}
+
+.spacer {
+  flex: 1;
+}
+
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #8b8b96;
+}
+
+.status::before {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #6b7280;
+}
+
+.status[data-kind="ok"]::before {
+  background: #4ade80;
+}
+
+.status[data-kind="warn"]::before {
+  background: #fbbf24;
+}
+
+#term {
+  flex: 1;
+  min-height: 0;
+  padding: 6px 0 0 8px;
+  overflow: hidden;
+}
+
+#term .xterm {
+  height: 100%;
+}
+
+#term .xterm-viewport::-webkit-scrollbar {
+  width: 10px;
+}
+
+#term .xterm-viewport::-webkit-scrollbar-thumb {
+  background: #3a3a44;
+  border-radius: 5px;
+}
