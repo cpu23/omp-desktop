@@ -46,8 +46,16 @@ terminal.
 `config/session.yml` is passed as `omp --config <file>`, a process-only overlay: the app must not edit the user's
 global `~/.omp/agent/config.yml` when their terminal shares those sessions. It sets `symbolPreset: nerd` because
 the `unicode` preset emits glyphs (U+29B8, emoji folders/images) that resolve to proportional or color-emoji faces
-and clip in a monospace cell; the app vendors `Symbols Nerd Font Mono` (`public/fonts/`) and serves it from
-`/fonts/`, so every PUA icon is one cell wide and `document.fonts`-gated before the first `fit()`.
+and clip in a monospace cell. The app vendors `JetBrainsMonoNerdFontMono-Regular.ttf` (`public/fonts/`, SIL OFL) and
+serves it from `/fonts/`, gated by `unicode-range` to the private-use planes: it is the **Mono** patch of a real base
+font, so its icons advance exactly one Hack cell (8.02px) and its ~8px ink sits inside that cell. Nerd Fonts'
+*Symbols-only* builds render icons at ~1em ink with a 1em advance, which overflowed and clipped in a 0.6em cell.
+`document.fonts` gates the first `fit()`, and a missing icon font is reported in the status chip instead of silently
+rendering non-mono fallbacks.
+
+The daemon serves its bundle with `cache-control: no-store` and publishes its hash at `/api/build`; the client polls
+that hash and reloads itself when it changes, and shows the hash in the pane header. Without this, a tab could keep
+running an old `client.js` after a daemon restart and make fixes look like they did nothing.
 
 ## Layout
 

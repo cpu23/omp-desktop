@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { basename, join } from "node:path";
 import { Runtime } from "./runtime";
 import { parseClientMessage, type ServerMessage } from "./protocol";
@@ -40,11 +41,18 @@ if (!clientBuild.success || !clientBundle) {
   process.exit(1);
 }
 
+const clientCode = await clientBundle.text();
+// Shown in the pane header and polled by the client: an open tab must notice a
+// daemon restart with new code, otherwise a stale bundle looks like "nothing
+// changed" (the pane is rebuilt on every daemon start).
+const BUILD = createHash("sha1").update(clientCode).digest("hex").slice(0, 7);
+const NO_STORE = { "cache-control": "no-store" };
+
 const assets = {
   index: await Bun.file(join(ROOT, "public/index.html")).text(),
   styles: await Bun.file(join(ROOT, "public/styles.css")).text(),
   xterm: await Bun.file(join(ROOT, "node_modules/@xterm/xterm/css/xterm.css")).text(),
-  client: await clientBundle.text(),
+  client: clientCode,
 };
 
 type WsData = { unsubData?: () => void; unsubExit?: () => void };
@@ -81,13 +89,23 @@ const server = Bun.serve<WsData>({
     if (url.pathname.startsWith("/fonts/")) return serveFont(url.pathname);
     switch (url.pathname) {
       case "/":
-        return new Response(assets.index, { headers: { "content-type": "text/html; charset=utf-8" } });
+        return new Response(assets.index, {
+          headers: { "content-type": "text/html; charset=utf-8", ...NO_STORE },
+        });
       case "/client.js":
-        return new Response(assets.client, { headers: { "content-type": "text/javascript; charset=utf-8" } });
+        return new Response(assets.client, {
+          headers: { "content-type": "text/javascript; charset=utf-8", ...NO_STORE },
+        });
       case "/styles.css":
-        return new Response(assets.styles, { headers: { "content-type": "text/css; charset=utf-8" } });
+        return new Response(assets.styles, {
+          headers: { "content-type": "text/css; charset=utf-8", ...NO_STORE },
+        });
       case "/xterm.css":
-        return new Response(assets.xterm, { headers: { "content-type": "text/css; charset=utf-8" } });
+        return new Response(assets.xterm, {
+          headers: { "content-type": "text/css; charset=utf-8", ...NO_STORE },
+        });
+      case "/api/build":
+        return Response.json({ build: BUILD }, { headers: NO_STORE });
       case "/api/state":
         return Response.json({ runtime: runtime.info() });
       default:

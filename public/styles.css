@@ -1,8 +1,12 @@
-/* Vendored so the app does not depend on the host's fontconfig: same font omp's
-   nerd symbol preset expects for PUA icons, one cell wide. */
+/* Vendored so the app does not depend on the host's fontconfig or on a browser
+   that was started before the font was installed. Only the private-use ranges are
+   taken from it, so text keeps Hack's letterforms. The "Mono" patch advances icons
+   exactly like its base font (0.6em = one Hack cell); the Symbols-only font's 1em
+   advance and ~1em ink overflow a 0.6em cell, which clips and shifts icons. */
 @font-face {
-  font-family: "Symbols Nerd Font Mono";
-  src: url("/fonts/SymbolsNerdFontMono-Regular.ttf") format("truetype");
+  font-family: "JetBrainsMono Nerd Font Mono";
+  src: url("/fonts/JetBrainsMonoNerdFontMono-Regular.ttf") format("truetype");
+  unicode-range: U+E000-F8FF, U+F0000-FFFFD, U+100000-10FFFD;
   font-display: block;
   font-weight: 400;
   font-style: normal;

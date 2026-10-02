@@ -5,21 +5,23 @@ import type { ServerMessage } from "./protocol";
 
 const statusEl = document.getElementById("status") as HTMLElement;
 const sessionEl = document.getElementById("session") as HTMLElement;
+const buildEl = document.getElementById("build");
 const host = document.getElementById("term") as HTMLElement;
 
 // Cell geometry mirrors the Konsole profile these sessions normally run in: Hack
 // (Konsole's font is QFontDatabase::systemFont(FixedFont); both running Konsole
 // processes have Hack-Regular.ttf mapped) at 10pt = 13.33px, plus Konsole
 // LineSpacing=3, which its TerminalFont adds as pixels on top of the font height.
-// "Symbols Nerd Font Mono" supplies omp's nerd-preset PUA icons at exactly one cell
-// wide. Tune the terminal look here, nowhere else.
+// "JetBrainsMono Nerd Font Mono" (PUA-only via unicode-range) supplies omp's
+// nerd-preset icons at exactly one cell wide. Tune the terminal look here, nowhere
+// else.
 const CELL_SIZE = 13.33;
 const CELL_LINE_HEIGHT = 1.4;
 const CELL_MIN = 8;
 const CELL_MAX = 28;
 const CELL_KEY = "omp-desktop.cellSize";
 const FONT_STACK =
-  '"Hack", "DejaVu Sans Mono", "Symbols Nerd Font Mono", ui-monospace, SFMono-Regular, monospace';
+  '"Hack", "JetBrainsMono Nerd Font Mono", "DejaVu Sans Mono", ui-monospace, SFMono-Regular, monospace';
 
 function storedCellSize(): number {
   const raw = Number(localStorage.getItem(CELL_KEY));
@@ -50,7 +52,7 @@ host.addEventListener("mousedown", () => term.focus());
 // Never fit against fallback metrics: a pre-font fit leaves the bottom rows
 // clipped once the real cell height lands.
 const fontsReady = Promise.all(
-  ["Hack", "DejaVu Sans Mono", "Symbols Nerd Font Mono"].map((family) =>
+  ["Hack", "JetBrainsMono Nerd Font Mono", "DejaVu Sans Mono"].map((family) =>
     document.fonts.load(`${cellSize}px "${family}"`),
   ),
 );
@@ -62,6 +64,12 @@ void fontsReady.then(() => {
   fit.fit();
   sendResize(true);
   term.focus();
+  // A silent fallback to a non-mono face is what makes icons clip and drift, so
+  // surface it instead of rendering a mystery.
+  if (!document.fonts.check(`${cellSize}px "JetBrainsMono Nerd Font Mono"`, "\u{F1157}")) {
+    setStatus("icon font missing", "warn");
+    console.warn("omp-desktop: icon font did not load; omp's nerd icons will fall back to a non-mono face");
+  }
 });
 
 // Ctrl/Cmd +/-/0 zooms the cell (browser zoom is suppressed). Persisted so a size
@@ -85,6 +93,30 @@ window.addEventListener("keydown", (event) => {
 });
 
 let ws: WebSocket | null = null;
+
+// The daemon serves the bundle with no-store and publishes its hash here; a tab
+// holding an older bundle reloads itself, so stale code cannot masquerade as
+// "nothing changed" after a daemon restart.
+let loadedBuild = "";
+async function checkBuild(): Promise<void> {
+  try {
+    const res = await fetch("/api/build", { cache: "no-store" });
+    const { build } = (await res.json()) as { build: string };
+    if (!loadedBuild) {
+      loadedBuild = build;
+      if (buildEl) buildEl.textContent = build;
+      return;
+    }
+    if (build !== loadedBuild) location.reload();
+  } catch {
+    // daemon restarting: the websocket reconnect path reports that
+  }
+}
+window.setInterval(() => void checkBuild(), 10_000);
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) void checkBuild();
+});
+void checkBuild();
 
 function setStatus(text: string, kind: "ok" | "warn" | "idle"): void {
   statusEl.textContent = text;

@@ -92,6 +92,16 @@ async function bashRoundTrip(): Promise<void> {
     OMP_DESKTOP_OVERLAY: "",
   });
   try {
+    // A tab that keeps an old bundle after a daemon restart makes every fix look
+    // like "nothing changed": the bundle must be uncacheable and its identity
+    // must be published for the client's self-reload check.
+    const page = await fetch(`${BASE}/`);
+    const bundle = await fetch(`${BASE}/client.js`);
+    assert(page.headers.get("cache-control") === "no-store", "index is served no-store");
+    assert(bundle.headers.get("cache-control") === "no-store", "client bundle is served no-store");
+    const { build } = (await (await fetch(`${BASE}/api/build`)).json()) as { build: string };
+    assert(/^[0-9a-f]{7}$/.test(build), `daemon publishes its bundle hash (${build})`);
+
     const chunks: string[] = [];
     const ws = await openTerminal();
     ws.onmessage = (event) => {
