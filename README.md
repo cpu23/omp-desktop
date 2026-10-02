@@ -31,6 +31,23 @@ Environment:
 | `OMP_DESKTOP_CWD` | `$HOME` | working directory for the spawned session |
 | `OMP_DESKTOP_OMP` | `omp` | omp binary (overridable for tests) |
 | `OMP_DESKTOP_OMP_ARGS` | empty | extra args for the omp binary |
+| `OMP_DESKTOP_OVERLAY` | `config/session.yml` | per-process omp config overlay; empty string disables it |
+
+## Terminal look
+
+The pane is meant to sit next to a real Konsole, so it is tuned against that profile: **Hack** at 10pt (`13.33px`) —
+Konsole's font is `QFontDatabase::systemFont(FixedFont)` and both running Konsole processes on this machine have
+`Hack-Regular.ttf` mapped (the same map shows `NotoSansMath` and `NotoColorEmoji`, i.e. exactly the proportional
+fallbacks that clip inside a monospace cell) — plus Konsole's `LineSpacing=3`, which it applies as pixels on top of
+the font height, approximated with xterm.js `lineHeight: 1.4`. Constants live at the top of `src/client.ts`;
+`Ctrl/Cmd +`/`-`/`0` adjust the cell size live (persisted in `localStorage`) so it can be dialed in against the real
+terminal.
+
+`config/session.yml` is passed as `omp --config <file>`, a process-only overlay: the app must not edit the user's
+global `~/.omp/agent/config.yml` when their terminal shares those sessions. It sets `symbolPreset: nerd` because
+the `unicode` preset emits glyphs (U+29B8, emoji folders/images) that resolve to proportional or color-emoji faces
+and clip in a monospace cell; the app vendors `Symbols Nerd Font Mono` (`public/fonts/`) and serves it from
+`/fonts/`, so every PUA icon is one cell wide and `document.fonts`-gated before the first `fit()`.
 
 ## Layout
 

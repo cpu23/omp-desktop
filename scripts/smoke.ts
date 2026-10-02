@@ -89,6 +89,7 @@ async function bashRoundTrip(): Promise<void> {
     OMP_DESKTOP_OMP: "/bin/bash",
     OMP_DESKTOP_OMP_ARGS: "-i",
     OMP_DESKTOP_CWD: tmpdir(),
+    OMP_DESKTOP_OVERLAY: "",
   });
   try {
     const chunks: string[] = [];
@@ -114,11 +115,28 @@ async function ompFirstFrame(): Promise<void> {
   let pid: number | null = null;
   try {
     let bytes = 0;
+    const text: string[] = [];
+    const decoder = new TextDecoder();
     const ws = await openTerminal((total) => {
       bytes = total;
     });
+    ws.addEventListener("message", (event) => {
+      if (typeof event.data !== "string") {
+        text.push(decoder.decode(new Uint8Array(event.data as ArrayBuffer), { stream: true }));
+      }
+    });
     await waitFor(() => bytes >= 200, 25_000, "omp TUI output");
     assert(bytes >= 200, `omp painted its TUI through the daemon (${bytes} bytes)`);
+
+    // The app's overlay sets symbolPreset=nerd, so the status line carries
+    // private-use icons instead of Unicode symbols/emoji (which fall back to
+    // proportional fonts and clip in a terminal cell).
+    await waitFor(
+      () => /[\uE000-\uF8FF]|[\u{F0000}-\u{FFFFD}]/u.test(text.join("")),
+      25_000,
+      "nerd-font glyph in omp output",
+    );
+    assert(true, "omp renders private-use (nerd font) glyphs from the app overlay");
 
     type State = { runtime: { pid: number | null; cols: number; rows: number } };
     const state = (await (await fetch(`${BASE}/api/state`)).json()) as State;

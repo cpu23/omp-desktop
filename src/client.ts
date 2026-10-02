@@ -7,12 +7,33 @@ const statusEl = document.getElementById("status") as HTMLElement;
 const sessionEl = document.getElementById("session") as HTMLElement;
 const host = document.getElementById("term") as HTMLElement;
 
+// Cell geometry mirrors the Konsole profile these sessions normally run in: Hack
+// (Konsole's font is QFontDatabase::systemFont(FixedFont); both running Konsole
+// processes have Hack-Regular.ttf mapped) at 10pt = 13.33px, plus Konsole
+// LineSpacing=3, which its TerminalFont adds as pixels on top of the font height.
+// "Symbols Nerd Font Mono" supplies omp's nerd-preset PUA icons at exactly one cell
+// wide. Tune the terminal look here, nowhere else.
+const CELL_SIZE = 13.33;
+const CELL_LINE_HEIGHT = 1.4;
+const CELL_MIN = 8;
+const CELL_MAX = 28;
+const CELL_KEY = "omp-desktop.cellSize";
+const FONT_STACK =
+  '"Hack", "DejaVu Sans Mono", "Symbols Nerd Font Mono", ui-monospace, SFMono-Regular, monospace';
+
+function storedCellSize(): number {
+  const raw = Number(localStorage.getItem(CELL_KEY));
+  return Number.isFinite(raw) && raw >= CELL_MIN && raw <= CELL_MAX ? raw : CELL_SIZE;
+}
+let cellSize = storedCellSize();
+
 const term = new Terminal({
   allowProposedApi: true,
   cursorBlink: true,
   scrollback: 20_000,
-  fontSize: 13,
-  fontFamily: '"DejaVu Sans Mono", ui-monospace, SFMono-Regular, monospace',
+  fontSize: cellSize,
+  lineHeight: CELL_LINE_HEIGHT,
+  fontFamily: FONT_STACK,
   theme: {
     background: "#101014",
     foreground: "#e8e8ec",
@@ -24,9 +45,44 @@ const fit = new FitAddon();
 term.loadAddon(fit);
 term.loadAddon(new ImageAddon());
 term.open(host);
-fit.fit();
-term.focus();
 host.addEventListener("mousedown", () => term.focus());
+
+// Never fit against fallback metrics: a pre-font fit leaves the bottom rows
+// clipped once the real cell height lands.
+const fontsReady = Promise.all(
+  ["Hack", "DejaVu Sans Mono", "Symbols Nerd Font Mono"].map((family) =>
+    document.fonts.load(`${cellSize}px "${family}"`),
+  ),
+);
+document.fonts.addEventListener("loadingdone", () => {
+  fit.fit();
+  sendResize();
+});
+void fontsReady.then(() => {
+  fit.fit();
+  sendResize(true);
+  term.focus();
+});
+
+// Ctrl/Cmd +/-/0 zooms the cell (browser zoom is suppressed). Persisted so a size
+// dialed in against the real terminal survives reloads.
+function setCellSize(size: number): void {
+  cellSize = Math.min(CELL_MAX, Math.max(CELL_MIN, size));
+  localStorage.setItem(CELL_KEY, String(cellSize));
+  term.options.fontSize = cellSize;
+  fit.fit();
+  sendResize();
+}
+
+window.addEventListener("keydown", (event) => {
+  if (!(event.ctrlKey || event.metaKey)) return;
+  const key = event.key;
+  if (key === "=" || key === "+") setCellSize(cellSize + 1);
+  else if (key === "-" || key === "_") setCellSize(cellSize - 1);
+  else if (key === "0") setCellSize(CELL_SIZE);
+  else return;
+  event.preventDefault();
+});
 
 let ws: WebSocket | null = null;
 

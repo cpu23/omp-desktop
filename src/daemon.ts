@@ -1,4 +1,4 @@
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { Runtime } from "./runtime";
 import { parseClientMessage, type ServerMessage } from "./protocol";
 
@@ -8,11 +8,15 @@ const ROOT = join(import.meta.dir, "..");
 const OMP_BIN = process.env.OMP_DESKTOP_OMP ?? "omp";
 const OMP_ARGS = (process.env.OMP_DESKTOP_OMP_ARGS ?? "").split(" ").filter((part) => part.length > 0);
 const CWD = process.env.OMP_DESKTOP_CWD ?? process.env.HOME ?? process.cwd();
+const OMP_OVERLAY = process.env.OMP_DESKTOP_OVERLAY ?? join(ROOT, "config/session.yml");
+// Empty OMP_DESKTOP_OVERLAY disables the overlay: non-omp binaries (smoke test's
+// bash) reject unknown flags.
+const OVERLAY_ARGS = OMP_OVERLAY ? ["--config", OMP_OVERLAY] : [];
 
 const runtime = new Runtime({
   id: "main",
   file: OMP_BIN,
-  args: OMP_ARGS,
+  args: [...OVERLAY_ARGS, ...OMP_ARGS],
   cwd: CWD,
   cols: 120,
   rows: 32,
@@ -45,6 +49,27 @@ const assets = {
 
 type WsData = { unsubData?: () => void; unsubExit?: () => void };
 
+const FONT_DIR = join(ROOT, "public/fonts");
+const FONT_TYPES: Record<string, string> = {
+  ttf: "font/ttf",
+  otf: "font/otf",
+  woff: "font/woff",
+  woff2: "font/woff2",
+};
+
+async function serveFont(pathname: string): Promise<Response> {
+  const name = basename(decodeURIComponent(pathname));
+  const ext = name.slice(name.lastIndexOf(".") + 1).toLowerCase();
+  if (!/^[A-Za-z0-9._-]+$/.test(name) || !(ext in FONT_TYPES)) {
+    return new Response("bad font", { status: 400 });
+  }
+  const file = Bun.file(join(FONT_DIR, name));
+  if (!(await file.exists())) return new Response("not found", { status: 404 });
+  return new Response(file, {
+    headers: { "content-type": FONT_TYPES[ext], "cache-control": "public, max-age=86400" },
+  });
+}
+
 const server = Bun.serve<WsData>({
   hostname: HOST,
   port: PORT,
@@ -53,6 +78,7 @@ const server = Bun.serve<WsData>({
     if (url.pathname === "/ws/term") {
       return srv.upgrade(req, { data: {} }) ? undefined : new Response("upgrade failed", { status: 400 });
     }
+    if (url.pathname.startsWith("/fonts/")) return serveFont(url.pathname);
     switch (url.pathname) {
       case "/":
         return new Response(assets.index, { headers: { "content-type": "text/html; charset=utf-8" } });
