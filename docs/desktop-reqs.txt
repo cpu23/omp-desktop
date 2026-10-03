@@ -12,3 +12,78 @@ omp desktop requirements:
 11. notifications only when final response is delivered (not tool call based)
 12. visual indications when a session is working like omp mobile
 13.
+
+status 2026-10-02 — omp-desktop P1 (daemon + browser client), each "done" verified live in a browser
+against a running daemon, not from a spec:
+ 1. done — panes are real `omp` TUI processes on PTYs; nothing of the agent is re-implemented, the
+    client speaks ANSI bytes only, so omp updates cannot break the GUI.
+ 2. done — side-by-side first, then top/bottom once per column; 4 panes max in a 2x2 layout.
+ 3. not started — the client is a localhost webapp, so a phone on the LAN can already open it; layout
+    and session ownership still live in browser storage, which is the piece to move daemon-side first.
+ 4. done — pane bindings (runtime id, title, session file) persist and are restored on reload; after a
+    daemon or machine restart panes come back labelled with what they held and offer
+    "resume this session" in one click (verified: resume click -> new pid, same session file).
+ 5. done (desktop half) — "+ new session" button (no cwd box), sidebar lists live + saved sessions with search
+    and per-row pane ownership ("pane 2"); mobile sync is item 3.
+ 6. not started.
+ 7. done — 20k-line scrollback per pane with xterm's viewport scrollbar.
+ 8. done — drag a live/recent session from the sidebar onto any pane, drag a pane header onto another
+    pane to swap them, or use the per-pane session selector; all three verified with live processes
+    keeping their pids through the swap.
+ 9. not started — needs the daemon-side config watcher; the PTY is already the only thing to restart.
+10. done — pasting an image uploads the bytes (POST /api/paste), the daemon stores the file and the
+    pane types its path, so omp attaches it (verified: omp shows its "#1" attachment chip). omp then
+    renders images inline through the forced iTerm2 protocol + xterm addon-image.
+11. not started — omp-mobile's notifications.ts is the port source.
+12. done — per-pane dot and sidebar row dot: streaming / idle / exited, derived from the daemon's
+    byte-rate heuristic.
+13. (no requirement recorded)
+
+status 2026-10-02 (later, from live use in the browser):
+ 2. done+ — split dividers are draggable: ratios persist per split node and both terminals refit to the new
+    box (verified by dragging a row divider to 156/818px, after which the daemon reported sizes matching
+    the rendered grid: 56x42 at a 449px screen = 8.018px cells). Side-by-side is no longer fixed 50/50.
+ 5. done+ — sidebar rows show per-session cost when the session is priced (sum of every usage.cost.total,
+    same accounting as omp's get_session_stats; parsed once per mtime change). Unpriced models — the
+    codex subscription and local EXL3 models this machine's default roles use — show nothing, which is
+    also why omp's own status line has no cost segment for them: 43 of the 60 newest transcripts carry
+    cost, the ones in this repo's default workspace do not.
+ +) the app passes no config overlay any more. Panes run with the user's own ~/.omp/agent/config.yml, so
+    the CLI renders exactly as it does in Konsole. The previous forced `symbolPreset: nerd` was the source
+    of the status-line glyphs that read as wrong/floating.
+ +) daemon restart is a hard reset: session files survive and resume is one click, but live pane processes
+    are killed with the service (they are children in its cgroup). A graceful restart/adopt path is still
+    open work.
+
+status 2026-10-02 (density pass, driven by screenshots of live use):
+ 2. done+ — pane area is flush: no outer padding, square pane corners, no pane-body padding, so the terminal
+    grid starts at the pane border. The band left at a pane's right/bottom edge is whole-cell quantisation
+    plus the scrollbar reserve, not padding: after the fit fix below it measures 6px right and 7px bottom on a
+    672x448 host (one cell is 8.0x15.2px). App header is 34px; control sizes are mouse-scale throughout.
+ 5. done+ — the sidebar is one flat list: running sessions as grey cards on top, saved sessions as outline-only
+    cards, no LIVE/RECENT headers, no count chips, no cwd input; a running session never appears twice (its
+    transcript is dropped from the saved half by session file). No accent tint marks selection anywhere: the
+    pane-ownership fact is the row's meta text ("pane 2"), the focused pane's border is neutral, and the drop
+    target's is white. Session and connection indicator dots are removed entirely;
+    pane/process state remains available as text. Sidebar session costs are omitted.
+ 2/12. corrected — side-by-side panes now keep the same font size and fixed `lineHeight: 1`.
+    The previous exact-fill fit stretched each pane independently; geometry sweeps did not
+    establish that the user's visual issue was fixed. Whole-cell fitting now leaves the
+    remaining strip unused. The user's comparison images still showed seams with DOM rendering.
+    Panes now use WebGL custom box/block glyphs, verified visually in two connected sessions at
+    native 100% and 125% display scaling. GPU failure/context loss shows a visible DOM warning;
+    the fallback's font glyphs may still have seams. Inline PNG rendering also passed a browser smoke.
+  2. done+ — directory labels no longer have xterm's dashed OSC 8 file-link underline.
+    HTTP links and explicitly underlined transcript text are preserved, including fragmented input.
+    Terminal and chrome text now use bundled Hack regular/bold instead of separate text families
+    or host-dependent Hack availability. Browser measurements gave identical advances for narrow,
+    wide, and numeric text in both weights.
+
+status 2026-10-03 (sidebar controls):
+ +) sidebar collapses to a reopen strip and resizes by pointer or keyboard; width and
+    collapsed state persist in browser storage, terminals refit with available space.
+ +) Pin/Unpin keeps chats at the top, by transcript path across stop/resume; pinned
+    snapshots retain older chats beyond the recent-list limit. Pins remain searchable.
+ +) global OMP Desktop header and per-session PID labels are hidden; connection status
+    is at the sidebar bottom. Live rows use only a thin OMP-blue (#00b4ff) left edge.
+ +) sidebar and xterm v6 scrollbars match: 10px wide, 5px rounded grey thumb, same hover colour.

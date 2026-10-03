@@ -8,14 +8,62 @@
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
-    <header>
-      <span class="brand">omp desktop</span>
-      <span id="session" class="muted">main</span>
-      <span id="build" class="muted"></span>
-      <span class="spacer"></span>
-      <span id="status" class="status" data-kind="idle">connecting…</span>
-    </header>
-    <main id="term"></main>
+    <!-- No global chrome: the sidebar is the only app-level surface. #status sits
+         at its bottom so connection failures stay visible, and #build stays in the
+         DOM (hidden) for the client's bundle-reload check. The resizer and the
+         collapsed-state expand control are wired by src/sidebar.ts. -->
+    <div id="app">
+      <aside id="sidebar">
+        <div class="side-block side-search">
+          <input id="search" type="search" placeholder="search sessions…" autocomplete="off" spellcheck="false" />
+          <button
+            id="sidebar-collapse"
+            class="sidebar-toggle"
+            type="button"
+            title="Collapse sidebar"
+            aria-expanded="true"
+            aria-controls="sidebar"
+          >
+            «
+          </button>
+        </div>
+        <div class="side-block">
+          <button id="new-session" class="side-action" title="Start a new omp session in the focused pane">
+            + new session
+          </button>
+        </div>
+        <div id="session-list" class="side-list"></div>
+        <div class="side-status">
+          <span id="status" class="status" data-kind="idle">connecting…</span>
+        </div>
+      </aside>
+      <div
+        id="sidebar-resizer"
+        class="sidebar-resizer"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize sidebar"
+        aria-controls="sidebar"
+        aria-valuemin="190"
+        aria-valuemax="560"
+        aria-valuenow="278"
+        tabindex="0"
+        title="Drag to resize · double-click to reset"
+      ></div>
+      <button
+        id="sidebar-expand"
+        class="sidebar-expand"
+        type="button"
+        title="Expand sidebar"
+        aria-expanded="false"
+        aria-controls="sidebar"
+        hidden
+      >
+        »
+      </button>
+      <main id="panes"></main>
+    </div>
+    <span id="build" hidden></span>
     <script type="module" src="/client.js"></script>
   </body>
 </html>

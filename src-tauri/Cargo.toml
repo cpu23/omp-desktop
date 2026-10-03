@@ -1,0 +1,16 @@
+[package]
+name = "omp-desktop"
+version = "0.1.0"
+description = "Native shell for the omp-desktop daemon (Tauri 2 / WebKitGTK)"
+edition = "2021"
+publish = false
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-single-instance = "2"
+serde_json = "1"
+# Opens external links with the system default handler (xdg-open on Linux).
+open = "5"

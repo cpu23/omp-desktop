@@ -1,3 +1,35 @@
+/* Styling mirrors omp-mobile (omp-mobile/public/styles.css): same OLED palette,
+   same mono chrome, same card/button/input treatments. Deliberate deviations,
+   both about density rather than looks: control heights are scaled for a mouse
+   (mobile sizes exist for fingers) and the sidebar row card drops mobile's
+   hover lift so dense lists do not shimmer. Tokens below are copied verbatim
+   from the mobile stylesheet and should be updated together with it. */
+
+/* Mobile's UI/terminal font, vendored for the same reason as the nerd face
+   below: the look must not depend on what the host has installed. */
+@font-face {
+  font-family: "OMP DejaVu Mono";
+  src: url("/fonts/DejaVuSansMono.ttf") format("truetype");
+  font-display: swap;
+}
+
+/* Ship both text weights; do not rely on host fonts or synthesized bold. */
+@font-face {
+  font-family: "Hack";
+  src: url("/fonts/Hack-Regular.ttf") format("truetype");
+  font-display: block;
+  font-weight: 400;
+  font-style: normal;
+}
+
+@font-face {
+  font-family: "Hack";
+  src: url("/fonts/Hack-Bold.ttf") format("truetype");
+  font-display: block;
+  font-weight: 700;
+  font-style: normal;
+}
+
 /* Vendored so the app does not depend on the host's fontconfig or on a browser
    that was started before the font was installed. Only the private-use ranges are
    taken from it, so text keeps Hack's letterforms. The "Mono" patch advances icons
@@ -14,6 +46,28 @@
 
 :root {
   color-scheme: dark;
+  /* OLED: page and chrome drop to true black, surfaces sit in grey above it. */
+  --bg: #000000;
+  --panel: #0a0b0d;
+  --panel-soft: #121316;
+  --panel-raised: #1c1e22;
+  --line: #262a30;
+  --line-muted: #191c21;
+  --text: #e8ecf4;
+  --muted: #9ca3b0;
+  --dim: #6b7280;
+  --accent: #00b4ff;
+  --accent-strong: #0082b3;
+  /* Mobile splits these: --effort-accent paints focus rings and hover borders,
+     --accent is the session-selection colour. */
+  --effort-accent: #00b4ff;
+  --gold: #d4c090;
+  --success: #00ff88;
+  --warn: #ffb347;
+  --danger: #ff4757;
+  --mono:
+    "Hack", "OMP DejaVu Mono", "DejaVu Sans Mono", ui-monospace,
+    SFMono-Regular, Menlo, monospace;
 }
 
 * {
@@ -24,9 +78,9 @@ html,
 body {
   height: 100%;
   margin: 0;
-  background: #101014;
-  color: #e8e8ec;
-  font: 13px/1.45 system-ui, "Segoe UI", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.45 var(--mono);
 }
 
 body {
@@ -34,72 +88,628 @@ body {
   flex-direction: column;
 }
 
-header {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  height: 34px;
-  flex: 0 0 auto;
-  padding: 0 12px;
-  background: #17171d;
-  border-bottom: 1px solid #26262e;
-  user-select: none;
+button,
+input,
+textarea,
+select {
+  font: inherit;
+  color: inherit;
 }
 
-.brand {
-  font-weight: 600;
-  letter-spacing: 0.02em;
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--effort-accent);
+  outline-offset: 2px;
 }
 
-#session,
-.muted {
-  color: #8b8b96;
-  font-variant-numeric: tabular-nums;
-}
-
-.spacer {
-  flex: 1;
-}
-
-.status {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  color: #8b8b96;
-}
-
-.status::before {
-  content: "";
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: #6b7280;
-}
-
-.status[data-kind="ok"]::before {
-  background: #4ade80;
-}
-
-.status[data-kind="warn"]::before {
-  background: #fbbf24;
-}
-
-#term {
+#app {
   flex: 1;
   min-height: 0;
-  padding: 6px 0 0 8px;
+  display: flex;
+}
+
+/* Sidebar ---------------------------------------------------------------- */
+
+/* Width is a variable so src/sidebar.ts can resize without touching flex; the
+   278px fallback is the module's DEFAULT_WIDTH. */
+#sidebar {
+  flex: 0 0 var(--sidebar-w, 278px);
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border-right: 1px solid var(--line);
+  padding: 10px 10px 8px;
   overflow: hidden;
 }
 
-#term .xterm {
+#sidebar[hidden] {
+  display: none;
+}
+
+.side-block {
+  padding: 0 0 8px;
+}
+
+/* Search and its collapse button share a row; the input keeps the block width
+   minus the button. */
+.side-search {
+  display: flex;
+  gap: 6px;
+}
+
+.sidebar-toggle {
+  flex: 0 0 auto;
+  display: inline-grid;
+  place-items: center;
+  width: 30px;
+  padding: 0;
+  background: var(--panel-raised);
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  cursor: pointer;
+  font: 13px/1 var(--mono);
+  transition:
+    border-color 0.15s ease,
+    color 0.15s ease;
+}
+
+.sidebar-toggle:hover {
+  border-color: var(--dim);
+  color: var(--text);
+}
+
+.side-block input {
+  width: 100%;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 10px;
+  font: 12px var(--mono);
+  outline: 0;
+  transition: border-color 0.15s ease;
+}
+
+.side-block input::placeholder {
+  color: var(--dim);
+}
+
+.side-block input:focus {
+  border-color: var(--effort-accent);
+}
+
+/* After the base input rule on purpose: same specificity, so the flex sizing
+   has to come later to beat `width: 100%`. */
+.side-search input {
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 0;
+}
+
+.side-action {
+  width: 100%;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-raised);
+  color: var(--muted);
+  font: 600 12px var(--mono);
+  cursor: pointer;
+  transition:
+    border-color 0.15s ease,
+    color 0.15s ease,
+    background-color 0.15s ease;
+}
+
+.side-action:hover {
+  border-color: var(--dim);
+  color: var(--text);
+}
+
+.side-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0 0 10px;
+}
+
+.side-list::-webkit-scrollbar {
+  width: 6px;
+}
+
+.side-list::-webkit-scrollbar-thumb {
+  background: var(--panel-raised);
+  border-radius: 3px;
+}
+
+.side-list::-webkit-scrollbar-thumb:hover {
+  background: var(--dim);
+}
+
+/* Status moved here when the app header was removed: the sidebar bottom keeps
+   connection failures visible. Long messages truncate instead of widening the
+   sidebar; warn recolours the line (and, via sidebar.ts, the collapsed-state
+   expand control) so a daemon failure is not silently hidden. */
+.side-status {
+  flex: 0 0 auto;
+  padding: 8px 2px 0;
+  border-top: 1px solid var(--line);
+  overflow: hidden;
+}
+
+.status {
+  display: block;
+  color: var(--muted);
+  font: 11px/18px var(--mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.status[data-kind="warn"] {
+  color: var(--warn);
+}
+
+/* Sidebar resize handle: the panes' divider pattern, applied to the sidebar
+   edge. Keyboard users get it as a separator (arrow keys / Home / End). */
+.sidebar-resizer {
+  flex: 0 0 6px;
+  background: transparent;
+  cursor: col-resize;
+  touch-action: none;
+  transition: background 90ms linear;
+}
+
+.sidebar-resizer:hover,
+.sidebar-resizer:focus-visible,
+.sidebar-resizer.dragging {
+  background: var(--accent-strong);
+}
+
+.sidebar-resizer:focus-visible {
+  /* The generic focus rule only covers button/input/textarea/select; without this
+     the div falls back to the UA ring. */
+  outline: 2px solid var(--effort-accent);
+  outline-offset: -2px;
+}
+
+.sidebar-resizer[hidden] {
+  display: none;
+}
+
+/* While dragging, the pointer owns the whole window: pin the cursor and stop
+   text selection everywhere (the terminal also fights for the cursor). */
+body.sidebar-resizing,
+body.sidebar-resizing * {
+  cursor: col-resize !important;
+  user-select: none !important;
+}
+
+/* Collapsed state: the sidebar and its resizer are hidden and this strip is the
+   only way back in. Full height, so the hit area is the whole edge. */
+.sidebar-expand {
+  flex: 0 0 16px;
+  display: inline-grid;
+  place-items: center;
+  padding: 0;
+  background: var(--panel);
+  color: var(--muted);
+  border: 0;
+  border-right: 1px solid var(--line);
+  cursor: pointer;
+  font: 12px/1 var(--mono);
+  transition:
+    background-color 0.15s ease,
+    color 0.15s ease;
+}
+
+.sidebar-expand:hover {
+  background: var(--panel-raised);
+  color: var(--text);
+}
+
+.sidebar-expand[data-kind="warn"] {
+  color: var(--warn);
+}
+
+.sidebar-expand[hidden] {
+  display: none;
+}
+
+/* Session row: the live/not distinction is one thin accent edge on the left,
+   nothing else — no tint, no dot, no whole-row outline. Saved rows are only an
+   outline on the sidebar colour. Which pane holds a session is written in the
+   meta line. */
+.row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    "name actions"
+    "sub sub";
+  align-items: center;
+  column-gap: 7px;
+  row-gap: 3px;
+  width: 100%;
+  text-align: left;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: transparent;
+  cursor: pointer;
+  user-select: none;
+  transition: border-color 0.16s ease;
+}
+
+.row:hover {
+  border-color: var(--dim);
+}
+
+/* After .row:hover on purpose: same specificity, so the live edge keeps the
+   accent while the other sides dim on hover. padding-left is one less than the
+   base so the 2px edge does not shift the content. */
+.row.live {
+  border-left: 2px solid var(--accent);
+  padding-left: 8px;
+}
+
+.row .name {
+  grid-area: name;
+  min-width: 0;
+  font: 700 12px var(--mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.row .sub {
+  grid-area: sub;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  color: var(--dim);
+  font: 10px var(--mono);
+}
+
+.row .sub .cwd {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Pin and kill share the row's action slot (grid area "actions"). Both stay out
+   of the way until the row is hovered or focused, except a pressed pin, which
+   must read as pinned at rest. */
+.row-actions {
+  grid-area: actions;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.row .pin,
+.row .kill {
+  opacity: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font: 11px/1.4 var(--mono);
+  padding: 0 2px;
+  transition:
+    opacity 0.15s ease,
+    color 0.15s ease;
+}
+
+.row .pin {
+  display: inline-grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  flex: 0 0 22px;
+}
+
+.row .pin svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.row .pin[aria-pressed="true"] svg path:first-child {
+  fill: currentColor;
+}
+
+.row .kill {
+  font-size: 12px;
+}
+
+.row:hover .pin,
+.row:focus-within .pin,
+.row:hover .kill,
+.row:focus-within .kill {
+  opacity: 1;
+}
+
+.row .pin[aria-pressed="true"] {
+  opacity: 1;
+  color: var(--accent);
+}
+
+.row .pin:hover:not(:disabled) {
+  color: var(--text);
+}
+
+.row .pin:disabled {
+  color: var(--dim);
+  cursor: default;
+}
+
+.row .kill:hover {
+  color: var(--danger);
+}
+
+.side-empty {
+  padding: 6px 8px;
+  color: var(--dim);
+  font: 11px var(--mono);
+}
+
+/* Panes ------------------------------------------------------------------ */
+
+#panes {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  padding: 0;
+}
+
+.split {
+  display: flex;
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  align-items: stretch;
+  gap: 0;
+}
+
+/* Split divider: the only gutter between sibling panes, so the gap the
+   container used to provide now lives here and doubles as the resize handle. */
+.divider {
+  flex: 0 0 6px;
+  position: relative;
+  z-index: 2;
+  background: transparent;
+  transition: background 90ms linear;
+}
+
+.divider-split-row {
+  cursor: col-resize;
+}
+
+.divider-split-col {
+  cursor: row-resize;
+}
+
+.divider:hover,
+.divider.dragging {
+  background: var(--accent-strong);
+}
+
+/* Direction classes are namespaced: the sidebar's `.row` rule (grid, now) would
+   otherwise leak onto `.split.row` and collapse panes to content height. */
+.split-row {
+  flex-direction: row;
+}
+
+.split-col {
+  flex-direction: column;
+}
+
+.pane {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 0;
+  overflow: hidden;
+  transition:
+    border-color 0.16s ease,
+    box-shadow 0.16s ease;
+}
+
+/* The drop target stays neutral (white) and nothing else: no tint or halo marks
+   a pane that merely holds focus, so a pane looks identical whatever has it. */
+.pane.drop {
+  border-color: var(--text);
+}
+
+.pane-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 30px;
+  flex: 0 0 auto;
+  padding: 0 6px 0 10px;
+  background: rgba(10, 11, 13, 0.95);
+  border-bottom: 1px solid var(--line);
+  font: 12px var(--mono);
+  user-select: none;
+  cursor: grab;
+}
+
+.pane-title {
+  flex: 0 1 auto;
+  min-width: 0;
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Exit state text only (the pid field was removed); same dim treatment the pid
+   had. */
+.pane-state {
+  color: var(--dim);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.pane-spacer {
+  flex: 1;
+}
+
+.pane-header button {
+  display: inline-grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  background: var(--panel-raised);
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+  font: 11px var(--mono);
+  transition:
+    border-color 0.15s ease,
+    color 0.15s ease;
+}
+
+.pane-menu {
+  position: fixed;
+  z-index: 100;
+  padding: 4px;
+  max-width: 100vw;
+  box-sizing: border-box;
+  background: var(--panel-raised);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  box-shadow: 0 4px 16px #0008;
+}
+
+.pane-menu button {
+  display: block;
+  width: 100%;
+  padding: 8px 12px;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text);
+  font: 12px var(--mono);
+  text-align: left;
+  cursor: pointer;
+}
+
+.pane-menu button:hover:not(:disabled),
+.pane-menu button:focus-visible {
+  background: var(--panel);
+  outline: 1px solid var(--effort-accent);
+}
+
+.pane-menu button:disabled {
+  color: var(--dim);
+  cursor: default;
+}
+
+.pane-header button:hover {
+  border-color: var(--effort-accent);
+  color: var(--text);
+}
+
+.pane-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 0;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+/* The xterm element is height:100% of its parent, so the parent (this host) needs
+   a definite height too: an auto-height host collapses to the terminal's own
+   content height, which pins rows to whatever the first fit produced and leaves
+   the pane bottom empty. */
+.pane-body .term-host {
+  height: 100%;
+  overflow: hidden;
+}
+
+/* DOM fallback only: let font strokes cross row boundaries. The GPU renderer
+   draws box/block glyphs to cell edges and does not use these row elements. */
+.pane-body .xterm-rows > div {
+  overflow: visible !important;
+}
+
+.pane-body .xterm {
   height: 100%;
 }
 
-#term .xterm-viewport::-webkit-scrollbar {
-  width: 10px;
+/* xterm v6 scrolls through its own VS Code-style DOM scrollbar
+   (.xterm-scrollable-element > .scrollbar); the native .xterm-viewport scroller
+   never renders, so the old ::-webkit-scrollbar rules were dead. Match the
+   sidebar: 6px wide, 3px radius, grey thumb, dim on hover. The widths need
+   !important because the renderer sets them inline (14px default); the colours
+   beat the per-theme inline <style> on specificity. */
+.pane-body .xterm .xterm-scrollable-element > .scrollbar.vertical {
+  width: 6px !important;
 }
 
-#term .xterm-viewport::-webkit-scrollbar-thumb {
-  background: #3a3a44;
-  border-radius: 5px;
+.pane-body .xterm .xterm-scrollable-element > .scrollbar > .slider {
+  width: 6px !important;
+  background: var(--panel-raised);
+  border-radius: 3px;
+}
+
+.pane-body .xterm .xterm-scrollable-element > .scrollbar > .slider:hover {
+  background: var(--dim);
+}
+
+.pane-body .xterm .xterm-scrollable-element > .scrollbar > .slider.active {
+  background: var(--muted);
+}
+
+.pane-placeholder {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--muted);
+  font: 12px var(--mono);
+  text-align: center;
+}
+
+.pane-placeholder button {
+  padding: 7px 12px;
+  background: var(--panel-raised);
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font: 600 12px var(--mono);
+  cursor: pointer;
+  transition:
+    border-color 0.15s ease,
+    color 0.15s ease;
+}
+
+.pane-placeholder button:hover {
+  border-color: var(--effort-accent);
+  color: var(--text);
 }

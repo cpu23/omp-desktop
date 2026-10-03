@@ -2,7 +2,12 @@
 
 Date: 2026-10-02. Implements the decision in [desktop-app-options.md](./desktop-app-options.md):
 GUI outside omp, real `omp` CLI/TUI processes in panes, desktop daemon is the source of truth.
-Status: design ready for a P0 spike. Sources for every borrowed idea are linked in §12.
+Status: P1 is built and running (see README). As built, three things differ from this design and are the next steps:
+layout/bindings live in browser storage instead of the daemon's `LayoutStore` (so a phone cannot see the desktop's
+panes yet), transports are one WebSocket per pane plus plain HTTP commands instead of seq/delta topics, and the
+per-runtime extension socket is not wired — session identity comes from the PTY replay buffer and omp's OSC 1337
+`omp_session_file` sniff, which is what makes resume-after-restart work. Sources for every borrowed idea are linked
+in §12.
 
 ## 1. Principle
 
@@ -33,7 +38,7 @@ Status: design ready for a P0 spike. Sources for every borrowed idea are linked 
 | PTY | **`bun-pty`** (MIT, Rust `portable-pty` over FFI) | node-pty has no supported Bun path ([node-pty#632](https://github.com/microsoft/node-pty/issues/632)); Bun's built-in `Bun.Terminal` lacks `setsid`/`TIOCSCTTY` ([bun#33237](https://github.com/oven-sh/bun/issues/33237)). Fallback: 200-line Rust helper with `portable-pty` behind the same PTY interface |
 | Terminal renderer | **xterm.js** + addon-image, fit, web-links, unicode11, clipboard | ZCode ships `@xterm/xterm 6`; addon-image 0.9.0 stable renders **SIXEL + iTerm2**, kitty only in 0.10 betas and without unicode placeholders ([inventory](https://github.com/xtermjs/xterm.js/discussions/5683)) |
 | In-pane images | spawn omp with `PI_FORCE_IMAGE_PROTOCOL=iterm2` (or `sixel` + `PI_ALLOW_SIXEL_PASSTHROUGH=1`) | Both verified in the omp 18.4.9 binary; stable addon-image path. Kitty path revisited if 0.10 lands placeholders |
-| Shell | **deferred** — P0–P2 run as localhost webapp/PWA; P3 wraps in Tauri 2 (or Electron) | Removes shell risk from the critical path; Tauri byte transport = `ipc::Channel`; Electron is the proven terminal performer (ZCode) |
+| Shell | **Tauri 2** native window over the existing loopback webapp; browser access remains available | Linux uses system WebKitGTK, not Chromium; window lifetime is independent of the Bun daemon. Build/install commands and native prerequisites are in README. |
 | Client transport | WS topics with monotonic seq + bounded delta log + snapshot resync; HTTP POST for commands | Stolen from OmpCode `sessionIndexTopics.ts` / `topicPublisher.ts`; beats omp-mobile's 2–8s polling |
 | Auth | loopback only + launch token → signed HttpOnly cookie, Host/Origin fence | OmpCode's relay has no auth (`127.0.0.1:8765`); dsh's model is stronger ([connection README](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/client/connection/README.md)) |
 | omp integration | TUI via PTY **plus** a desktop extension (fork of `extension.ts`) over a per-runtime unix socket | Extension gives structured state/actions (title, status, session file, cost, capabilities); PTY gives the real UI |
@@ -156,7 +161,7 @@ read/write client (prompt, abort, model, view panes), matching the "shared live"
 **Terminal renderer (xterm.js)**
 - **Glyph set (resolved 2026-10-02).** omp's default `symbolPreset: unicode` emits marks no monospace font covers consistently: the reasoning/effort indicator (U+29B8) resolves to proportional Noto Sans Math, and folder/image marks are color emoji at ~1.17em advance — both clipped inside a monospace cell. Fix: `config/session.yml` sets `symbolPreset: nerd` through `omp --config` (process-only overlay; the user's global `~/.omp/agent/config.yml` stays untouched, so their Konsole keeps its own preset), and the app vendors `JetBrainsMonoNerdFontMono-Regular.ttf` as the icon fallback after Hack, restricted by `unicode-range` to the private-use planes so text keeps Hack's letterforms. Every PUA codepoint omp emitted in a probe (U+E0B0/E0B1/E0B6, U+F115, U+F0068, U+F055D, U+F067A, U+F0A9F, U+F0D57) is covered by the vendored file; the smoke test asserts PUA glyphs actually appear in the PTY stream. **The patch family matters, not just the family name:** Nerd Fonts' *Symbols-only* builds draw icons at ~1em ink with a 1em advance, so inside Hack's 0.6em cell every icon overflowed its cell (clipped at the row edge, visibly detached from its neighbours, measured 13.33px advance/14px ink at a 8.02px cell). The **Mono** patch of a real base font (`JetBrainsMono Nerd Font Mono`, advance 0.6em = 8.02px, ink ~8px) drops into the cell exactly; verified in-browser by canvas advance/ink measurement and 3x screenshots.
 - **Stale bundle must be impossible (resolved 2026-10-02).** A tab kept an old `client.js` while the daemon restarted with new code (no cache headers + no reload path), so fixes looked like "nothing changed". The daemon now serves `/`, `/client.js`, `/styles.css`, `/xterm.css` with `cache-control: no-store`, publishes its bundle hash at `/api/build`, and the client polls it (10s + on focus) and reloads itself when it differs; the hash is shown in the pane header so the running build is always identifiable.
-- **Cell geometry.** Matches the Konsole profile the sessions normally run in. Konsole's font is `QFontDatabase::systemFont(FixedFont)` (`Profile.cpp:293`) and the profile sets no `Font=`, so the platform default applies; the running Konsole processes have `Hack-Regular.ttf` mapped (that map also shows `NotoSansMath-Regular.ttf` and `NotoColorEmoji.ttf` — the fallbacks behind the clipping above). Hack at 10pt = 13.33px, plus Konsole `LineSpacing=3`, which `TerminalFont` adds as pixels to the font height → approximated as xterm.js `lineHeight: 1.4` (measured cell 8.02 × 20.8px at dpr 1.25, i.e. ~20px, within a few percent of Qt's `Hack@10pt + 3`). `Ctrl/Cmd +/-/0` adjusts live (persisted) since Qt's effective font cannot be introspected from outside.
+- **Cell geometry.** Hack defaults to 13.33px with fixed `lineHeight: 1`. All panes use the same font size and row spacing; divider drags change only whole-row/column counts. `Ctrl/Cmd +/-/0` adjusts the shared, persisted font size. This is not a claim of pixel-identical Qt/Konsole rendering.
 - **Fit must be font-gated.** An initial `fit()` before the webfont loads measures fallback metrics and leaves the bottom rows (status line, prompt) outside the viewport. `document.fonts.load` for every family in the stack gates the first fit; `loadingdone` re-fits.
 - Stable `addon-image` renders SIXEL + iTerm2 only; **kitty graphics is beta-only and lacks unicode placeholders**, so omp's default kitty image path is unavailable → force `PI_FORCE_IMAGE_PROTOCOL=iterm2|sixel`. If that degrades omp's rendering, fall back to app-side image rendering from the blob store (needs extension data). P0 gate.
 - Kitty keyboard protocol has open bugs in xterm.js → some modifier chords may not reach omp identically to a native terminal.
@@ -213,3 +218,89 @@ Build only the straight line; no fallbacks until a gate fails:
 3. One omp process per session, lazy spawn, no pool until P2 (idle unload = kill + `--resume`).
 4. Browser client first — no Tauri/Electron decision, no packaging.
 5. Extension optional at runtime; if it fails to load, the pane still works (terminal bytes only).
+
+## 17. Post-P1 fixes from live use (2026-10-02)
+
+Four defects the browser acceptance pass had missed, all reproduced and fixed the same day:
+
+1. **Panes did not fill their box.** Two independent causes, both invisible in the old checks because a
+   terminal that is too short still renders.
+   - The xterm element is `height: 100%` of its parent, and the parent (`#host`) had no height, so `100%`
+     resolved against an auto-height box: the terminal kept whatever row count the first fit produced
+     (24 rows at 20.78px = 499px) inside an 881px pane. Fixed by giving the host a definite height
+     (`.pane-body .term-host { height: 100% }`). Verified: 42 rows rendered = 42 rows reported by the daemon.
+   - `.split.row` collided with the sidebar's `.row { align-items: center }`, so split children were sized
+     to content instead of stretched and panes of different terminal heights sat ragged in the same row.
+     Direction classes are now namespaced (`split-row`, `split-col`, `divider-split-row`, ...) and `.split`
+     sets `align-items: stretch` explicitly.
+2. **The CLI looked wrong in the app.** The daemon used to pass `omp --config config/session.yml` forcing
+   `symbolPreset: nerd`. Panes therefore rendered PUA status glyphs the user never chose — the "floating
+   symbols" — and diverged from the same session in Konsole. The overlay is gone by default
+   (`OMP_DESKTOP_OVERLAY` still exists for experiments) so panes render the user's own config.
+   The vendored nerd font stays for the PUA planes only (`unicode-range`), which is what makes the
+   remaining PUA glyphs (omp's welcome card) one Hack cell wide.
+3. **Fixed 50/50 splits.** Split nodes always carried a `ratio`, but nothing could change it. Each split now
+   renders a 6px divider that drags the ratio (clamped 0.15–0.85, persisted on release). Panes refit through
+   their own ResizeObserver, and the drag end forces one explicit fit per pane because the debounced observer
+   callback can land mid-drag. `.split` gap moved into the divider so the gutter width is unchanged.
+4. **Cost was nowhere in the app.** omp itself only prints a cost segment when the session actually has one
+   (codex-subscription and local models report none, and 43 of the 60 newest transcripts are priced), so the
+   sidebar now shows per-session cost from the transcripts: the sum of every `usage.cost.total`, matching
+   `get_session_stats`, streamed once per `(mtime, size)` and cached. The cost object is matched as a whole,
+   so a chunk boundary can never contribute a truncated number; verified against an independent sum
+   ($30.4880).
+
+Operating note: `systemctl --user restart omp-desktopd` kills every pane process (they are in the service
+cgroup), so it is a hard reset, not a reload. Panes come back labelled and resumable, but a graceful
+restart/adopt path remains open work.
+
+## 18. Chrome styling follows omp-mobile (2026-10-02)
+
+The desktop chrome now uses omp-mobile's visual language verbatim, because the two clients are two windows onto the
+same sessions and should not look like two products.
+
+- **Tokens copied, not re-invented**: `public/styles.css` `:root` mirrors `omp-mobile/public/styles.css` (OLED black
+  page, `--panel`/`--panel-soft`/`--panel-raised` surfaces, `--line`/`--line-muted` borders, `--accent` `#00b4ff`,
+  `--gold` for cost, `--success`/`--warn`/`--danger` for status, `--mono`/`--sans` stacks). The mobile file stays the
+  source of truth; both are edited together.
+- **Font**: `DejaVuSansMono.ttf` is vendored from omp-mobile and served as `OMP DejaVu Mono` so the chrome renders
+  identically regardless of host fontconfig. This is the UI font only — panes keep Hack plus the nerd PUA fallback,
+  whose one-cell advance math (§14) is tied to the terminal grid, not to the app chrome.
+- **Component mapping**: mobile `.topbar` -> app header (blur, 1px bottom line, mono brand); `.sidebar*` -> sidebar
+  with a single session list (no section labels); `.slot-card` -> session row (live sessions are `--panel-raised`
+  grey cards, saved ones outline-only on the sidebar colour); `.ghost-btn`/`.icon-btn` -> pane-header buttons;
+  modal input -> search input (black, 1px line, accent focus); `.slot-meta` -> row meta line, three spans (time,
+  cwd, gold cost).
+- **No accent tint on chrome state**: which pane holds a session is written in the row's meta line ("pane 2"), not
+  painted. Rows carry no `bound` accent bar or accent border, the focused pane's border is `--muted` and the drop
+  target's is `--text` — focus and drop stay visible without a colour that reads as selection.
+- **Flush panes**: no padding on the pane area or pane body and square pane corners, so a terminal starts at the pane
+  border. What is left at the right/bottom edge is grid quantisation (whole cells) plus the scrollbar reserve; the
+  fit uses the real reserve rather than FitAddon's hardcoded 14px so it costs 6px of width instead of 22px (§19).
+- **Terminal theme**: xterm now matches the palette (`#000` bg, `#e8ecf4` fg, `#00b4ff` cursor, accent selection),
+  where the pane body and the terminal clear to true black like the mobile transcript.
+- **Deviations, deliberately**: control heights are mouse-sized (34px header vs mobile's 52px, 22px pane-header
+  buttons vs 40px touch targets), and row cards skip mobile's `translateY(-1px)` hover lift, which makes dense list
+  text shimmer. Status dots are flat — the glow halos read as noise at desktop density.
+
+## 19. Fixed terminal geometry and solid frame strokes (2026-10-02)
+
+The previous fit varied font size and line spacing to fill each pane. Geometry sweeps passed,
+but the user reported the side-by-side view was still wrong; those checks did not establish
+the requested visual behavior.
+
+- **Spacing:** `lineHeight: 1` is fixed. Per-row overflow is visible in the DOM fallback,
+  but the user's comparison screenshots still showed row breaks and seams in block glyphs.
+- **Renderer:** `@xterm/addon-webgl` 0.19.0 with `customGlyphs: true` draws box/block characters
+  to cell edges. xterm's DOM renderer does not support custom glyphs. The image addon is loaded
+  after the GPU renderer. If WebGL activation fails or its context is lost, disposing the addon
+  restores DOM rendering and a visible **DOM** warning identifies the degraded renderer.
+- **Fit:** `Pane.#fitGrid()` reads xterm's device-cell metrics (with a drawn-grid fallback)
+  and the actual scrollbar reserve. It floors the available space to whole columns/rows.
+  It never scales text to fill a pane; unused space below or beside the grid is intentional.
+- **Verification:** two connected omp sessions were inspected side by side using native Chromium
+  display scaling at 100% and 125%; screenshots showed joined frame strokes and solid logo blocks.
+  A forced WebGL context loss returned the affected pane to DOM with its warning visible.
+  A browser-only iTerm2 image-protocol smoke rendered a red PNG over the GPU terminal.
+  Native text antialiasing, font weight, and the Konsole background are separate from custom glyphs;
+  this is not a claim of pixel-identical Qt/Konsole rendering.

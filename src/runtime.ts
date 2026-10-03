@@ -1,5 +1,7 @@
 import { spawn, type IPty } from "bun-pty";
+import { basename } from "node:path";
 import type { RuntimeInfo } from "./protocol";
+import { sniffSessionFile } from "./sniff";
 
 export type RuntimeSpec = {
   id: string;
@@ -14,6 +16,8 @@ export type RuntimeSpec = {
 export type RuntimeExit = { exitCode: number | null; signal?: number | string };
 
 const DEFAULT_REPLAY_LIMIT = 512 * 1024;
+/** Output within this window counts as "streaming" in the sidebar. */
+const STREAMING_WINDOW_MS = 1500;
 
 /**
  * One omp TUI process on a PTY. Keeps the tail of raw output so a client that
@@ -24,6 +28,9 @@ export class Runtime {
   readonly spec: RuntimeSpec;
   bytesOut = 0;
   startedAt: Date | null = null;
+  /** Absolute session file this process is writing, sniffed from omp's OSC 1337. */
+  sessionFile: string | null = null;
+  lastActivityAt: number | null = null;
 
   #pty: IPty | null = null;
   #exit: RuntimeExit | null = null;
@@ -32,6 +39,8 @@ export class Runtime {
   #replayLimit: number;
   #dataSubs = new Set<(data: string) => void>();
   #exitSubs = new Set<(exit: RuntimeExit) => void>();
+  /** Tail of the last chunk: an OSC sequence can split across PTY reads. */
+  #sniffCarry = "";
 
   constructor(spec: RuntimeSpec, replayLimit = DEFAULT_REPLAY_LIMIT) {
     this.id = spec.id;
@@ -59,6 +68,21 @@ export class Runtime {
     return this.#exit;
   }
 
+  /** See RuntimeStatus: recent bytes = omp is painting or streaming. */
+  get status(): RuntimeInfo["status"] {
+    if (!this.alive) return this.#exit ? "exited" : "idle";
+    return this.lastActivityAt !== null && Date.now() - this.lastActivityAt < STREAMING_WINDOW_MS
+      ? "streaming"
+      : "idle";
+  }
+
+  /** Pane header label before the client can match the session file to a title. */
+  get title(): string {
+    const file = this.sessionFile;
+    if (file) return basename(file).replace(/\.jsonl$/, "");
+    return basename(this.spec.cwd) || this.spec.cwd;
+  }
+
   info(): RuntimeInfo {
     return {
       id: this.id,
@@ -68,6 +92,11 @@ export class Runtime {
       rows: this.rows,
       startedAt: this.startedAt?.toISOString() ?? null,
       bytesOut: this.bytesOut,
+      cwd: this.spec.cwd,
+      sessionFile: this.sessionFile,
+      title: this.title,
+      status: this.status,
+      lastActivity: this.lastActivityAt === null ? null : new Date(this.lastActivityAt).toISOString(),
     };
   }
 
@@ -89,6 +118,10 @@ export class Runtime {
     this.#chunkBytes = 0;
     pty.onData((data) => {
       this.bytesOut += Buffer.byteLength(data);
+      this.lastActivityAt = Date.now();
+      const sniffed = sniffSessionFile(this.#sniffCarry, data);
+      this.#sniffCarry = sniffed.carry;
+      if (sniffed.sessionFile) this.sessionFile = sniffed.sessionFile;
       this.#pushReplay(data);
       for (const sub of this.#dataSubs) sub(data);
     });

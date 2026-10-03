@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Core APIs for the bundled connection page only. The window is local here, so this capability does not apply once the window navigates to the daemon origin (remote content gets no native permissions).",
+  "windows": ["main"],
+  "local": true,
+  "permissions": ["core:default"]
+}

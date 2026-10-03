@@ -1,8 +1,0 @@
-# Overlay passed to omp per process by omp-desktopd (`omp --config <this file>`).
-# App-side terminal chrome only: the app is one client among several, so it never
-# touches the user's global ~/.omp/agent/config.yml.
-#
-# symbolPreset: nerd -> PUA icons from a Nerd Font instead of Unicode symbols, some
-# of which (U+29B8, color emoji) fall back to proportional fonts and clip in a
-# monospace cell. Requires a Nerd Font; the app vendors Symbols Nerd Font Mono.
-symbolPreset: nerd
