@@ -87,3 +87,16 @@ status 2026-10-03 (sidebar controls):
  +) global OMP Desktop header and per-session PID labels are hidden; connection status
     is at the sidebar bottom. Live rows use only a thin OMP-blue (#00b4ff) left edge.
  +) sidebar and xterm v6 scrollbars match: 10px wide, 5px rounded grey thumb, same hover colour.
+
+status 2026-10-03 (pane menu, pins, scrollbars — supersedes the selector/split state above):
+ 2. right-click any pane opens a one-item layout menu (Ctrl+Shift+E also works): the first use
+    splits 1x1 into 1x2 side by side, the next splits both columns top/bottom into 2x2. At four
+    panes the item is disabled; closing a pane re-enables it to fill missing grid slots. The old
+    Ctrl+Shift+O direction shortcut is removed; Ctrl+Shift+X closes a pane (src/client.ts).
+ 8. pane headers have no session dropdown and there is no header split button. Sessions are
+    swapped by dragging a sidebar row onto a pane or one pane header onto another; the per-pane
+    session selector noted above no longer exists (src/client.ts).
+ +) pins are per-row pushpin SVG buttons — outlined when unpinned, filled/accent when pinned —
+    with "Pin chat"/"Unpin chat" tooltips and accessible labels (src/client.ts).
+ +) sidebar and xterm v6 scrollbars are 6px wide with a rounded grey thumb and the same hover
+    colour (public/styles.css); this corrects the 10px/5px line above.

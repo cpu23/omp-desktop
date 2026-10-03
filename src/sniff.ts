@@ -21,12 +21,8 @@ export function sniffSessionFile(carry: string, chunk: string): { carry: string;
   OSC_1337.lastIndex = 0;
   let match: RegExpExecArray | null;
   while ((match = OSC_1337.exec(buffer)) !== null) {
-    try {
-      const decoded = Buffer.from(match[1], "base64").toString("utf8");
-      if (decoded.startsWith("/")) sessionFile = decoded;
-    } catch {
-      // not base64 after all; ignore
-    }
+    const decoded = Buffer.from(match[1], "base64").toString("utf8");
+    if (decoded.startsWith("/")) sessionFile = decoded;
   }
   return { carry: buffer.slice(-CARRY), sessionFile };
 }

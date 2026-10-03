@@ -36,16 +36,14 @@ export class Runtime {
   #exit: RuntimeExit | null = null;
   #chunks: string[] = [];
   #chunkBytes = 0;
-  #replayLimit: number;
   #dataSubs = new Set<(data: string) => void>();
   #exitSubs = new Set<(exit: RuntimeExit) => void>();
   /** Tail of the last chunk: an OSC sequence can split across PTY reads. */
   #sniffCarry = "";
 
-  constructor(spec: RuntimeSpec, replayLimit = DEFAULT_REPLAY_LIMIT) {
+  constructor(spec: RuntimeSpec) {
     this.id = spec.id;
     this.spec = spec;
-    this.#replayLimit = replayLimit;
   }
 
   get alive(): boolean {
@@ -62,10 +60,6 @@ export class Runtime {
 
   get rows(): number {
     return this.#pty?.rows ?? this.spec.rows;
-  }
-
-  get exit(): RuntimeExit | null {
-    return this.#exit;
   }
 
   /** See RuntimeStatus: recent bytes = omp is painting or streaming. */
@@ -117,12 +111,13 @@ export class Runtime {
     this.#chunks = [];
     this.#chunkBytes = 0;
     pty.onData((data) => {
-      this.bytesOut += Buffer.byteLength(data);
+      const bytes = Buffer.byteLength(data);
+      this.bytesOut += bytes;
       this.lastActivityAt = Date.now();
       const sniffed = sniffSessionFile(this.#sniffCarry, data);
       this.#sniffCarry = sniffed.carry;
       if (sniffed.sessionFile) this.sessionFile = sniffed.sessionFile;
-      this.#pushReplay(data);
+      this.#pushReplay(data, bytes);
       for (const sub of this.#dataSubs) sub(data);
     });
     pty.onExit((event) => {
@@ -180,10 +175,10 @@ export class Runtime {
     }
   }
 
-  #pushReplay(data: string): void {
+  #pushReplay(data: string, bytes: number): void {
     this.#chunks.push(data);
-    this.#chunkBytes += Buffer.byteLength(data);
-    while (this.#chunkBytes > this.#replayLimit && this.#chunks.length > 1) {
+    this.#chunkBytes += bytes;
+    while (this.#chunkBytes > DEFAULT_REPLAY_LIMIT && this.#chunks.length > 1) {
       this.#chunkBytes -= Buffer.byteLength(this.#chunks.shift() as string);
     }
   }

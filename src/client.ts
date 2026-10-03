@@ -199,7 +199,6 @@ function displayTitle(runtime: RuntimeInfo): string {
   return runtime.cwd.replace(/^\/home\/[^/]+/, "~") || runtime.id;
 }
 
-
 /** xterm's measured cell dimensions in device pixels. */
 type CellMetrics = { cellW: number; cellH: number };
 
@@ -266,7 +265,13 @@ class Pane {
     this.#stateEl.className = "pane-state";
     const spacer = document.createElement("span");
     spacer.className = "pane-spacer";
-    const close = headerButton("✕", "Close pane (Ctrl+Shift+X)", () => closePane(this.id));
+    const close = document.createElement("button");
+    close.textContent = "✕";
+    close.title = "Close pane (Ctrl+Shift+X)";
+    close.addEventListener("click", (event) => {
+      event.stopPropagation();
+      closePane(this.id);
+    });
     header.append(this.#titleEl, this.#stateEl, spacer, close);
 
     this.#body = document.createElement("div");
@@ -439,7 +444,7 @@ class Pane {
   focus(): void {
     if (layout.focused !== this.id) {
       layout.focused = this.id;
-      renderFocus();
+      renderSidebar();
       save();
     }
     this.term.focus();
@@ -484,13 +489,9 @@ class Pane {
 
   bind(binding: PaneBinding): void {
     this.binding = binding;
-    if (!binding.runtimeId) {
-      this.detach();
-      this.renderPlaceholder();
-    } else {
-      this.renderPlaceholder();
-      this.attach();
-    }
+    if (!binding.runtimeId) this.detach();
+    this.renderPlaceholder();
+    if (binding.runtimeId) this.attach();
     this.renderHeader();
     save();
     renderSidebar();
@@ -573,15 +574,14 @@ class Pane {
 
   syncFromRuntimes(): void {
     const runtimeId = this.binding.runtimeId;
-    if (runtimeId) {
-      const runtime = runtimes.find((candidate) => candidate.id === runtimeId);
+    const runtime = runtimeId ? runtimes.find((candidate) => candidate.id === runtimeId) : undefined;
+    if (runtime) {
       // Check the persisted transcript identity before reattaching a pane.
       const sameSession =
-        runtime !== undefined &&
-        (!this.binding.sessionFile ||
-          !runtime.sessionFile ||
-          runtime.sessionFile === this.binding.sessionFile);
-      if (runtime && sameSession) {
+        !this.binding.sessionFile ||
+        !runtime.sessionFile ||
+        runtime.sessionFile === this.binding.sessionFile;
+      if (sameSession) {
         this.#stateEl.textContent = "";
         const title = displayTitle(runtime);
         // omp emits the session file after the hello: adopt it late, or a reload
@@ -594,7 +594,7 @@ class Pane {
           save();
         }
         if (!this.ws && this.retry !== Number.POSITIVE_INFINITY) this.attach();
-      } else if (runtime && !this.ws) {
+      } else if (!this.ws) {
         this.runtimeGone();
       }
     }
@@ -653,17 +653,6 @@ class Pane {
   }
 }
 
-function headerButton(label: string, title: string, onClick: () => void): HTMLButtonElement {
-  const button = document.createElement("button");
-  button.textContent = label;
-  button.title = title;
-  button.addEventListener("click", (event) => {
-    event.stopPropagation();
-    onClick();
-  });
-  return button;
-}
-
 const paneMenu = document.createElement("div");
 paneMenu.className = "pane-menu";
 paneMenu.setAttribute("role", "menu");
@@ -672,6 +661,7 @@ paneMenu.hidden = true;
 paneMenu.tabIndex = -1;
 const splitMenuItem = document.createElement("button");
 splitMenuItem.setAttribute("role", "menuitem");
+splitMenuItem.setAttribute("aria-keyshortcuts", "Control+Shift+E");
 paneMenu.append(splitMenuItem);
 document.body.append(paneMenu);
 
@@ -689,7 +679,7 @@ splitMenuItem.addEventListener("click", () => {
 panesEl.addEventListener("contextmenu", (event) => {
   const target = event.target instanceof Element ? event.target.closest<HTMLElement>(".pane") : null;
   const pane = target?.dataset.pane ? panes.get(target.dataset.pane) : null;
-  if (!pane) return;
+  if (!target || !pane) return;
   event.preventDefault();
   pane.focus();
   const count = leaves().length;
@@ -697,10 +687,9 @@ panesEl.addEventListener("contextmenu", (event) => {
     ? "Split — maximum 4 panes"
     : count === 1 ? "Split side by side" : "Split into 2×2";
   splitMenuItem.disabled = count >= MAX_PANES;
-  splitMenuItem.setAttribute("aria-keyshortcuts", "Control+Shift+E");
   paneMenu.hidden = false;
   const rect = paneMenu.getBoundingClientRect();
-  const anchor = target!.getBoundingClientRect();
+  const anchor = target.getBoundingClientRect();
   const x = event.clientX || anchor.left;
   const y = event.clientY || anchor.top;
   paneMenu.style.left = `${Math.max(0, Math.min(x, window.innerWidth - rect.width))}px`;
@@ -731,10 +720,6 @@ function leaves(node: LayoutNode = layout.tree, out: string[] = []): string[] {
   return out;
 }
 
-function bindings(node: PaneBinding | undefined): PaneBinding {
-  return node ?? { runtimeId: null, title: null, sessionFile: null };
-}
-
 /** `restoredId` keeps a stored layout's tree and pane map agreeing; collisions fall back to a fresh id. */
 function newPane(binding: PaneBinding, restoredId?: string): Pane {
   let id = restoredId ?? `p${++paneSeq}`;
@@ -747,10 +732,11 @@ function newPane(binding: PaneBinding, restoredId?: string): Pane {
 
 /** Preserve valid grid ratios; migrate arbitrary old trees without losing bindings. */
 function gridLayout(tree: LayoutNode): LayoutNode {
-  const ids = [...new Set(leaves(tree))].slice(0, MAX_PANES);
+  const all = leaves(tree);
+  const ids = [...new Set(all)].slice(0, MAX_PANES);
   const columnValid = (node: LayoutNode): boolean =>
     node.kind === "leaf" || (node.dir === "col" && node.a.kind === "leaf" && node.b.kind === "leaf");
-  if (ids.length === leaves(tree).length &&
+  if (ids.length === all.length &&
       (tree.kind === "leaf" || (tree.dir === "row" && columnValid(tree.a) && columnValid(tree.b)))) return tree;
   const leaf = (id: string): LayoutNode => ({ kind: "leaf", pane: id });
   const column = (entries: string[]): LayoutNode => entries.length === 1
@@ -831,6 +817,7 @@ function swapPanes(aId: string, bId: string): void {
 function renderLayout(): void {
   closePaneMenu();
   const tree = layout.tree;
+  const ids = leaves(tree);
   panesEl.replaceChildren(buildNode(tree));
   for (const pane of panes.values()) {
     pane.renderHeader();
@@ -838,7 +825,7 @@ function renderLayout(): void {
     window.setTimeout(() => pane.fitPane(), 0);
   }
   for (const pane of panes.values()) {
-    if (!leaves(tree).includes(pane.id)) panes.delete(pane.id);
+    if (!ids.includes(pane.id)) panes.delete(pane.id);
   }
 }
 
@@ -916,11 +903,6 @@ function startResize(
   divider.addEventListener("pointercancel", onEnd);
 }
 
-function renderFocus(): void {
-  for (const pane of panes.values()) pane.renderHeader();
-  renderSidebar();
-}
-
 // ---------------------------------------------------------------- sidebar
 
 function sessionRelative(iso: string): string {
@@ -935,10 +917,6 @@ function sessionRelative(iso: string): string {
   return days < 30 ? `${days}d` : `${Math.round(days / 30)}mo`;
 }
 
-function liveTitle(runtime: RuntimeInfo): string {
-  return displayTitle(runtime);
-}
-
 function renderSidebar(): void {
   // Rebuilding rows mid-drag cancels the drag the user is performing.
   if (dragging) {
@@ -949,6 +927,10 @@ function renderSidebar(): void {
   sessionListEl.replaceChildren();
 
   const query = searchEl.value.trim().toLowerCase();
+  const sessionByPath = new Map<string, SessionSummaryLike>();
+  for (const session of sessions) {
+    if (!sessionByPath.has(session.path)) sessionByPath.set(session.path, session);
+  }
   const liveFiles = new Set<string>();
   for (const runtime of runtimes) {
     if (runtime.sessionFile) liveFiles.add(runtime.sessionFile);
@@ -957,7 +939,7 @@ function renderSidebar(): void {
   // Transcript paths identify pins across stop/resume and daemon restarts.
   let pinsChanged = false;
   pinnedSessions = pinnedSessions.map((pin) => {
-    const fresh = sessions.find((session) => session.path === pin.path);
+    const fresh = sessionByPath.get(pin.path);
     if (fresh && JSON.stringify(fresh) !== JSON.stringify(pin)) {
       pinsChanged = true;
       return fresh;
@@ -969,13 +951,13 @@ function renderSidebar(): void {
   const pinnedRows: HTMLElement[] = [];
   const otherRows: HTMLElement[] = [];
   const liveRuntimes = query
-    ? runtimes.filter((runtime) => `${liveTitle(runtime)} ${runtime.cwd}`.toLowerCase().includes(query))
+    ? runtimes.filter((runtime) => `${displayTitle(runtime)} ${runtime.cwd}`.toLowerCase().includes(query))
     : runtimes;
   const candidates = new Map(pinnedSessions.map((session) => [session.path, session]));
   for (const session of sessions) candidates.set(session.path, session);
   const recent = [...candidates.values()].filter((session) =>
     !liveFiles.has(session.path) &&
-    (!query || sessions.some((match) => match.path === session.path) ||
+    (!query || sessionByPath.has(session.path) ||
       `${session.title} ${session.cwd}`.toLowerCase().includes(query)),
   );
 
@@ -986,18 +968,26 @@ function renderSidebar(): void {
     sessionListEl.append(empty);
   }
 
+  // Which pane shows a runtime, for the row subtitle; first matching pane wins.
+  const paneForRuntime = new Map<string, string>();
+  for (const pane of panes.values()) {
+    const runtimeId = pane.binding.runtimeId;
+    if (runtimeId && !paneForRuntime.has(runtimeId)) paneForRuntime.set(runtimeId, pane.id);
+  }
+
   for (const runtime of liveRuntimes) {
+    const title = displayTitle(runtime);
     const row = document.createElement("div");
     row.className = runtime.alive ? "row live" : "row recent";
     row.draggable = true;
     row.title = `${runtime.cwd}\n${runtime.sessionFile ?? "(session file not known yet)"}\n${runtime.id}`;
-    const owner = [...panes.values()].find((pane) => pane.binding.runtimeId === runtime.id);
+    const ownerId = paneForRuntime.get(runtime.id);
     const name = document.createElement("span");
     name.className = "name";
-    name.textContent = liveTitle(runtime);
+    name.textContent = title;
     const sub = document.createElement("span");
     sub.className = "sub";
-    sub.textContent = owner ? owner.id.replace("p", "pane ") : runtime.cwd.replace(/^\/home\/[^/]+/, "~");
+    sub.textContent = ownerId ? ownerId.replace("p", "pane ") : runtime.cwd.replace(/^\/home\/[^/]+/, "~");
     const kill = document.createElement("button");
     kill.className = "kill";
     kill.textContent = "✕";
@@ -1007,9 +997,9 @@ function renderSidebar(): void {
       void killRuntime(runtime.id);
     });
     const snapshot = runtime.sessionFile
-      ? sessions.find((session) => session.path === runtime.sessionFile) ?? {
+      ? sessionByPath.get(runtime.sessionFile) ?? {
         id: runtime.id, path: runtime.sessionFile, cwd: runtime.cwd,
-        title: liveTitle(runtime), updatedAt: runtime.lastActivity ?? runtime.startedAt ?? new Date().toISOString(),
+        title, updatedAt: runtime.lastActivity ?? runtime.startedAt ?? new Date().toISOString(),
         costUsd: 0,
       }
       : null;
@@ -1019,9 +1009,7 @@ function renderSidebar(): void {
     row.append(name, sub, actions);
     row.addEventListener("click", () => {
       const pane = focusedPane();
-      if (pane) {
-        pane.bind({ runtimeId: runtime.id, title: displayTitle(runtime), sessionFile: runtime.sessionFile });
-      }
+      if (pane) pane.bind({ runtimeId: runtime.id, title: displayTitle(runtime), sessionFile: runtime.sessionFile });
     });
     row.addEventListener("dragstart", (event) => {
       event.dataTransfer?.setData("text/omp-payload", JSON.stringify({ kind: "runtime", runtimeId: runtime.id }));
@@ -1150,10 +1138,9 @@ function load(): void {
     stored = null;
   }
   if (stored) {
-    const storedLeaves = leaves(stored.tree).filter((id) => typeof id === "string");
-    const ids = [...new Set(storedLeaves)].slice(0, MAX_PANES);
+    const tree = gridLayout(stored.tree);
+    const ids = leaves(tree);
     if (ids.length) {
-      const tree = gridLayout(stored.tree);
       layout = {
         tree,
         panes: stored.panes,
@@ -1162,7 +1149,7 @@ function load(): void {
       for (const id of ids) {
         const numeric = Number(id.replace(/\D/g, ""));
         if (Number.isFinite(numeric)) paneSeq = Math.max(paneSeq, numeric);
-        newPane(bindings(stored.panes[id]), id);
+        newPane(stored.panes[id] ?? { runtimeId: null, title: null, sessionFile: null }, id);
       }
       return;
     }

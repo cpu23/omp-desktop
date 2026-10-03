@@ -203,10 +203,18 @@ source of truth.
 
 ## Layout
 
-- `src/daemon.ts` — HTTP + websocket server; serves the client bundle, owns the runtime.
-- `src/runtime.ts` — one PTY-backed omp process: spawn, byte fan-out, replay tail, process-group kill.
-- `src/client.ts` — xterm.js pane: binary output in, JSON input/resize out.
+- `src/daemon.ts` — HTTP + websocket server; one `TEXT_ASSETS` dispatch for index/client/styles/xterm CSS, `/api/build`, `/api/paste`, resume validation; owns the runtime pool and wires the optional mobile extension.
+- `src/manager.ts` — `RuntimeManager`: the pool of live omp processes (spawn, list, kill, capacity cap).
+- `src/runtime.ts` — one PTY-backed omp process: spawn, byte fan-out, bounded replay tail, byte-rate status, process-group kill.
+- `src/sessions.ts` — sidebar session index over omp's session store (`history.db` titles, 8 KiB header scan, memoized per-transcript cost cache).
+- `src/sniff.ts` — OSC 1337 `omp_session_file` sniff: learns a freshly started session's file from the PTY stream.
+- `src/protocol.ts` — wire types plus the boundary validators shared by daemon and client.
+- `src/guards.ts` — `isRecord`, the shape guard every validator starts from.
+- `src/client.ts` — xterm.js pane (binary output in, JSON input/resize out) plus the pane menu/split layout and pin list.
 - `src/sidebar.ts` — persisted sidebar collapse/resize controls.
 - `src/selection.ts` — text-bounded selection painting for WebGL and DOM renderers.
-- `src/protocol.ts` — wire types shared by both sides.
-- `scripts/smoke.ts` — P0 acceptance test.
+- `scripts/smoke.ts` — end-to-end acceptance test; one `withDaemon` lifetime helper per scenario set.
+- `scripts/install-app.ts` — installs the built native release binary and per-user application-menu entry.
+- `src-tauri/` — native shell: `main.rs` entry, `daemon.rs` daemon identity probe and systemd start, `shell.rs` window policy, `bootstrap/` connection page.
+
+Cleanup note (behavior-preserving): dead helpers/exports removed (`headerButton`, `renderFocus`, `liveTitle`, `bindings`, `isString`/`isFiniteNumber`/`isBoolean`, `Runtime.exit`, the `Runtime` replay-limit constructor parameter); sidebar rows use one `sessionByPath` lookup map plus one `paneForRuntime` map instead of repeated `find`/`some` scans, and layout rendering walks the tree once per call; static responses share the `TEXT_ASSETS` dispatch and `no-store` headers; smoke starts one daemon per scenario set through `withDaemon`.

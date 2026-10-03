@@ -46,7 +46,7 @@ export type RuntimesResponse = {
 // Everything below crosses a process boundary (HTTP, websocket, localStorage).
 // Validate once here instead of casting and trusting reads at the use site.
 
-export function isRuntimeInfo(value: unknown): value is RuntimeInfo {
+function isRuntimeInfo(value: unknown): value is RuntimeInfo {
   if (!isRecord(value)) return false;
   if (typeof value.id !== "string" || typeof value.title !== "string" || typeof value.cwd !== "string") return false;
   if (value.pid !== null && typeof value.pid !== "number") return false;
@@ -56,8 +56,12 @@ export function isRuntimeInfo(value: unknown): value is RuntimeInfo {
 
 export function parseRuntimeList(payload: unknown): RuntimeInfo[] | null {
   if (!isRecord(payload) || !Array.isArray(payload.runtimes)) return null;
-  const runtimes = payload.runtimes.filter(isRuntimeInfo);
-  return runtimes.length === payload.runtimes.length ? runtimes : null;
+  const runtimes: RuntimeInfo[] = [];
+  for (const entry of payload.runtimes) {
+    if (!isRuntimeInfo(entry)) return null;
+    runtimes.push(entry);
+  }
+  return runtimes;
 }
 
 export function parseRuntimeOne(payload: unknown): RuntimeInfo | null {

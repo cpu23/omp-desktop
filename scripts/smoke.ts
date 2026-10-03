@@ -104,6 +104,16 @@ async function stopDaemon(proc: Bun.Subprocess): Promise<void> {
   await proc.exited;
 }
 
+/** Start one daemon, run a scenario set against it, and always stop it. */
+async function withDaemon(env: Record<string, string>, run: () => Promise<void>): Promise<void> {
+  const proc = await startDaemon(env);
+  try {
+    await run();
+  } finally {
+    await stopDaemon(proc);
+  }
+}
+
 async function createRuntime(request: Record<string, unknown>): Promise<RuntimeInfo> {
   const res = await fetch(`${BASE}/api/runtimes`, {
     method: "POST",
@@ -141,8 +151,11 @@ async function attach(runtimeId: string): Promise<Pane> {
   const ws = new WebSocket(`${WS_URL}?runtime=${encodeURIComponent(runtimeId)}`);
   ws.binaryType = "arraybuffer";
   let out = "";
+  // One decoder per pane keeps a multi-byte character split across two frames
+  // from being mangled: the PTY can cut anywhere, not just at character ends.
+  const decoder = new TextDecoder();
   ws.onmessage = (event) => {
-    if (event.data instanceof ArrayBuffer) out += new TextDecoder().decode(new Uint8Array(event.data));
+    if (event.data instanceof ArrayBuffer) out += decoder.decode(new Uint8Array(event.data), { stream: true });
   };
   await new Promise<void>((resolve, reject) => {
     ws.onopen = () => resolve();
@@ -175,7 +188,7 @@ async function phaseA(dir: string): Promise<void> {
   const tag = `omp-smoke-${Date.now()}`;
   pane.send(`echo ${tag}\n`);
   await waitFor(() => pane.text().includes(tag), 10_000, `echo ${tag} round-trip`);
-  assert(true, "input -> PTY -> output -> websocket round-trip");
+  console.log("ok - input -> PTY -> output -> websocket round-trip");
   const listed = await runtimes();
   assert(listed.some((entry) => entry.id === runtime.id), "runtime shows up in /api/runtimes");
   pane.close();
@@ -219,7 +232,7 @@ async function phaseC(dir: string): Promise<void> {
     10_000,
     "input on rebound panes",
   );
-  assert(true, "both rebound panes still take input; pids unchanged");
+  console.log("ok - both rebound panes still take input; pids unchanged");
 
   // Closing a pane must not kill the process: a pane is a view, the pool owns it.
   swappedA.close();
@@ -232,7 +245,7 @@ async function phaseC(dir: string): Promise<void> {
   await waitFor(async () => !(await runtimes()).some((entry) => entry.id === a.id), 5_000, "runtime removed");
   if (typeof pidA === "number") {
     await waitFor(() => !isAlive(pidA), 5_000, "killed runtime reaped");
-    assert(true, "killed runtime's process is gone (process group reaped)");
+    console.log("ok - killed runtime's process is gone (process group reaped)");
   }
   await fetch(`${BASE}/api/runtimes/${b.id}`, { method: "DELETE" });
 }
@@ -314,28 +327,23 @@ const pasteDir = join(dir, "pastes");
 console.log(`smoke: omp-desktopd + PTY pool (tmp ${dir})`);
 let failed = false;
 try {
-  const bashDaemon = await startDaemon({
-    OMP_DESKTOP_OMP: "/bin/bash",
-    OMP_DESKTOP_OMP_ARGS: "-i",
-    OMP_DESKTOP_OVERLAY: "",
-    OMP_DESKTOP_CWD: dir,
-    OMP_DESKTOP_PASTE_DIR: pasteDir,
-  });
-  try {
-    await phaseA(dir);
-    await phaseC(dir);
-    await phaseD();
-    await phaseE(pasteDir);
-  } finally {
-    await stopDaemon(bashDaemon);
-  }
+  await withDaemon(
+    {
+      OMP_DESKTOP_OMP: "/bin/bash",
+      OMP_DESKTOP_OMP_ARGS: "-i",
+      OMP_DESKTOP_OVERLAY: "",
+      OMP_DESKTOP_CWD: dir,
+      OMP_DESKTOP_PASTE_DIR: pasteDir,
+    },
+    async () => {
+      await phaseA(dir);
+      await phaseC(dir);
+      await phaseD();
+      await phaseE(pasteDir);
+    },
+  );
 
-  const ompDaemon = await startDaemon({ OMP_DESKTOP_CWD: dir });
-  try {
-    await phaseB();
-  } finally {
-    await stopDaemon(ompDaemon);
-  }
+  await withDaemon({ OMP_DESKTOP_CWD: dir }, phaseB);
   console.log("\nSMOKE PASSED");
 } catch (error) {
   failed = true;

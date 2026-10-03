@@ -9,7 +9,8 @@
  * Listing is a two-phase scan: collect and stat every `.jsonl` file first
  * (cheap), sort by mtime, then read only the first 8 KiB of the newest files
  * to recover identity/title/first prompt — transcripts reach beyond 1 MB and
- * this is polled. Nothing is cached; each call reflects the store on disk.
+ * this is polled. Header data is read fresh each call; only the per-transcript
+ * cost sums are memoized, keyed by (mtime, size) — see `costCache`.
  *
  * Robustness: a missing/nonexistent root, unreadable file or directory, or a
  * truncated JSONL line must never abort the listing. The header is parsed
@@ -17,7 +18,7 @@
  */
 
 import { Database } from "bun:sqlite";
-import { existsSync, type Dirent } from "node:fs";
+import { existsSync } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -138,33 +139,19 @@ export async function listSessions(
 /** Stat every `.jsonl` one level below `root`; unreadable entries are skipped. */
 async function collectSessionFiles(root: string): Promise<SessionFile[]> {
   const files: SessionFile[] = [];
-  let dirs: Dirent[];
-  try {
-    dirs = await readdir(root, { withFileTypes: true });
-  } catch {
-    return files;
-  }
+  const dirs = await readdir(root, { withFileTypes: true }).catch(() => []);
   await Promise.all(
     dirs.map(async (dir) => {
       if (!dir.isDirectory()) return;
       const dirPath = join(root, dir.name);
-      let entries: Dirent[];
-      try {
-        entries = await readdir(dirPath, { withFileTypes: true });
-      } catch {
-        return;
-      }
+      const entries = await readdir(dirPath, { withFileTypes: true }).catch(() => []);
       await Promise.all(
         entries.map(async (entry) => {
           if (!entry.name.endsWith(".jsonl")) return;
           const path = join(dirPath, entry.name);
-          try {
-            const info = await stat(path);
-            if (info.isFile()) {
-              files.push({ path, dir: dir.name, mtimeMs: info.mtimeMs, bytes: info.size });
-            }
-          } catch {
-            // Unreadable/vanished file: skip it, keep listing.
+          const info = await stat(path).catch(() => null); // vanished/unreadable
+          if (info?.isFile()) {
+            files.push({ path, dir: dir.name, mtimeMs: info.mtimeMs, bytes: info.size });
           }
         }),
       );

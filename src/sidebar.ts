@@ -24,13 +24,6 @@ const KEY_STEP = 16;
 const KEY_STEP_LARGE = 64;
 
 type SidebarState = { width: number; collapsed: boolean };
-type Controls = {
-  sidebar: HTMLElement;
-  resizer: HTMLElement;
-  collapse: HTMLElement;
-  expand: HTMLElement;
-  status: HTMLElement | null;
-};
 
 function maxWidth(): number {
   return Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, window.innerWidth - PANE_RESERVE));
@@ -68,10 +61,8 @@ function init(): void {
     console.warn("sidebar: collapse/resize controls missing from index.html");
     return;
   }
-  setup({ sidebar, resizer, collapse, expand, status: document.getElementById("status") });
-}
+  const status = document.getElementById("status");
 
-function setup({ sidebar, resizer, collapse, expand, status }: Controls): void {
   const stored = readState();
   let width = stored.width;
   let collapsed = stored.collapsed;
@@ -84,7 +75,7 @@ function setup({ sidebar, resizer, collapse, expand, status }: Controls): void {
     }
   }
 
-  function render(): void {
+  const render = (): void => {
     // Clamp for display only; the stored width is the user's intent and survives
     // a temporarily narrow window.
     const shown = clampWidth(width);
@@ -92,7 +83,7 @@ function setup({ sidebar, resizer, collapse, expand, status }: Controls): void {
     resizer.setAttribute("aria-valuenow", String(shown));
     resizer.setAttribute("aria-valuemin", String(MIN_WIDTH));
     resizer.setAttribute("aria-valuemax", String(maxWidth()));
-  }
+  };
 
   function setWidth(px: number, persist: boolean): void {
     width = clampWidth(px);
@@ -100,22 +91,22 @@ function setup({ sidebar, resizer, collapse, expand, status }: Controls): void {
     if (persist) saveState();
   }
 
-  function applyCollapsed(): void {
+  const applyCollapsed = (): void => {
     sidebar.hidden = collapsed;
     resizer.hidden = collapsed;
     expand.hidden = !collapsed;
     const expanded = String(!collapsed);
     collapse.setAttribute("aria-expanded", expanded);
     expand.setAttribute("aria-expanded", expanded);
-  }
+  };
 
-  function setCollapsed(next: boolean): void {
+  const setCollapsed = (next: boolean): void => {
     collapsed = next;
     applyCollapsed();
     // Hand focus to the control that is still on screen.
     (collapsed ? expand : collapse).focus();
     saveState();
-  }
+  };
 
   collapse.addEventListener("click", () => setCollapsed(true));
   expand.addEventListener("click", () => setCollapsed(false));

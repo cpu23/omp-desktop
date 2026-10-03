@@ -24,6 +24,7 @@ const OMP_OVERLAY = process.env.OMP_DESKTOP_OVERLAY ?? "";
 const MAX_RUNTIMES = Number(process.env.OMP_DESKTOP_MAX_RUNTIMES ?? 8);
 const SESSIONS_DIR =
   process.env.OMP_DESKTOP_SESSIONS_DIR ?? join(process.env.HOME ?? "", ".omp/agent/sessions");
+const SESSIONS_ROOT = resolve(SESSIONS_DIR);
 const PASTE_DIR = process.env.OMP_DESKTOP_PASTE_DIR ?? join(tmpdir(), "omp-desktop-pastes");
 const PASTE_TYPES: Record<string, string> = {
   "image/png": "png",
@@ -114,11 +115,15 @@ const stylesCode = await Bun.file(join(ROOT, "public/styles.css")).text();
 const BUILD = createHash("sha1").update(clientCode).update(stylesCode).digest("hex").slice(0, 7);
 const NO_STORE = { "cache-control": "no-store" };
 
-const assets = {
-  index: await Bun.file(join(ROOT, "public/index.html")).text(),
-  styles: stylesCode,
-  xterm: await Bun.file(join(ROOT, "node_modules/@xterm/xterm/css/xterm.css")).text(),
-  client: clientCode,
+/** Static text responses, keyed by the exact pathname they answer. */
+const TEXT_ASSETS: Record<string, { type: string; body: string }> = {
+  "/": { type: "text/html; charset=utf-8", body: await Bun.file(join(ROOT, "public/index.html")).text() },
+  "/client.js": { type: "text/javascript; charset=utf-8", body: clientCode },
+  "/styles.css": { type: "text/css; charset=utf-8", body: stylesCode },
+  "/xterm.css": {
+    type: "text/css; charset=utf-8",
+    body: await Bun.file(join(ROOT, "node_modules/@xterm/xterm/css/xterm.css")).text(),
+  },
 };
 
 type WsData = { runtime?: Runtime; unsubData?: () => void; unsubExit?: () => void };
@@ -150,9 +155,8 @@ async function serveFont(pathname: string): Promise<Response> {
 function validResume(path: string | undefined): string | null {
   if (!path || !isAbsolute(path) || !path.endsWith(".jsonl")) return null;
   const absolute = resolve(path);
-  if (!absolute.startsWith(resolve(SESSIONS_DIR) + "/")) return null;
-  if (!existsSync(absolute)) return null;
-  return absolute;
+  if (!absolute.startsWith(`${SESSIONS_ROOT}/`)) return null;
+  return existsSync(absolute) ? absolute : null;
 }
 
 const server = Bun.serve<WsData>({
@@ -166,30 +170,18 @@ const server = Bun.serve<WsData>({
       return srv.upgrade(req, { data: { runtime } }) ? undefined : new Response("upgrade failed", { status: 400 });
     }
     if (url.pathname.startsWith("/fonts/")) return serveFont(url.pathname);
+    const asset = TEXT_ASSETS[url.pathname];
+    if (req.method === "GET" && asset) {
+      return new Response(asset.body, { headers: { "content-type": asset.type, ...NO_STORE } });
+    }
     switch (`${req.method} ${url.pathname}`) {
-      case "GET /":
-        return new Response(assets.index, {
-          headers: { "content-type": "text/html; charset=utf-8", ...NO_STORE },
-        });
-      case "GET /client.js":
-        return new Response(assets.client, {
-          headers: { "content-type": "text/javascript; charset=utf-8", ...NO_STORE },
-        });
-      case "GET /styles.css":
-        return new Response(assets.styles, {
-          headers: { "content-type": "text/css; charset=utf-8", ...NO_STORE },
-        });
-      case "GET /xterm.css":
-        return new Response(assets.xterm, {
-          headers: { "content-type": "text/css; charset=utf-8", ...NO_STORE },
-        });
       case "GET /api/build":
         return Response.json({ build: BUILD }, { headers: NO_STORE });
       case "POST /api/paste": {
         // The browser owns the clipboard image; omp's TUI only reads text, so the
         // bytes land in a file and the pane types the path — what a terminal with
         // image paste does.
-        const type = (req.headers.get("content-type") ?? "").split(";")[0]?.trim().toLowerCase() ?? "";
+        const type = (req.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
         const ext = PASTE_TYPES[type];
         if (!ext) return new Response("unsupported image type", { status: 415 });
         const bytes = await req.arrayBuffer();
@@ -212,15 +204,17 @@ const server = Bun.serve<WsData>({
         const body: unknown = await req.json().catch(() => null);
         if (!isRecord(body)) return new Response("bad request", { status: 400 });
         const cwd = typeof body.cwd === "string" && existsSync(body.cwd) ? body.cwd : undefined;
-        const resumeRaw = typeof body.resume === "string" ? body.resume : undefined;
-        const resume = resumeRaw === undefined ? undefined : validResume(resumeRaw);
-        if (resumeRaw !== undefined && resume === null) {
-          return new Response("resume must be an existing session file under the session store", { status: 400 });
+        let resume: string | undefined;
+        if (typeof body.resume === "string") {
+          resume = validResume(body.resume) ?? undefined;
+          if (!resume) {
+            return new Response("resume must be an existing session file under the session store", { status: 400 });
+          }
         }
         try {
           const runtime = manager.create({
             cwd,
-            resume: resume ?? undefined,
+            resume,
             cols: typeof body.cols === "number" ? body.cols : undefined,
             rows: typeof body.rows === "number" ? body.rows : undefined,
           });
@@ -231,9 +225,9 @@ const server = Bun.serve<WsData>({
         }
       }
       case "GET /api/sessions": {
-        const limit = Number(url.searchParams.get("limit") ?? 60);
+        // `listSessions` owns limit validation; forwarding keeps one policy.
         const sessions = await listSessions({
-          limit: Number.isFinite(limit) && limit > 0 ? limit : 60,
+          limit: Number(url.searchParams.get("limit") ?? 60),
           search: url.searchParams.get("search") ?? undefined,
         });
         return Response.json({ sessions }, { headers: NO_STORE });

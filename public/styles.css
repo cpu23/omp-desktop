@@ -201,8 +201,7 @@ select:focus-visible {
   cursor: pointer;
   transition:
     border-color 0.15s ease,
-    color 0.15s ease,
-    background-color 0.15s ease;
+    color 0.15s ease;
 }
 
 .side-action:hover {
@@ -474,7 +473,6 @@ body.sidebar-resizing * {
   min-width: 0;
   min-height: 0;
   display: flex;
-  padding: 0;
 }
 
 .split {
@@ -482,8 +480,6 @@ body.sidebar-resizing * {
   flex: 1 1 0;
   min-width: 0;
   min-height: 0;
-  align-items: stretch;
-  gap: 0;
 }
 
 /* Split divider: the only gutter between sibling panes, so the gap the
@@ -527,11 +523,8 @@ body.sidebar-resizing * {
   min-height: 0;
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: 0;
   overflow: hidden;
-  transition:
-    border-color 0.16s ease,
-    box-shadow 0.16s ease;
+  transition: border-color 0.16s ease;
 }
 
 /* The drop target stays neutral (white) and nothing else: no tint or halo marks
@@ -597,7 +590,6 @@ body.sidebar-resizing * {
   z-index: 100;
   padding: 4px;
   max-width: 100vw;
-  box-sizing: border-box;
   background: var(--panel-raised);
   border: 1px solid var(--line);
   border-radius: 6px;
@@ -636,7 +628,6 @@ body.sidebar-resizing * {
 .pane-body {
   flex: 1 1 auto;
   min-height: 0;
-  padding: 0;
   overflow: hidden;
   background: var(--bg);
 }
