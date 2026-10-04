@@ -13,7 +13,7 @@
  * stored width cannot swallow a narrow window. Only user-driven changes
  * overwrite the stored intent; a shrinking window just clamps the display.
  */
-const STORE_KEY = "omp-desktop.sidebar.v1";
+export const STORE_KEY = "omp-desktop.sidebar.v1";
 /** Default width and the fallback in #sidebar's flex-basis; keep the two in sync. */
 const DEFAULT_WIDTH = 278;
 const MIN_WIDTH = 190;
@@ -25,6 +25,39 @@ const KEY_STEP_LARGE = 64;
 
 type SidebarState = { width: number; collapsed: boolean };
 
+/** Set by init(); null only in the instant before the controls are wired. */
+let applyExternalState: ((state: SidebarState) => void) | null = null;
+
+/** Set by the client so a user-driven width/collapse change reaches the durable mirror. */
+let notifyStateChange: (() => void) | null = null;
+
+/**
+ * Registers the client's hook for user-driven sidebar changes (collapse, resize,
+ * keyboard/double-click width). Adoption via applySidebarState notifies too, so
+ * one save path covers both.
+ */
+export function onSidebarStateChange(listener: () => void): void {
+  notifyStateChange = listener;
+}
+
+/**
+ * Adopt a persisted sidebar state, e.g. one the client restored from the
+ * daemon's durable workspace after browser storage was lost. Applies live once
+ * the controls are wired and persists it to the local cache.
+ */
+export function applySidebarState(value: unknown): void {
+  const state = parseSidebarState(value);
+  if (applyExternalState) {
+    applyExternalState(state);
+    return;
+  }
+  try {
+    localStorage.setItem(STORE_KEY, JSON.stringify(state));
+  } catch {
+    // Storage denied: the sidebar still works for this page life.
+  }
+}
+
 function maxWidth(): number {
   return Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, window.innerWidth - PANE_RESERVE));
 }
@@ -34,22 +67,27 @@ function clampWidth(px: number): number {
   return Math.round(Math.min(Math.max(value, MIN_WIDTH), maxWidth()));
 }
 
-function readState(): SidebarState {
-  try {
-    const raw: unknown = JSON.parse(localStorage.getItem(STORE_KEY) ?? "null");
-    if (typeof raw === "object" && raw !== null) {
-      const record = raw as Record<string, unknown>;
-      return {
-        width: typeof record.width === "number" && Number.isFinite(record.width)
-          ? Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, record.width))
-          : DEFAULT_WIDTH,
-        collapsed: record.collapsed === true,
-      };
-    }
-  } catch {
-    // Corrupt JSON or storage denied (private mode): defaults are fine.
+/** Validates an untrusted record (storage blob or durable state) into a usable state. */
+function parseSidebarState(value: unknown): SidebarState {
+  if (typeof value === "object" && value !== null) {
+    const record = value as Record<string, unknown>;
+    return {
+      width: typeof record.width === "number" && Number.isFinite(record.width)
+        ? Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, record.width))
+        : DEFAULT_WIDTH,
+      collapsed: record.collapsed === true,
+    };
   }
   return { width: DEFAULT_WIDTH, collapsed: false };
+}
+
+function readState(): SidebarState {
+  try {
+    return parseSidebarState(JSON.parse(localStorage.getItem(STORE_KEY) ?? "null"));
+  } catch {
+    // Corrupt JSON or storage denied (private mode): defaults are fine.
+    return { width: DEFAULT_WIDTH, collapsed: false };
+  }
 }
 
 function init(): void {
@@ -73,6 +111,8 @@ function init(): void {
     } catch {
       // Storage denied: the sidebar still works for this page life.
     }
+    // A settled width/collapse change is workspace state: let the client mirror it.
+    notifyStateChange?.();
   }
 
   const render = (): void => {
@@ -179,6 +219,14 @@ function init(): void {
     new MutationObserver(mirrorStatus).observe(status, { attributes: true, attributeFilter: ["data-kind"] });
     mirrorStatus();
   }
+
+  applyExternalState = (state) => {
+    width = clampWidth(state.width);
+    collapsed = state.collapsed === true;
+    saveState();
+    render();
+    applyCollapsed();
+  };
 
   render();
   applyCollapsed();

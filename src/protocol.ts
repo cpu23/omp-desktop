@@ -130,3 +130,22 @@ export function parseClientMessage(raw: string): ClientMessage | null {
   }
   return null;
 }
+
+/**
+ * `GET /api/state` response (`{ state, savedAt, corrupt, path }`). The document
+ * inside is owned by the client; the version check keeps this build from
+ * silently overwriting a newer format with its own.
+ */
+export type WorkspaceStatePayload =
+  | { kind: "none"; corrupt: boolean }
+  | { kind: "unsupported"; version: unknown }
+  | { kind: "state"; state: Record<string, unknown> };
+
+export function parseStateResponse(payload: unknown): WorkspaceStatePayload | null {
+  if (!isRecord(payload)) return null;
+  const state = payload.state;
+  if (state === null || state === undefined) return { kind: "none", corrupt: payload.corrupt === true };
+  if (!isRecord(state)) return null;
+  if (state.version !== 1) return { kind: "unsupported", version: state.version };
+  return { kind: "state", state };
+}

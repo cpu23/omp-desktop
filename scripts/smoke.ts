@@ -9,10 +9,11 @@
  * them, and neither process restarts — same pids, same output streams.
  * Phase D exercises the session index behind the sidebar.
  * Phase E covers clipboard image paste: stored bytes, rejected types, empty bodies.
+ * Phase H proves resume uses the transcript's recorded cwd, not OMP_DESKTOP_CWD.
  *
  * Run: bun run smoke
  */
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isRecord } from "../src/guards";
@@ -301,7 +302,7 @@ async function phaseE(pasteDir: string): Promise<void> {
   assert(res.status === 200, "paste accepts an image/png body");
   const payload: unknown = await res.json();
   assert(isRecord(payload) && typeof payload.path === "string", "paste returns a path");
-  const path = (payload as { path: string }).path;
+  const path = payload.path;
   assert(path.startsWith(pasteDir), `paste is written under the configured directory (${path})`);
   const written = new Uint8Array(await Bun.file(path).arrayBuffer());
   assert(
@@ -322,8 +323,115 @@ async function phaseE(pasteDir: string): Promise<void> {
   assert(empty.status === 400, "paste rejects an empty body");
 }
 
+/** The exact document written in phase F; phase G compares the daemon's copy against it. */
+let writtenState = "";
+
+async function phaseF(stateDir: string): Promise<void> {
+  console.log("\n-- Phase F: durable workspace state");
+  const fresh = await fetch(`${BASE}/api/state`);
+  assert(fresh.ok, "GET /api/state answers on a fresh state dir");
+  const freshBody: unknown = await fresh.json();
+  assert(isRecord(freshBody) && freshBody.state === null, "no state is stored yet");
+  assert(
+    freshBody.path === join(stateDir, "state.json"),
+    `state file lives under OMP_DESKTOP_STATE_DIR (${String(freshBody.path)})`,
+  );
+
+  const doc = {
+    version: 1,
+    savedAt: new Date().toISOString(),
+    layout: {
+      tree: {
+        kind: "split",
+        dir: "row",
+        ratio: 0.5,
+        a: { kind: "leaf", pane: "p1" },
+        b: { kind: "leaf", pane: "p2" },
+      },
+      panes: {
+        p1: { runtimeId: null, title: "restart smoke", sessionFile: "/tmp/omp-smoke-session.jsonl" },
+        p2: { runtimeId: null, title: null, sessionFile: null },
+      },
+      focused: "p2",
+    },
+    pins: [],
+    cellSize: 14.33,
+    sidebar: JSON.stringify({ width: 300, collapsed: false }),
+  };
+  writtenState = JSON.stringify(doc);
+  const put = await fetch(`${BASE}/api/state`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: writtenState,
+  });
+  assert(put.ok, "PUT /api/state stores a v1 document");
+  const got = await fetch(`${BASE}/api/state`);
+  const gotBody: unknown = await got.json();
+  assert(
+    isRecord(gotBody) && JSON.stringify(gotBody.state) === writtenState,
+    "GET /api/state returns the stored document",
+  );
+  const wrongVersion = await fetch(`${BASE}/api/state`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ version: 2, savedAt: new Date().toISOString() }),
+  });
+  assert(wrongVersion.status === 400, "PUT rejects a non-v1 document");
+  const notJson = await fetch(`${BASE}/api/state`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: "not json",
+  });
+  assert(notJson.status === 400, "PUT rejects a non-JSON body");
+}
+
+/** Runs on a second daemon sharing the state dir: the document survived the restart. */
+async function phaseG(stateDir: string): Promise<void> {
+  console.log("\n-- Phase G: workspace state survives a daemon restart");
+  assert(await Bun.file(join(stateDir, "state.json")).exists(), "state file is on disk");
+  const res = await fetch(`${BASE}/api/state`);
+  assert(res.ok, "GET /api/state after restart");
+  const body: unknown = await res.json();
+  assert(isRecord(body) && JSON.stringify(body.state) === writtenState, "stored document is unchanged");
+}
+
+type CwdFixture = { sessionPath: string; project: string; launch: string };
+
+/**
+ * Isolated store + transcript: resume must run in the directory recorded in the
+ * transcript, never the daemon's OMP_DESKTOP_CWD fallback, and a conflicting
+ * explicit cwd must not override the recorded one.
+ */
+async function phaseH(fixture: CwdFixture): Promise<void> {
+  console.log("\n-- Phase H: resume uses the session's recorded cwd");
+  const resumed = await createRuntime({ resume: fixture.sessionPath });
+  assert(resumed.cwd === fixture.project, `resume without cwd uses the recorded cwd (${resumed.cwd})`);
+  const resumedPane = await attach(resumed.id);
+  await waitFor(() => resumedPane.text().includes(`${fixture.project}\r\n`), 5_000, "resumed process reports its actual project cwd");
+  resumedPane.close();
+  const conflicting = await createRuntime({ resume: fixture.sessionPath, cwd: fixture.launch });
+  assert(conflicting.cwd === fixture.project, `resume ignores a conflicting explicit cwd (${conflicting.cwd})`);
+  const fresh = await createRuntime({ cwd: fixture.launch });
+  assert(fresh.cwd === fixture.launch, "new sessions still start in the requested cwd");
+  const listed = await sessions(5, "smoke cwd fixture");
+  const row = listed.find((session) => session.path === fixture.sessionPath);
+  assert(row?.cwd === fixture.project, `session index lists the recorded cwd (${row?.cwd ?? "<missing>"})`);
+  console.log("ok - recorded cwd wins on resume; explicit cwd still applies to new sessions");
+  for (const runtime of [resumed, conflicting, fresh]) {
+    await fetch(`${BASE}/api/runtimes/${runtime.id}`, { method: "DELETE" });
+  }
+  const concurrent = await Promise.all(Array.from({ length: 9 }, () => fetch(`${BASE}/api/runtimes`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ resume: fixture.sessionPath }),
+  })));
+  assert(concurrent.filter((response) => response.ok).length === 8, "concurrent transcript reads cannot exceed runtime capacity");
+  assert(concurrent.filter((response) => response.status === 409).length === 1, "one concurrent resume is rejected at capacity");
+}
+
 const dir = mkdtempSync(join(tmpdir(), "omp-smoke-"));
 const pasteDir = join(dir, "pastes");
+const stateDir = join(dir, "state");
 console.log(`smoke: omp-desktopd + PTY pool (tmp ${dir})`);
 let failed = false;
 try {
@@ -334,16 +442,68 @@ try {
       OMP_DESKTOP_OVERLAY: "",
       OMP_DESKTOP_CWD: dir,
       OMP_DESKTOP_PASTE_DIR: pasteDir,
+      OMP_DESKTOP_STATE_DIR: stateDir,
     },
     async () => {
       await phaseA(dir);
       await phaseC(dir);
       await phaseD();
       await phaseE(pasteDir);
+      await phaseF(stateDir);
     },
   );
 
-  await withDaemon({ OMP_DESKTOP_CWD: dir }, phaseB);
+  await withDaemon(
+    { OMP_DESKTOP_CWD: dir, OMP_DESKTOP_STATE_DIR: stateDir },
+    async () => {
+      await phaseG(stateDir);
+      await phaseB();
+    },
+  );
+
+  // Isolated store for phase H: the fixture transcript records its own cwd, and
+  // the daemon's OMP_DESKTOP_CWD is a different (launch-fallback) directory.
+  const fixtureRoot = join(dir, "cwd-fixture");
+  const fixtureSessions = join(fixtureRoot, "sessions");
+  const fixtureProject = join(fixtureRoot, "project");
+  const fixtureLaunch = join(fixtureRoot, "launch");
+  const fixturePath = join(
+    fixtureSessions,
+    "-tmp-smoke-cwd-fixture",
+    "2026-10-04T00-00-00-000Z_01a10000-0000-7000-8000-000000000009.jsonl",
+  );
+  mkdirSync(join(fixtureSessions, "-tmp-smoke-cwd-fixture"), { recursive: true });
+  mkdirSync(fixtureProject, { recursive: true });
+  mkdirSync(fixtureLaunch, { recursive: true });
+  writeFileSync(
+    fixturePath,
+    [
+      JSON.stringify({ type: "title", v: 1, title: "smoke cwd fixture", updatedAt: new Date().toISOString() }),
+      JSON.stringify({
+        type: "session",
+        version: 3,
+        id: "01a10000-0000-7000-8000-000000000009",
+        timestamp: new Date().toISOString(),
+        cwd: fixtureProject,
+      }),
+    ].join("\n") + "\n",
+  );
+  await withDaemon(
+    {
+      OMP_DESKTOP_OMP: "/bin/sh",
+      OMP_DESKTOP_OMP_ARGS: "-c pwd",
+      OMP_DESKTOP_OVERLAY: "",
+      OMP_DESKTOP_EXTENSION: "",
+      OMP_DESKTOP_MAX_RUNTIMES: "8",
+      OMP_DESKTOP_CWD: fixtureLaunch,
+      OMP_DESKTOP_SESSIONS_DIR: fixtureSessions,
+      OMP_DESKTOP_PASTE_DIR: join(fixtureRoot, "pastes"),
+      OMP_DESKTOP_STATE_DIR: join(fixtureRoot, "state"),
+    },
+    async () => {
+      await phaseH({ sessionPath: fixturePath, project: fixtureProject, launch: fixtureLaunch });
+    },
+  );
   console.log("\nSMOKE PASSED");
 } catch (error) {
   failed = true;

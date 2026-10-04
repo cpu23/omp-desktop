@@ -136,6 +136,23 @@ export async function listSessions(
   return matched.slice(0, limit);
 }
 
+/**
+ * Working directory recorded in a transcript's `session` header, for resume.
+ * This is the session's own project directory; the process launch directory is
+ * unrelated — omp switches to the recorded cwd itself when resuming. Returns
+ * null for an unreadable file or a transcript predating the header, so callers
+ * keep their own fallback.
+ */
+export async function readSessionCwd(path: string): Promise<string | null> {
+  let head: string;
+  try {
+    head = await Bun.file(path).slice(0, HEADER_BYTES).text();
+  } catch {
+    return null;
+  }
+  return parseHead(head).cwd;
+}
+
 /** Stat every `.jsonl` one level below `root`; unreadable entries are skipped. */
 async function collectSessionFiles(root: string): Promise<SessionFile[]> {
   const files: SessionFile[] = [];

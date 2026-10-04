@@ -4,9 +4,10 @@ import { existsSync, readFileSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { RuntimeManager, RuntimeCapacityError } from "./manager";
-import { listSessions } from "./sessions";
+import { listSessions, readSessionCwd } from "./sessions";
 import { isRecord } from "./guards";
 import { parseClientMessage, type RuntimesResponse, type ServerMessage } from "./protocol";
+import { STATE_LIMIT_BYTES, WorkspaceStateStore } from "./state";
 import type { Runtime } from "./runtime";
 
 const HOST = process.env.OMP_DESKTOP_HOST ?? "127.0.0.1";
@@ -33,6 +34,17 @@ const PASTE_TYPES: Record<string, string> = {
   "image/gif": "gif",
 };
 const PASTE_LIMIT = 32 * 1024 * 1024;
+// Durable workspace state (layout, pins, settings). The client caches it in
+// browser storage and mirrors every change here, so a reboot, a cleared browser
+// profile or a different port cannot lose the workspace description. Tests and
+// secondary daemons must set OMP_DESKTOP_STATE_DIR (or _FILE) to stay off the
+// user's real state file.
+const STATE_DIR = resolve(
+  process.env.OMP_DESKTOP_STATE_DIR ??
+    join(process.env.XDG_STATE_HOME ?? join(process.env.HOME ?? "", ".local/state"), "omp-desktop"),
+);
+const STATE_FILE = process.env.OMP_DESKTOP_STATE_FILE ?? join(STATE_DIR, "state.json");
+const stateStore = new WorkspaceStateStore(STATE_FILE);
 // Empty OMP_DESKTOP_OVERLAY disables the overlay: non-omp binaries (smoke test's
 // bash) reject unknown flags.
 const OVERLAY_ARGS = OMP_OVERLAY ? ["--config", OMP_OVERLAY] : [];
@@ -81,6 +93,9 @@ const manager = new RuntimeManager({
   cols: 120,
   rows: 32,
   maxRuntimes: Number.isFinite(MAX_RUNTIMES) && MAX_RUNTIMES > 0 ? MAX_RUNTIMES : 8,
+  // Resume works in the directory recorded in the transcript, never the daemon's
+  // launch dir (see RuntimeManager.#workingDirectory).
+  readResumeCwd: readSessionCwd,
   env: {
     // process.env values are `string | undefined`; drop the undefined entries so the
     // child inherits exactly the defined parent environment.
@@ -177,6 +192,49 @@ const server = Bun.serve<WsData>({
     switch (`${req.method} ${url.pathname}`) {
       case "GET /api/build":
         return Response.json({ build: BUILD }, { headers: NO_STORE });
+      case "GET /api/state": {
+        try {
+          return Response.json(await stateStore.read(), { headers: NO_STORE });
+        } catch (error) {
+          return new Response(
+            `state read failed: ${error instanceof Error ? error.message : String(error)}`,
+            { status: 500 },
+          );
+        }
+      }
+      case "PUT /api/state": {
+        const declared = Number(req.headers.get("content-length") ?? "0");
+        if (Number.isFinite(declared) && declared > STATE_LIMIT_BYTES) {
+          return new Response("state document too large", { status: 413 });
+        }
+        const text = await req.text();
+        if (Buffer.byteLength(text) > STATE_LIMIT_BYTES) {
+          return new Response("state document too large", { status: 413 });
+        }
+        let body: unknown;
+        try {
+          body = JSON.parse(text);
+        } catch {
+          return new Response("state document must be JSON", { status: 400 });
+        }
+        // The client owns the document shape; the daemon pins only `version` and
+        // `savedAt`, so a future format needs no daemon change. A malformed
+        // layout cannot hurt the daemon because it never acts on this document.
+        if (!isRecord(body) || body.version !== 1 || typeof body.savedAt !== "string") {
+          return new Response("state document must be a version 1 workspace", { status: 400 });
+        }
+        try {
+          return Response.json(
+            { ok: true, path: STATE_FILE, ...(await stateStore.write(body)) },
+            { headers: NO_STORE },
+          );
+        } catch (error) {
+          return new Response(
+            `state save failed: ${error instanceof Error ? error.message : String(error)}`,
+            { status: 500 },
+          );
+        }
+      }
       case "POST /api/paste": {
         // The browser owns the clipboard image; omp's TUI only reads text, so the
         // bytes land in a file and the pane types the path — what a terminal with
@@ -212,7 +270,7 @@ const server = Bun.serve<WsData>({
           }
         }
         try {
-          const runtime = manager.create({
+          const runtime = await manager.create({
             cwd,
             resume,
             cols: typeof body.cols === "number" ? body.cols : undefined,
@@ -281,6 +339,7 @@ const server = Bun.serve<WsData>({
 });
 
 console.log(`omp-desktopd listening on http://${HOST}:${server.port}`);
+console.log(`omp-desktopd workspace state: ${STATE_FILE}`);
 
 let shuttingDown = false;
 function shutdown(code = 0): void {

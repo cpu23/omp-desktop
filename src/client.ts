@@ -1,5 +1,5 @@
 import { trimSelectionHighlight } from "./selection";
-import "./sidebar";
+import { applySidebarState, onSidebarStateChange, STORE_KEY as SIDEBAR_KEY } from "./sidebar";
 import { Terminal } from "@xterm/xterm";
 import { ImageAddon } from "@xterm/addon-image";
 import { WebglAddon } from "@xterm/addon-webgl";
@@ -10,9 +10,14 @@ import {
   parseRuntimeOne,
   parseServerMessage,
   parseSessionList,
+  parseStateResponse,
   type RuntimeInfo,
   type SessionSummaryLike,
 } from "./protocol";
+
+// Sidebar width/collapse is workspace state; the sidebar announces settled
+// changes so they take the same durable-save path as panes, pins and font size.
+onSidebarStateChange(() => queueStateSave());
 
 const statusEl = document.getElementById("status") as HTMLElement;
 const buildEl = document.getElementById("build") as HTMLElement;
@@ -35,6 +40,10 @@ const CELL_MIN = 8;
 const CELL_MAX = 28;
 const CELL_KEY = "omp-desktop.cellSize";
 const LAYOUT_KEY = "omp-desktop.layout.v1";
+/** Workspace document format mirrored to the daemon's durable state file. */
+const STATE_VERSION = 1;
+/** Keep in sync with src/state.ts so an oversized document fails before the wire. */
+const STATE_LIMIT_BYTES = 1024 * 1024;
 const MAX_PANES = 4;
 /** Divider drag clamp; the stored-layout reader accepts 0.1..0.9, so stay inside it. */
 const RATIO_MIN = 0.15;
@@ -57,6 +66,8 @@ type StoredLayout = { tree: LayoutNode; panes: Record<string, PaneBinding>; focu
 
 const panes = new Map<string, Pane>();
 let layout: StoredLayout = { tree: { kind: "leaf", pane: "p1" }, panes: {}, focused: "p1" };
+/** True when the current panes came from a stored document (browser or daemon). */
+let restoredLocal = false;
 let runtimes: RuntimeInfo[] = [];
 let sessions: SessionSummaryLike[] = [];
 let daemonUp = false;
@@ -71,12 +82,30 @@ function readPins(): SessionSummaryLike[] {
 }
 let pinnedSessions = readPins();
 
+/** Sticky while the durable workspace copy cannot be written; shown by setStatus. */
+let stateSaveError: string | null = null;
+let stateDelivering = false;
+let stateQueued = false;
+/**
+ * Publishing gate. Closed until the daemon's document has been read (or proven
+ * absent) and every adopted field is in memory, so a partial or fallback
+ * workspace can never overwrite the durable copy. Browser storage keeps caching
+ * while closed; only the daemon PUT is held back.
+ */
+let stateGate: "pending" | "ready" | "blocked" = "pending";
+/** Why publishing is blocked; surfaced when a save is attempted while gated. */
+let stateGateReason = "";
+/** Fingerprint of the last document the daemon accepted, to skip no-op PUTs. */
+let deliveredState = "";
+
 function savePins(): void {
   try {
     localStorage.setItem(PINS_KEY, JSON.stringify(pinnedSessions));
   } catch {
-    setStatus("Pinned chats cannot be saved in this browser", "warn");
+    console.warn("omp-desktop: pinned chats cannot be cached in browser storage");
+    setStatus("Pinned chats cannot be cached in this browser — saved on the daemon only", "warn");
   }
+  queueStateSave();
 }
 
 function pinButton(session: SessionSummaryLike | null): HTMLButtonElement {
@@ -131,12 +160,12 @@ async function getJson(path: string, init?: RequestInit): Promise<unknown | null
   }
 }
 
-async function refreshRuntimes(): Promise<void> {
+async function refreshRuntimes(): Promise<boolean> {
   const list = parseRuntimeList(await getJson("/api/runtimes"));
   if (!list) {
     daemonUp = false;
     renderSidebar();
-    return;
+    return false;
   }
   daemonUp = true;
   runtimes = list;
@@ -151,6 +180,7 @@ async function refreshRuntimes(): Promise<void> {
   renderSidebar();
   for (const pane of panes.values()) pane.syncFromRuntimes();
   setStatus(`${runtimes.length} live`, "ok");
+  return true;
 }
 
 async function refreshSessions(): Promise<void> {
@@ -190,10 +220,13 @@ async function uploadPaste(file: File): Promise<string | null> {
 
 // ---------------------------------------------------------------- panes
 
+/** Title/cwd for a transcript path from the loaded list or a pinned snapshot. */
+function sessionSummary(path: string): SessionSummaryLike | undefined {
+  return sessions.find((session) => session.path === path) ?? pinnedSessions.find((session) => session.path === path);
+}
+
 function displayTitle(runtime: RuntimeInfo): string {
-  const match = runtime.sessionFile
-    ? sessions.find((session) => session.path === runtime.sessionFile)
-    : undefined;
+  const match = runtime.sessionFile ? sessionSummary(runtime.sessionFile) : undefined;
   if (match) return match.title;
   if (runtime.title && !/^\d{4}-\d{2}-\d{2}T/.test(runtime.title)) return runtime.title;
   return runtime.cwd.replace(/^\/home\/[^/]+/, "~") || runtime.id;
@@ -488,10 +521,12 @@ class Pane {
   }
 
   bind(binding: PaneBinding): void {
+    const changed = this.binding.runtimeId !== binding.runtimeId;
+    if (changed || !binding.runtimeId) this.detach();
     this.binding = binding;
-    if (!binding.runtimeId) this.detach();
     this.renderPlaceholder();
-    if (binding.runtimeId) this.attach();
+    // Selecting the current session must not replay it or add another stream.
+    if (binding.runtimeId && !this.ws) this.attach();
     this.renderHeader();
     save();
     renderSidebar();
@@ -507,6 +542,9 @@ class Pane {
   attach(): void {
     const runtimeId = this.binding.runtimeId;
     if (!runtimeId) return;
+    // A pane owns one stream. Rebinding must stop its previous subscription
+    // before replacing the socket that detach() knows how to close.
+    this.detach();
     const runtime = runtimes.find((candidate) => candidate.id === runtimeId);
     if (!runtime) {
       this.runtimeGone();
@@ -518,13 +556,19 @@ class Pane {
     socket.binaryType = "arraybuffer";
     this.ws = socket;
     socket.onopen = () => {
-      this.binding.sessionFile = runtime.sessionFile;
+      if (this.ws !== socket) return;
+      this.term.reset();
+      // The daemon may not have sniffed the session file yet (or ever, for a
+      // session started this instant); keep a known transcript identity instead
+      // of overwriting it with null.
+      if (runtime.sessionFile) this.binding.sessionFile = runtime.sessionFile;
       this.sendResize(true);
       this.fitPane();
       if (layout.focused === this.id) this.term.focus();
       save();
     };
     socket.onmessage = (event) => {
+      if (this.ws !== socket) return;
       if (typeof event.data === "string") {
         this.#handleControl(event.data);
         return;
@@ -550,7 +594,10 @@ class Pane {
     if (!msg) return;
     if (msg.type === "hello") {
       this.binding.title = displayTitle(msg.runtime);
-      this.binding.sessionFile = msg.runtime.sessionFile;
+      // Same rule as onopen: an unknown file must not erase the one the pane
+      // already holds, or a resume would lose its transcript identity until the
+      // next sniff.
+      if (msg.runtime.sessionFile) this.binding.sessionFile = msg.runtime.sessionFile;
       this.renderHeader();
       renderSidebar();
       // Persist the sniffed session file: it is what "resume this session" and
@@ -573,6 +620,12 @@ class Pane {
   }
 
   syncFromRuntimes(): void {
+    // An unreplied refresh means the daemon is unreachable, not that every
+    // runtime is gone: never clear a binding from missing data.
+    if (!daemonUp) {
+      this.renderPlaceholder();
+      return;
+    }
     const runtimeId = this.binding.runtimeId;
     const runtime = runtimeId ? runtimes.find((candidate) => candidate.id === runtimeId) : undefined;
     if (runtime) {
@@ -625,7 +678,9 @@ class Pane {
     row.style.gap = "8px";
     const sessionFile = this.binding.sessionFile;
     if (sessionFile) {
-      const known = sessions.find((session) => session.path === sessionFile);
+      // Pins keep older transcripts reachable, so they carry the fallback cwd too;
+      // the daemon resolves the recorded cwd itself when the file has one.
+      const known = sessionSummary(sessionFile);
       const resume = document.createElement("button");
       resume.textContent = "resume this session";
       resume.addEventListener("click", () =>
@@ -951,7 +1006,10 @@ function renderSidebar(): void {
   const pinnedRows: HTMLElement[] = [];
   const otherRows: HTMLElement[] = [];
   const liveRuntimes = query
-    ? runtimes.filter((runtime) => `${displayTitle(runtime)} ${runtime.cwd}`.toLowerCase().includes(query))
+    ? runtimes.filter((runtime) => {
+      const summary = runtime.sessionFile ? sessionSummary(runtime.sessionFile) : undefined;
+      return `${displayTitle(runtime)} ${summary?.cwd ?? runtime.cwd}`.toLowerCase().includes(query);
+    })
     : runtimes;
   const candidates = new Map(pinnedSessions.map((session) => [session.path, session]));
   for (const session of sessions) candidates.set(session.path, session);
@@ -977,17 +1035,22 @@ function renderSidebar(): void {
 
   for (const runtime of liveRuntimes) {
     const title = displayTitle(runtime);
+    // The transcript's recorded directory is the session's project; runtime.cwd
+    // is only the process launch dir (equal for a resumed session, not for one
+    // omp relocated out of a disallowed launch dir).
+    const summary = runtime.sessionFile ? sessionSummary(runtime.sessionFile) : undefined;
+    const cwd = summary?.cwd ?? runtime.cwd;
     const row = document.createElement("div");
     row.className = runtime.alive ? "row live" : "row recent";
     row.draggable = true;
-    row.title = `${runtime.cwd}\n${runtime.sessionFile ?? "(session file not known yet)"}\n${runtime.id}`;
+    row.title = `${cwd}\n${runtime.sessionFile ?? "(session file not known yet)"}\n${runtime.id}`;
     const ownerId = paneForRuntime.get(runtime.id);
     const name = document.createElement("span");
     name.className = "name";
     name.textContent = title;
     const sub = document.createElement("span");
     sub.className = "sub";
-    sub.textContent = ownerId ? ownerId.replace("p", "pane ") : runtime.cwd.replace(/^\/home\/[^/]+/, "~");
+    sub.textContent = ownerId ? ownerId.replace("p", "pane ") : cwd.replace(/^\/home\/[^/]+/, "~");
     const kill = document.createElement("button");
     kill.className = "kill";
     kill.textContent = "✕";
@@ -997,8 +1060,8 @@ function renderSidebar(): void {
       void killRuntime(runtime.id);
     });
     const snapshot = runtime.sessionFile
-      ? sessionByPath.get(runtime.sessionFile) ?? {
-        id: runtime.id, path: runtime.sessionFile, cwd: runtime.cwd,
+      ? summary ?? {
+        id: runtime.id, path: runtime.sessionFile, cwd,
         title, updatedAt: runtime.lastActivity ?? runtime.startedAt ?? new Date().toISOString(),
         costUsd: 0,
       }
@@ -1096,8 +1159,170 @@ function save(): void {
   try {
     localStorage.setItem(LAYOUT_KEY, JSON.stringify(layout));
   } catch {
-    // private mode / quota: layout just will not survive reload
+    console.warn("omp-desktop: workspace layout cannot be cached in browser storage");
+    setStatus("Browser storage unavailable — workspace is kept on the daemon only", "warn");
   }
+  queueStateSave();
+}
+
+/** Everything a restart or a cleared browser profile needs to rebuild the workspace. */
+function workspaceStateDoc(): unknown {
+  return {
+    version: STATE_VERSION,
+    savedAt: new Date().toISOString(),
+    layout,
+    pins: pinnedSessions,
+    cellSize,
+    sidebar: localStorage.getItem(SIDEBAR_KEY),
+  };
+}
+
+/**
+ * Mirror the workspace to the daemon's state file (durable) while browser storage
+ * stays the fast cache. Serialized: a save during a PUT queues one follow-up, so
+ * the document that lands on disk is the last one, not an earlier one. A failure
+ * stays visible in the status chip until the next state change persists it.
+ */
+function queueStateSave(): void {
+  if (stateDelivering) {
+    stateQueued = true;
+    return;
+  }
+  void deliverState();
+}
+
+async function deliverState(): Promise<void> {
+  if (stateGate !== "ready") {
+    // The local cache already holds the change; publishing waits for a compatible
+    // read so a partial or fallback document cannot replace the daemon's copy.
+    if (stateGate === "blocked") {
+      const message = `workspace state not saved: ${stateGateReason}`;
+      if (stateSaveError !== message) {
+        stateSaveError = message;
+        console.warn("omp-desktop:", message);
+        setStatus(message, "warn");
+      }
+    }
+    return;
+  }
+  if (stateDelivering) {
+    stateQueued = true;
+    return;
+  }
+  stateDelivering = true;
+  try {
+    do {
+      stateQueued = false;
+      const fingerprint = JSON.stringify({
+        layout,
+        pins: pinnedSessions,
+        cellSize,
+        sidebar: localStorage.getItem(SIDEBAR_KEY),
+      });
+      if (fingerprint === deliveredState) break;
+      const body = JSON.stringify(workspaceStateDoc());
+      const bodyBytes = new TextEncoder().encode(body).length;
+      if (bodyBytes > STATE_LIMIT_BYTES) {
+        stateSaveError = `workspace state is too large to save (${Math.ceil(bodyBytes / 1024)} KiB)`;
+        setStatus(stateSaveError, "warn");
+        break;
+      }
+      const res = await fetch("/api/state", {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body,
+      });
+      if (!res.ok) {
+        const detail = (await res.text().catch(() => "")).slice(0, 200);
+        throw new Error(detail || `HTTP ${res.status}`);
+      }
+      deliveredState = fingerprint;
+      if (stateSaveError) {
+        stateSaveError = null;
+        setStatus("workspace state saved", "ok");
+      }
+    } while (stateQueued);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    const message = `workspace state not saved: ${detail}`;
+    if (stateSaveError !== message) {
+      stateSaveError = message;
+      console.warn("omp-desktop:", message, error);
+      setStatus(message, "warn");
+    }
+  } finally {
+    stateDelivering = false;
+  }
+}
+
+/** Union of two pin lists by transcript path; the fresher snapshot wins, local on ties. */
+function mergePins(local: SessionSummaryLike[], remote: SessionSummaryLike[]): SessionSummaryLike[] {
+  const byPath = new Map<string, SessionSummaryLike>();
+  for (const pin of [...remote, ...local]) {
+    const existing = byPath.get(pin.path);
+    if (!existing || !(Date.parse(existing.updatedAt) > Date.parse(pin.updatedAt))) byPath.set(pin.path, pin);
+  }
+  return [...byPath.values()];
+}
+
+/**
+ * Adopts the daemon's durable workspace when this browser has none (cleared
+ * storage, different port), merges pins both ways, then republishes the result.
+ * The publishing gate opens only after this read succeeded (or proved the file
+ * absent) and every adopted field is in memory, so a partial or fallback
+ * document can never overwrite the durable copy.
+ */
+async function reconcileWorkspaceState(): Promise<void> {
+  const payload = parseStateResponse(await getJson("/api/state"));
+  if (payload === null) {
+    // Unreadable copy: publishing stays closed so fallback state cannot replace it.
+    stateGate = "blocked";
+    stateGateReason = "the daemon's saved workspace could not be read";
+    return;
+  }
+  if (payload.kind === "unsupported") {
+    // A newer document must not be overwritten by this build either.
+    stateGate = "blocked";
+    stateGateReason = `the state file is version ${String(payload.version)} — update the app to read it`;
+    setStatus(`workspace state file is version ${String(payload.version)} — update the app to read it`, "warn");
+    return;
+  }
+  if (payload.kind === "none") {
+    if (payload.corrupt) console.warn("omp-desktop: workspace state file is not valid JSON; replacing it");
+  } else {
+    const state = payload.state;
+    if (!restoredLocal) {
+      const stored = parseStoredLayout(state.layout);
+      if (stored && applyStoredLayout(stored)) {
+        restoredLocal = true;
+        // Repopulate the browser cache from the adopted document, so a later
+        // reload (even with the daemon down) still has the workspace. The publish
+        // this queues is held by the gate until adoption finishes.
+        save();
+        // Adopted bindings may name runtimes this daemon still has.
+        for (const pane of panes.values()) pane.syncFromRuntimes();
+      }
+    }
+    const mergedPins = mergePins(pinnedSessions, parseSessionList({ sessions: state.pins }) ?? []);
+    if (JSON.stringify(mergedPins) !== JSON.stringify(pinnedSessions)) {
+      pinnedSessions = mergedPins;
+      savePins();
+    }
+    const remoteCellSize = typeof state.cellSize === "number" && Number.isFinite(state.cellSize) ? state.cellSize : null;
+    if (remoteCellSize !== null && localStorage.getItem(CELL_KEY) === null) setCellSize(remoteCellSize);
+    const remoteSidebar = typeof state.sidebar === "string" && state.sidebar.length <= 4096 ? state.sidebar : null;
+    if (remoteSidebar && localStorage.getItem(SIDEBAR_KEY) === null) {
+      try {
+        applySidebarState(JSON.parse(remoteSidebar));
+      } catch {
+        // A malformed sidebar cache only costs the preferred width; ignore it.
+      }
+    }
+  }
+  // Compatible read and every adopted field in memory: the next publish carries
+  // the whole workspace, never a partial one.
+  stateGate = "ready";
+  queueStateSave();
 }
 
 /** localStorage is still a boundary: a hand-edited or older blob must not crash boot. */
@@ -1130,6 +1355,27 @@ function parseTree(value: unknown, depth: number): LayoutNode | null {
   return null;
 }
 
+/** Rebuilds the pane grid from a stored document; false when it has no usable leaf. */
+function applyStoredLayout(stored: StoredLayout): boolean {
+  const tree = gridLayout(stored.tree);
+  const ids = leaves(tree);
+  if (!ids.length) return false;
+  for (const pane of panes.values()) pane.destroy();
+  panes.clear();
+  layout = {
+    tree,
+    panes: stored.panes,
+    focused: stored.focused && ids.includes(stored.focused) ? stored.focused : ids[0],
+  };
+  for (const id of ids) {
+    const numeric = Number(id.replace(/\D/g, ""));
+    if (Number.isFinite(numeric)) paneSeq = Math.max(paneSeq, numeric);
+    newPane(stored.panes[id] ?? { runtimeId: null, title: null, sessionFile: null }, id);
+  }
+  renderLayout();
+  return true;
+}
+
 function load(): void {
   let stored: StoredLayout | null = null;
   try {
@@ -1137,22 +1383,9 @@ function load(): void {
   } catch {
     stored = null;
   }
-  if (stored) {
-    const tree = gridLayout(stored.tree);
-    const ids = leaves(tree);
-    if (ids.length) {
-      layout = {
-        tree,
-        panes: stored.panes,
-        focused: stored.focused && ids.includes(stored.focused) ? stored.focused : ids[0],
-      };
-      for (const id of ids) {
-        const numeric = Number(id.replace(/\D/g, ""));
-        if (Number.isFinite(numeric)) paneSeq = Math.max(paneSeq, numeric);
-        newPane(stored.panes[id] ?? { runtimeId: null, title: null, sessionFile: null }, id);
-      }
-      return;
-    }
+  if (stored && applyStoredLayout(stored)) {
+    restoredLocal = true;
+    return;
   }
   const pane = newPane({ runtimeId: null, title: null, sessionFile: null });
   layout = { tree: { kind: "leaf", pane: pane.id }, panes: {}, focused: pane.id };
@@ -1177,6 +1410,13 @@ async function checkBuild(): Promise<void> {
 }
 
 function setStatus(text: string, kind: "ok" | "warn" | "idle"): void {
+  // A failed durable save stays visible (it risks losing the workspace) until a
+  // save succeeds, instead of being overwritten by routine refreshes.
+  if (stateSaveError) {
+    statusEl.textContent = stateSaveError;
+    statusEl.dataset.kind = "warn";
+    return;
+  }
   statusEl.textContent = text;
   statusEl.dataset.kind = kind;
 }
@@ -1207,11 +1447,16 @@ void fontsReady.then(() => {
 // dialed in against the real terminal survives reloads.
 function setCellSize(size: number): void {
   cellSize = Math.min(CELL_MAX, Math.max(CELL_MIN, size));
-  localStorage.setItem(CELL_KEY, String(cellSize));
+  try {
+    localStorage.setItem(CELL_KEY, String(cellSize));
+  } catch {
+    console.warn("omp-desktop: font size cannot be cached in browser storage");
+  }
   for (const pane of panes.values()) {
     pane.fitPane();
     pane.sendResize(true);
   }
+  queueStateSave();
 }
 
 window.addEventListener("keydown", (event) => {
@@ -1257,24 +1502,40 @@ document.addEventListener("visibilitychange", () => {
 });
 
 async function boot(): Promise<void> {
-  await refreshRuntimes();
+  const reachable = await refreshRuntimes();
   await refreshSessions();
-  // First run: no stored binding anywhere, no live sessions — start one so the app
-  // opens on a usable session like P0 did.
-  const bound = [...panes.values()].some((pane) => pane.binding.runtimeId);
-  if (!bound && runtimes.length === 0) {
-    const pane = focusedPane();
-    if (pane) await newSession(pane);
-  } else {
-    for (const pane of panes.values()) pane.syncFromRuntimes();
-    // Fresh profile or cleared storage next to live sessions: without this the
-    // panes render empty while the sidebar lists sessions already running.
-    const claimed = new Set([...panes.values()].map((pane) => pane.binding.runtimeId));
-    const adopted = [...runtimes].reverse().find((runtime) => !claimed.has(runtime.id));
-    const empty = [...panes.values()].find((pane) => !pane.binding.runtimeId);
-    if (adopted && empty) {
-      empty.bind({ runtimeId: adopted.id, title: displayTitle(adopted), sessionFile: adopted.sessionFile });
+  if (reachable) {
+    await reconcileWorkspaceState();
+    const bound = [...panes.values()].some((pane) => pane.binding.runtimeId);
+    // First run only when nothing was ever stored, and only after the daemon's
+    // copy was read (or proven absent). A restored workspace whose runtimes are
+    // gone must keep its session files: replacing the focused pane with a fresh
+    // session is exactly how a reboot used to lose the workspace.
+    const stored = [...panes.values()].some(
+      (pane) => pane.binding.runtimeId || pane.binding.sessionFile || pane.binding.title,
+    );
+    if (!bound && runtimes.length === 0 && !stored && stateGate === "ready") {
+      const pane = focusedPane();
+      if (pane) await newSession(pane);
+    } else {
+      for (const pane of panes.values()) pane.syncFromRuntimes();
+      // Fresh profile or cleared storage next to live sessions: without this the
+      // panes render empty while the sidebar lists sessions already running.
+      const claimed = new Set([...panes.values()].map((pane) => pane.binding.runtimeId));
+      const adopted = [...runtimes].reverse().find((runtime) => !claimed.has(runtime.id));
+      const empty = [...panes.values()].find(
+        (pane) => !pane.binding.runtimeId && !pane.binding.sessionFile,
+      );
+      if (adopted && empty) {
+        empty.bind({ runtimeId: adopted.id, title: displayTitle(adopted), sessionFile: adopted.sessionFile });
+      }
     }
+  } else {
+    // Nothing was read, so nothing may be published: this browser's fallback
+    // must never replace a daemon copy it could not see.
+    stateGate = "blocked";
+    stateGateReason = "daemon unreachable at startup";
+    setStatus("daemon unreachable", "warn");
   }
   const pane = focusedPane();
   pane?.focus();

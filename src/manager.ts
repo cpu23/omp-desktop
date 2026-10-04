@@ -1,8 +1,13 @@
+import { existsSync } from "node:fs";
 import { Runtime, type RuntimeSpec } from "./runtime";
 import type { RuntimeInfo } from "./protocol";
 
 export type SpawnRequest = {
-  /** Working directory for a new session; ignored when resuming. */
+  /**
+   * Working directory for a new session. When resuming, the transcript's
+   * recorded cwd wins while it exists; this value is only the fallback for a
+   * session whose recorded directory is gone (omp then offers to move it here).
+   */
   cwd?: string;
   /** Absolute path of a session file to resume. */
   resume?: string;
@@ -18,6 +23,13 @@ export type ManagerDefaults = {
   rows: number;
   env: Record<string, string>;
   maxRuntimes: number;
+  /**
+   * Reads the working directory recorded in a transcript. The manager calls it
+   * when resuming so the runtime runs (and is labelled) in the session's own
+   * project instead of the daemon's launch directory; the daemon injects
+   * sessions.ts's reader, keeping session-store access out of here.
+   */
+  readResumeCwd?: (path: string) => Promise<string | null>;
 };
 
 export class RuntimeCapacityError extends Error {}
@@ -43,7 +55,10 @@ export class RuntimeManager {
     return this.#runtimes.get(id);
   }
 
-  create(request: SpawnRequest = {}): Runtime {
+  async create(request: SpawnRequest = {}): Promise<Runtime> {
+    const cwd = await this.#workingDirectory(request);
+    // Check after the async transcript read: concurrent resume requests must
+    // not all reserve the same final slot while that read is in flight.
     if (this.#runtimes.size >= this.defaults.maxRuntimes) {
       throw new RuntimeCapacityError(`runtime limit reached (${this.defaults.maxRuntimes})`);
     }
@@ -59,7 +74,7 @@ export class RuntimeManager {
       args: request.resume
         ? [...this.defaults.args, "--resume", request.resume]
         : [...this.defaults.args],
-      cwd: request.cwd ?? this.defaults.cwd,
+      cwd,
       cols: clamp(request.cols, 2, 500, this.defaults.cols),
       rows: clamp(request.rows, 2, 300, this.defaults.rows),
       env: {
@@ -80,6 +95,21 @@ export class RuntimeManager {
     // an explicitly requested session starts now.
     if (request.resume) runtime.start();
     return runtime;
+  }
+
+  /**
+   * A resumed session belongs to the directory recorded in its transcript: omp
+   * itself switches there, and the sidebar renders this value, so the launch
+   * directory must not leak in. Only when the recorded directory is gone (or
+   * unreadable) does the request/default cwd remain, which omp uses as the
+   * move target for the relocated session.
+   */
+  async #workingDirectory(request: SpawnRequest): Promise<string> {
+    if (request.resume && this.defaults.readResumeCwd) {
+      const recorded = await this.defaults.readResumeCwd(request.resume).catch(() => null);
+      if (recorded && existsSync(recorded)) return recorded;
+    }
+    return request.cwd ?? this.defaults.cwd;
   }
 
   /** Kill and forget. Panes bound to it fall back to an exited placeholder. */
