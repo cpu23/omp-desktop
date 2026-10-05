@@ -6,8 +6,9 @@ import { tmpdir } from "node:os";
 import { RuntimeManager, RuntimeCapacityError } from "./manager";
 import { listSessions, readSessionCwd } from "./sessions";
 import { isRecord } from "./guards";
-import { parseClientMessage, type RuntimesResponse, type ServerMessage } from "./protocol";
-import { STATE_LIMIT_BYTES, WorkspaceStateStore } from "./state";
+import { parseClientMessage, type RuntimeInfo, type RuntimesResponse, type ServerMessage } from "./protocol";
+import { PresentationReader } from "./presentation";
+import { STATE_LIMIT_BYTES, WorkspaceStateStore, RuntimeLedgerStore } from "./state";
 import type { Runtime } from "./runtime";
 
 const HOST = process.env.OMP_DESKTOP_HOST ?? "127.0.0.1";
@@ -45,6 +46,11 @@ const STATE_DIR = resolve(
 );
 const STATE_FILE = process.env.OMP_DESKTOP_STATE_FILE ?? join(STATE_DIR, "state.json");
 const stateStore = new WorkspaceStateStore(STATE_FILE);
+// Durable record of the live runtime pool, owned by the daemon (see state.ts):
+// client documents describe panes, this describes the sessions themselves, so a
+// restart restores every session that was live — including ones no pane holds.
+const LEDGER_FILE = process.env.OMP_DESKTOP_LEDGER_FILE ?? join(STATE_DIR, "sessions.json");
+const ledger = new RuntimeLedgerStore(LEDGER_FILE);
 // Empty OMP_DESKTOP_OVERLAY disables the overlay: non-omp binaries (smoke test's
 // bash) reject unknown flags.
 const OVERLAY_ARGS = OMP_OVERLAY ? ["--config", OMP_OVERLAY] : [];
@@ -85,6 +91,13 @@ if (!MOBILE_TOKEN) {
     `omp-desktop: no mobile IPC token at ${MOBILE_TOKEN_FILE}; spawned extensions read the file themselves and sockets stay 0600/owner-only, but set the token before spawning runtimes to require it on every call`,
   );
 }
+
+// Sidebar presentation (accent/working/done) comes from each runtime's injected
+// extension over its own socket; failures are reported as unavailable, never
+// inferred from the PTY byte heuristic. Reads are bounded and cached per
+// runtime, so `/api/runtimes` (polled every 2.5s per tab) cannot stall on a
+// wedged socket.
+const presentationReader = new PresentationReader({ dir: MOBILE_IPC_DIR, token: MOBILE_TOKEN ?? null });
 
 const manager = new RuntimeManager({
   file: OMP_BIN,
@@ -174,11 +187,24 @@ function validResume(path: string | undefined): string | null {
   return existsSync(absolute) ? absolute : null;
 }
 
+/**
+ * Identity of this daemon process. Every runtime belongs to one generation, so
+ * a reconnect that sees a different value knows the daemon restarted (all
+ * runtimes are gone) rather than that its runtimes were stopped.
+ */
+const GENERATION = crypto.randomUUID();
+
+let shuttingDown = false;
+
 const server = Bun.serve<WsData>({
   hostname: HOST,
   port: PORT,
   async fetch(req, srv) {
     const url = new URL(req.url);
+    if (url.pathname === "/api/runtimes" || url.pathname === "/ws/term") {
+      await poolReady;
+      if (shuttingDown) return new Response("daemon shutting down", { status: 503 });
+    }
     if (url.pathname === "/ws/term") {
       const runtime = manager.get(url.searchParams.get("runtime") ?? "");
       if (!runtime) return new Response("unknown runtime", { status: 404 });
@@ -251,9 +277,20 @@ const server = Bun.serve<WsData>({
         return Response.json({ path }, { headers: NO_STORE });
       }
       case "GET /api/runtimes": {
+        // Enrich with extension state in parallel; each read has its own
+        // deadline and returns null (unavailable) instead of failing the list.
+        const listed = manager.list();
+        presentationReader.retain(new Set(listed.map((info) => info.id)));
+        const runtimes = await Promise.all(
+          listed.map(async (info): Promise<RuntimeInfo> => ({
+            ...info,
+            presentation: info.alive ? await presentationReader.read(info.id) : null,
+          })),
+        );
         const body: RuntimesResponse = {
           build: BUILD,
-          runtimes: manager.list(),
+          generation: GENERATION,
+          runtimes,
           defaults: { cwd: manager.defaults.cwd, maxRuntimes: manager.defaults.maxRuntimes },
         };
         return Response.json(body, { headers: NO_STORE });
@@ -319,7 +356,7 @@ const server = Bun.serve<WsData>({
       if (replay.length > 0) ws.send(Buffer.from(replay, "utf8"));
       ws.data.unsubData = runtime.subscribeData((data) => ws.send(Buffer.from(data, "utf8")));
       ws.data.unsubExit = runtime.subscribeExit((exit) => {
-        const message: ServerMessage = { type: "exit", exitCode: exit.exitCode };
+        const message: ServerMessage = { type: "exit", exitCode: exit.exitCode, daemonShutdown: shuttingDown };
         ws.send(JSON.stringify(message));
       });
     },
@@ -340,15 +377,128 @@ const server = Bun.serve<WsData>({
 
 console.log(`omp-desktopd listening on http://${HOST}:${server.port}`);
 console.log(`omp-desktopd workspace state: ${STATE_FILE}`);
+console.log(`omp-desktopd runtime ledger: ${LEDGER_FILE}`);
 
-let shuttingDown = false;
+/**
+ * Every pool change is a durable statement of what is running. The ledger is
+ * rewritten from the live pool (not accumulated), so a runtime that is stopped
+ * disappears from it at that moment and the next start does not bring its
+ * session back.
+ *
+ * An *exit* is provisional, though: a process death carries no reason, and in
+ * the case this ledger exists for — a unit teardown (systemctl stop/restart,
+ * logout, reboot) SIGTERMs the daemon and its PTY children together — a child's
+ * death is often processed before this process's own signal handler runs. A
+ * snapshot wired straight to the exit event would then erase sessions that were
+ * live a moment ago, which is exactly the "only some sessions came back" bug.
+ * Exit-driven saves are therefore held back; if the daemon stays alive for the
+ * settle window, the exit was an ordinary one (omp quit, crash) and is recorded
+ * then. A start or a stop cancels the pending write, since their snapshot
+ * already includes every exit so far.
+ */
+const EXIT_SETTLE_MS = 3000;
+/** Handle of the pending exit-settle write; a start/stop/shutdown clears it. */
+let exitSaveTimer: Timer | null = null;
+let ledgerWrite: Promise<void> = Promise.resolve();
+/**
+ * True until the startup restore has settled the pool. While it is set, the
+ * on-disk snapshot is still the only complete record of what must come back, so
+ * pool-change saves are suppressed: writing a partial pool over it would drop
+ * the sessions the restore had not reached yet.
+ */
+let restoringPool = true;
+
+function writeLedger(): void {
+  ledgerWrite = ledger.save(manager.liveSessions()).catch((error) => {
+    console.warn(`omp-desktopd: runtime ledger not saved: ${error instanceof Error ? error.message : String(error)}`);
+  });
+}
+
+manager.subscribeChanges((change) => {
+  if (shuttingDown || restoringPool) return;
+  if (change === "exited") {
+    exitSaveTimer ??= setTimeout(() => {
+      exitSaveTimer = null;
+      writeLedger();
+    }, EXIT_SETTLE_MS);
+    return;
+  }
+  if (exitSaveTimer !== null) {
+    clearTimeout(exitSaveTimer);
+    exitSaveTimer = null;
+  }
+  writeLedger();
+});
+
+/**
+ * Bring back the pool a previous daemon left behind. Sessions are restored by
+ * the daemon, before and independently of any client: the pool outlives panes
+ * and windows, so a session with no pane bound (or no app open at all) comes
+ * back exactly like a visible one. Explicit stops and ordinary exits already
+ * dropped their ledger entry, so nothing stopped is resurrected. Replays whose
+ * transcript no longer exists — or that no longer fit under the runtime limit —
+ * are logged and forgotten; their data is still on disk.
+ *
+ * Until this finishes, the on-disk snapshot is still the only complete record of
+ * what must come back, so pool changes are not written through: a daemon that
+ * dies mid-restore retries the whole pool instead of only the sessions it had
+ * reached when its partial pool was saved over the record.
+ */
+async function restorePool(): Promise<void> {
+  try {
+    const records = await ledger.read();
+    if (records.length === 0) return;
+    let restored = 0;
+    for (const record of records) {
+      if (shuttingDown) break;
+      const resume = validResume(record.sessionFile);
+      if (!resume) {
+        console.warn(`omp-desktopd: not restoring ${record.sessionFile}: no such transcript under ${SESSIONS_ROOT}`);
+        continue;
+      }
+      try {
+        const runtime = await manager.create({ resume, cwd: record.cwd, cols: record.cols, rows: record.rows });
+        if (shuttingDown) {
+          runtime.kill();
+          break;
+        }
+        restored += 1;
+        console.log(`omp-desktopd restored session ${resume} as ${runtime.id}`);
+      } catch (error) {
+        console.warn(
+          `omp-desktopd: could not restore ${record.sessionFile}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+    if (restored > 0) console.log(`omp-desktopd pool restored: ${restored} session(s)`);
+  } finally {
+    restoringPool = false;
+  }
+  // The ledger now describes this daemon's pool (including anything clients
+  // started while the restore ran), so stale entries do not retry forever.
+  if (!shuttingDown) writeLedger();
+}
+
 function shutdown(code = 0): void {
   if (shuttingDown) return;
+  // Freeze the durable record first: the snapshot on disk describes the pool
+  // this daemon owned, and the SIGTERMs below are this teardown killing it, not
+  // the sessions ending. A pending exit save is a child death that the same
+  // teardown caused, so it must not land either.
   shuttingDown = true;
+  if (exitSaveTimer !== null) {
+    clearTimeout(exitSaveTimer);
+    exitSaveTimer = null;
+  }
   manager.killAll();
   server.stop(true);
-  setTimeout(() => process.exit(code), 150);
+  // Exit only once a write already in flight has landed; the ceiling keeps a
+  // wedged filesystem from hanging the shutdown, and the timer also gives the
+  // SIGTERMed children a moment to go.
+  void Promise.race([ledgerWrite, Bun.sleep(1000)]).then(() => setTimeout(() => process.exit(code), 100));
 }
 process.on("SIGINT", () => shutdown(0));
 process.on("SIGTERM", () => shutdown(0));
 process.on("exit", () => manager.killAll());
+
+const poolReady = restorePool();

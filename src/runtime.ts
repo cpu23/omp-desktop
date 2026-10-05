@@ -38,6 +38,7 @@ export class Runtime {
   #chunkBytes = 0;
   #dataSubs = new Set<(data: string) => void>();
   #exitSubs = new Set<(exit: RuntimeExit) => void>();
+  #fileSubs = new Set<(sessionFile: string) => void>();
   /** Tail of the last chunk: an OSC sequence can split across PTY reads. */
   #sniffCarry = "";
 
@@ -116,7 +117,10 @@ export class Runtime {
       this.lastActivityAt = Date.now();
       const sniffed = sniffSessionFile(this.#sniffCarry, data);
       this.#sniffCarry = sniffed.carry;
-      if (sniffed.sessionFile) this.sessionFile = sniffed.sessionFile;
+      if (sniffed.sessionFile && sniffed.sessionFile !== this.sessionFile) {
+        this.sessionFile = sniffed.sessionFile;
+        for (const sub of this.#fileSubs) sub(this.sessionFile);
+      }
       this.#pushReplay(data, bytes);
       for (const sub of this.#dataSubs) sub(data);
     });
@@ -139,6 +143,12 @@ export class Runtime {
   subscribeExit(sub: (exit: RuntimeExit) => void): () => void {
     this.#exitSubs.add(sub);
     return () => this.#exitSubs.delete(sub);
+  }
+
+  /** Fires when the transcript omp is writing becomes known or changes. */
+  subscribeSessionFile(sub: (sessionFile: string) => void): () => void {
+    this.#fileSubs.add(sub);
+    return () => this.#fileSubs.delete(sub);
   }
 
   write(data: string): void {

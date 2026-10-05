@@ -1,12 +1,23 @@
 import { trimSelectionHighlight } from "./selection";
 import { applySidebarState, onSidebarStateChange, STORE_KEY as SIDEBAR_KEY } from "./sidebar";
+import { doneIndicator, syncWorkingAnimation, workingIndicator } from "./working-indicator";
 import { Terminal } from "@xterm/xterm";
 import { ImageAddon } from "@xterm/addon-image";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { isRecord } from "./guards";
 import {
+  attachable,
+  bindingForRuntime,
+  bindingFromStored,
+  emptyBinding,
+  intentAfterExit,
+  intentAfterRuntimeLoss,
+  pendingResumes,
+  type PaneBinding,
+} from "./lifecycle";
+import {
   parsePasteResponse,
-  parseRuntimeList,
+  parseRuntimesResponse,
   parseRuntimeOne,
   parseServerMessage,
   parseSessionList,
@@ -57,8 +68,11 @@ function storedCellSize(): number {
 }
 let cellSize = storedCellSize();
 
-/** Persisted per pane: which runtime it shows, plus labels for when that runtime is gone. */
-type PaneBinding = { runtimeId: string | null; title: string | null; sessionFile: string | null };
+/**
+ * Persisted per pane: which runtime it shows, plus labels for when that runtime
+ * is gone. `PaneBinding` lives in ./lifecycle with the rules that decide when a
+ * binding's resume claim survives a daemon restart or a deliberate stop.
+ */
 type LayoutNode =
   | { kind: "leaf"; pane: string }
   | { kind: "split"; dir: "row" | "col"; ratio: number; a: LayoutNode; b: LayoutNode };
@@ -71,6 +85,15 @@ let restoredLocal = false;
 let runtimes: RuntimeInfo[] = [];
 let sessions: SessionSummaryLike[] = [];
 let daemonUp = false;
+/** Generation of the daemon that last answered: changes on every daemon restart. */
+let daemonId: string | null = null;
+/**
+ * Set when a daemon restart (or a first contact with a daemon) may have a pool
+ * to hand back: unclaimed runtimes are adopted while the pool grows, and the
+ * window closes on the first poll where it did not.
+ */
+let adoptPending = false;
+let adoptSeen = 0;
 
 const PINS_KEY = "omp-desktop.pins.v1";
 function readPins(): SessionSummaryLike[] {
@@ -160,27 +183,73 @@ async function getJson(path: string, init?: RequestInit): Promise<unknown | null
   }
 }
 
-async function refreshRuntimes(): Promise<boolean> {
-  const list = parseRuntimeList(await getJson("/api/runtimes"));
-  if (!list) {
+async function refreshRuntimes(options: { restore?: boolean } = {}): Promise<boolean> {
+  const payload = parseRuntimesResponse(await getJson("/api/runtimes"));
+  if (!payload) {
     daemonUp = false;
     renderSidebar();
     return false;
   }
+  const previousGeneration = daemonId;
   daemonUp = true;
-  runtimes = list;
-  const live = new Set(runtimes.map((runtime) => runtime.id));
-  for (const pane of panes.values()) {
-    // A runtime that vanished (killed here, crashed, daemon restarted) leaves the
-    // pane's screen as it was, labelled so it is obvious the process is gone.
-    if (pane.binding.runtimeId && !live.has(pane.binding.runtimeId)) {
-      pane.runtimeGone();
-    }
+  if (payload.generation) daemonId = payload.generation;
+  // A new (or never-seen) generation means the pool this client knew is gone
+  // and the daemon may be rebuilding it right now. Watch the pool while it
+  // grows so restored sessions no pane claims still get a view.
+  if (options.restore !== false && (previousGeneration === null || daemonId !== previousGeneration)) {
+    adoptPending = true;
+    adoptSeen = 0;
   }
+  runtimes = payload.runtimes;
   renderSidebar();
+  // One pass per pane clears vanished bindings (keeping a resume claim only when
+  // the daemon restarted) and reattaches runtimes that are still alive.
   for (const pane of panes.values()) pane.syncFromRuntimes();
   setStatus(`${runtimes.length} live`, "ok");
+  // Reopen panes whose session came back after boot; the boot path passes
+  // restore:false so adoption finishes before anything is resumed.
+  if (options.restore !== false) {
+    void restoreWantedSessions().then(() => {
+      if (!adoptPending) return;
+      if (runtimes.length > adoptSeen) {
+        adoptSeen = runtimes.length;
+        adoptUnclaimedRuntimes();
+      } else {
+        adoptPending = false;
+      }
+    });
+  }
   return true;
+}
+
+/**
+ * POST /api/runtimes with its HTTP status kept: a 400 is the daemon refusing a
+ * transcript (gone or not under the session store) and must end a pane's resume
+ * claim, while a transport or capacity failure is retried later.
+ */
+async function requestRuntime(
+  request: { cwd?: string; resume?: string },
+  notify = true,
+): Promise<{ runtime: RuntimeInfo | null; status: number | null }> {
+  let res: Response;
+  try {
+    res = await fetch("/api/runtimes", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(request),
+    });
+  } catch {
+    return { runtime: null, status: null };
+  }
+  if (!res.ok) {
+    if (notify) setStatus(`/api/runtimes → ${res.status}`, "warn");
+    return { runtime: null, status: res.status };
+  }
+  const runtime = parseRuntimeOne(await res.json().catch(() => null));
+  if (!runtime) return { runtime: null, status: res.status };
+  runtimes = [...runtimes.filter((candidate) => candidate.id !== runtime.id), runtime];
+  renderSidebar();
+  return { runtime, status: res.status };
 }
 
 async function refreshSessions(): Promise<void> {
@@ -191,20 +260,6 @@ async function refreshSessions(): Promise<void> {
   if (!list) return;
   sessions = list;
   renderSidebar();
-}
-
-async function createRuntime(request: { cwd?: string; resume?: string }): Promise<RuntimeInfo | null> {
-  const runtime = parseRuntimeOne(
-    await getJson("/api/runtimes", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(request),
-    }),
-  );
-  if (!runtime) return null;
-  runtimes = [...runtimes.filter((candidate) => candidate.id !== runtime.id), runtime];
-  renderSidebar();
-  return runtime;
 }
 
 /** Uploads a pasted image; the daemon returns the path it stored it at. */
@@ -461,7 +516,7 @@ class Pane {
       } else if (parsed.kind === "runtime" && typeof parsed.runtimeId === "string") {
         const runtime = runtimes.find((candidate) => candidate.id === parsed.runtimeId);
         if (runtime) {
-          this.bind({ runtimeId: runtime.id, title: displayTitle(runtime), sessionFile: runtime.sessionFile });
+          this.bind(bindingForRuntime(runtime, daemonId, displayTitle(runtime)));
         }
       } else if (
         parsed.kind === "session" &&
@@ -562,6 +617,9 @@ class Pane {
       // session started this instant); keep a known transcript identity instead
       // of overwriting it with null.
       if (runtime.sessionFile) this.binding.sessionFile = runtime.sessionFile;
+      // Attached means live under the daemon that answered this open.
+      this.binding.autoResume = true;
+      this.binding.daemonGeneration = daemonId;
       this.sendResize(true);
       this.fitPane();
       if (layout.focused === this.id) this.term.focus();
@@ -600,11 +658,18 @@ class Pane {
       if (msg.runtime.sessionFile) this.binding.sessionFile = msg.runtime.sessionFile;
       this.renderHeader();
       renderSidebar();
-      // Persist the sniffed session file: it is what "resume this session" and
-      // the restart guard in syncFromRuntimes match on.
+      // Persist the sniffed session file: it is the identity auto-resume and the
+      // placeholder's manual resume both need.
       save();
     } else if (msg.type === "exit") {
       this.#stateEl.textContent = `exited ${msg.exitCode ?? "?"}`;
+      // A process that ended is finished, not restarted; only a daemon-wide
+      // shutdown defers the pane's claim to be live to the next daemon start.
+      const next = intentAfterExit(this.binding, msg.daemonShutdown);
+      if (next !== this.binding.autoResume) {
+        this.binding.autoResume = next;
+        save();
+      }
     }
   }
 
@@ -613,9 +678,20 @@ class Pane {
     // Drop the id but keep the title/session file: the placeholder then offers
     // "resume this session" instead of a frozen screen with no way back.
     this.binding.runtimeId = null;
+    // Keep the resume claim only when the runtime may have died with its daemon;
+    // a loss under the same daemon (kill button, another client, omp exiting) is
+    // final, and a pane without a transcript has nothing to reopen.
+    this.binding.autoResume = intentAfterRuntimeLoss(this.binding, { up: daemonUp, generation: daemonId });
     this.#stateEl.textContent = "exited";
     this.renderHeader();
     this.renderPlaceholder();
+    save();
+  }
+
+  /** The user stopped this pane's session: never resume it on a later start. */
+  clearLiveIntent(): void {
+    if (!this.binding.autoResume) return;
+    this.binding.autoResume = false;
     save();
   }
 
@@ -627,30 +703,46 @@ class Pane {
       return;
     }
     const runtimeId = this.binding.runtimeId;
-    const runtime = runtimeId ? runtimes.find((candidate) => candidate.id === runtimeId) : undefined;
-    if (runtime) {
-      // Check the persisted transcript identity before reattaching a pane.
-      const sameSession =
-        !this.binding.sessionFile ||
-        !runtime.sessionFile ||
-        runtime.sessionFile === this.binding.sessionFile;
-      if (sameSession) {
-        this.#stateEl.textContent = "";
-        const title = displayTitle(runtime);
-        // omp emits the session file after the hello: adopt it late, or a reload
-        // cannot tell which session this pane was showing.
-        const adoptFile = runtime.sessionFile && !this.binding.sessionFile ? runtime.sessionFile : null;
-        if (title !== this.binding.title || adoptFile) {
-          if (adoptFile) this.binding.sessionFile = adoptFile;
-          this.binding.title = title;
-          this.renderHeader();
-          save();
-        }
-        if (!this.ws && this.retry !== Number.POSITIVE_INFINITY) this.attach();
-      } else if (!this.ws) {
-        this.runtimeGone();
-      }
+    if (!runtimeId) {
+      this.renderPlaceholder();
+      return;
     }
+    const runtime = runtimes.find((candidate) => candidate.id === runtimeId);
+    if (!runtime) {
+      // Gone for good: stopped under this daemon or lost with it. runtimeGone()
+      // decides whether the pane keeps its resume claim.
+      this.runtimeGone();
+      this.renderPlaceholder();
+      return;
+    }
+    if (!attachable(runtime)) {
+      // An exited process is final: attaching would start the session again.
+      // A reserved runtime (never attached, `alive:false` until the daemon
+      // spawns it) is attachable and must not be mistaken for a dead one.
+      // A socket that watched the exit keeps the frozen "exited" screen; a
+      // fresh page falls back to the placeholder (and its manual resume).
+      if (!this.ws) this.runtimeGone();
+      this.renderPlaceholder();
+      return;
+    }
+    // The runtime is authoritative about which transcript it is writing. If omp
+    // switched sessions in the TUI after this binding was saved, adopt the
+    // transcript it is actually on; a matching runtime id is the same process,
+    // not a reused name.
+    this.#stateEl.textContent = "";
+    const title = displayTitle(runtime);
+    const adoptFile = runtime.sessionFile && runtime.sessionFile !== this.binding.sessionFile
+      ? runtime.sessionFile
+      : null;
+    if (adoptFile) this.binding.sessionFile = adoptFile;
+    if (title !== this.binding.title || adoptFile || this.binding.daemonGeneration !== daemonId || !this.binding.autoResume) {
+      this.binding.title = title;
+      this.binding.autoResume = true;
+      this.binding.daemonGeneration = daemonId;
+      this.renderHeader();
+      save();
+    }
+    if (!this.ws && this.retry !== Number.POSITIVE_INFINITY) this.attach();
     this.renderPlaceholder();
   }
 
@@ -811,9 +903,7 @@ function splitLayout(): void {
     const candidate = runtimes.find((runtime) => !shown.has(runtime.id));
     if (candidate) shown.add(candidate.id);
     const fresh = newPane(
-      candidate
-        ? { runtimeId: candidate.id, title: displayTitle(candidate), sessionFile: candidate.sessionFile }
-        : { runtimeId: null, title: null, sessionFile: null },
+      candidate ? bindingForRuntime(candidate, daemonId, displayTitle(candidate)) : emptyBinding(),
     );
     layout.focused = fresh.id;
     return { kind: "split", dir, ratio: 0.5, a: node, b: { kind: "leaf", pane: fresh.id } };
@@ -830,7 +920,7 @@ function closePane(paneId: string): void {
   if (!pane) return;
   if (leaves().length <= 1) {
     pane.detach();
-    pane.binding = { runtimeId: null, title: null, sessionFile: null };
+    pane.binding = emptyBinding();
     pane.renderPlaceholder();
     pane.renderHeader();
     save();
@@ -972,6 +1062,40 @@ function sessionRelative(iso: string): string {
   return days < 30 ? `${days}d` : `${Math.round(days / 30)}mo`;
 }
 
+/** Mobile's fallback for a session whose accent the extension cannot resolve. */
+const ACCENT_FALLBACK = "#808080";
+const ACCENT_HEX = /^#[0-9a-f]{6}$/i;
+
+function runtimeAccent(runtime: RuntimeInfo): string {
+  const accent = runtime.presentation?.accent;
+  return typeof accent === "string" && ACCENT_HEX.test(accent) ? accent : ACCENT_FALLBACK;
+}
+
+/**
+ * Working/Done come only from the extension's authoritative state
+ * (`presentation`): PTY byte traffic says bytes moved, not that omp is
+ * answering, so a missing presentation shows no indicator at all. Working wins
+ * while the next turn runs; a finished turn keeps its Done badge until then.
+ */
+function runtimeIndicator(runtime: RuntimeInfo): HTMLElement | null {
+  const presentation = runtime.presentation;
+  if (!daemonUp || !runtime.alive || !presentation) return null;
+  if (presentation.agentActive) return workingIndicator();
+  return presentation.completion ? doneIndicator() : null;
+}
+
+/** Row heading: title plus the authoritative working/done badge, mobile-style. */
+function rowName(title: string, status: HTMLElement | null): HTMLElement {
+  const name = document.createElement("span");
+  name.className = "name";
+  const label = document.createElement("span");
+  label.className = "title";
+  label.textContent = title;
+  name.append(label);
+  if (status) name.append(status);
+  return name;
+}
+
 function renderSidebar(): void {
   // Rebuilding rows mid-drag cancels the drag the user is performing.
   if (dragging) {
@@ -1042,12 +1166,13 @@ function renderSidebar(): void {
     const cwd = summary?.cwd ?? runtime.cwd;
     const row = document.createElement("div");
     row.className = runtime.alive ? "row live" : "row recent";
+    // The live edge and the working shimmer both read this one session colour;
+    // without a validated accent they fall back to mobile's grey.
+    row.style.setProperty("--row-accent", runtimeAccent(runtime));
     row.draggable = true;
     row.title = `${cwd}\n${runtime.sessionFile ?? "(session file not known yet)"}\n${runtime.id}`;
     const ownerId = paneForRuntime.get(runtime.id);
-    const name = document.createElement("span");
-    name.className = "name";
-    name.textContent = title;
+    const name = rowName(title, runtimeIndicator(runtime));
     const sub = document.createElement("span");
     sub.className = "sub";
     sub.textContent = ownerId ? ownerId.replace("p", "pane ") : cwd.replace(/^\/home\/[^/]+/, "~");
@@ -1059,12 +1184,13 @@ function renderSidebar(): void {
       event.stopPropagation();
       void killRuntime(runtime.id);
     });
+    // A live session with no index row (new, or outside the loaded window) may
+    // carry an existing pin snapshot, but never a synthesized time: runtime
+    // activity is PTY byte traffic, not conversation, and "now" would relabel
+    // an old chat as freshly used. No snapshot disables the pin button until
+    // the next session-index refresh carries the row.
     const snapshot = runtime.sessionFile
-      ? summary ?? {
-        id: runtime.id, path: runtime.sessionFile, cwd,
-        title, updatedAt: runtime.lastActivity ?? runtime.startedAt ?? new Date().toISOString(),
-        costUsd: 0,
-      }
+      ? summary ?? pinnedSessions.find((entry) => entry.path === runtime.sessionFile) ?? null
       : null;
     const actions = document.createElement("div");
     actions.className = "row-actions";
@@ -1072,7 +1198,7 @@ function renderSidebar(): void {
     row.append(name, sub, actions);
     row.addEventListener("click", () => {
       const pane = focusedPane();
-      if (pane) pane.bind({ runtimeId: runtime.id, title: displayTitle(runtime), sessionFile: runtime.sessionFile });
+      if (pane) pane.bind(bindingForRuntime(runtime, daemonId, displayTitle(runtime)));
     });
     row.addEventListener("dragstart", (event) => {
       event.dataTransfer?.setData("text/omp-payload", JSON.stringify({ kind: "runtime", runtimeId: runtime.id }));
@@ -1086,9 +1212,7 @@ function renderSidebar(): void {
     row.className = "row recent";
     row.draggable = true;
     row.title = `${session.cwd}\n${session.path}`;
-    const name = document.createElement("span");
-    name.className = "name";
-    name.textContent = session.title || session.cwd;
+    const name = rowName(session.title || session.cwd, null);
     const sub = document.createElement("span");
     sub.className = "sub";
     const rel = document.createElement("span");
@@ -1116,6 +1240,9 @@ function renderSidebar(): void {
     (pinnedPaths.has(session.path) ? pinnedRows : otherRows).push(row);
   }
   sessionListEl.append(...pinnedRows, ...otherRows);
+  // New rows bring new spinner/shimmer nodes: the loop is only alive while one
+  // of them paints.
+  syncWorkingAnimation();
 }
 
 function focusedPane(): Pane | null {
@@ -1124,31 +1251,125 @@ function focusedPane(): Pane | null {
 }
 
 async function killRuntime(id: string): Promise<void> {
+  // An explicit stop: the pane keeps its transcript identity but must not be
+  // resumed by a later app start, even if the daemon restarts afterwards.
+  for (const pane of panes.values()) {
+    if (pane.binding.runtimeId === id) pane.clearLiveIntent();
+  }
   await getJson(`/api/runtimes/${encodeURIComponent(id)}`, { method: "DELETE" });
   await refreshRuntimes();
 }
 
 async function newSession(pane: Pane): Promise<void> {
-  const runtime = await createRuntime({});
+  const { runtime } = await requestRuntime({});
   if (!runtime) return;
-  pane.bind({ runtimeId: runtime.id, title: displayTitle(runtime), sessionFile: runtime.sessionFile });
+  pane.bind(bindingForRuntime(runtime, daemonId, displayTitle(runtime)));
   pane.focus();
 }
 
-/** Attach a saved session to a pane: reuse its live runtime if one exists, else resume. */
+/** Attach a saved session to a pane: reuse an attachable runtime for it if one exists, else resume. */
 async function openSession(pane: Pane, session: { path: string; cwd: string; title: string }): Promise<void> {
-  const live = runtimes.find((runtime) => runtime.sessionFile === session.path);
+  const live = runtimes.find((runtime) => attachable(runtime) && runtime.sessionFile === session.path);
   if (live) {
-    pane.bind({ runtimeId: live.id, title: session.title, sessionFile: live.sessionFile });
+    pane.bind(bindingForRuntime(live, daemonId, session.title));
     pane.focus();
     return;
   }
   setStatus("resuming…", "idle");
-  const runtime = await createRuntime({ resume: session.path, cwd: session.cwd });
+  const { runtime } = await requestRuntime({ resume: session.path, cwd: session.cwd });
   if (!runtime) return;
-  runtime.sessionFile = session.path;
-  pane.bind({ runtimeId: runtime.id, title: session.title, sessionFile: session.path });
+  // Keep the requested transcript as the runtime's identity until omp sniffs
+  // its own: a second click must adopt this runtime, not spawn a sibling.
+  if (!runtime.sessionFile) runtime.sessionFile = session.path;
+  pane.bind(bindingForRuntime(runtime, daemonId, session.title));
   pane.focus();
+}
+
+// ---------------------------------------------------------------- restoration
+
+/** When each transcript was last asked to reopen, to space retries of transient failures. */
+const resumeAttempts = new Map<string, number>();
+/** Transient failures (capacity, transport) are retried no sooner than this. */
+const RESUME_RETRY_MS = 15_000;
+let restoring = false;
+
+/**
+ * Reopen every transcript a pane claims live but no runtime is writing. Panes
+ * keep that claim across a daemon restart (the only way their runtime can be
+ * lost without a stop), so this runs once the boot document is in memory and on
+ * every later refresh: a daemon that went away and came back puts formerly live
+ * sessions back on a live process instead of a "not running" placeholder.
+ * Transcripts another pane (or another client) already has live are adopted,
+ * never duplicated.
+ *
+ * This is pane reattachment and legacy workspace migration. The daemon restores
+ * its complete durable pool before serving runtime requests, including sessions
+ * with no pane or client open; its transcript-level dedupe also covers this path.
+ */
+async function restoreWantedSessions(): Promise<void> {
+  if (!daemonUp || restoring) return;
+  const wanted = pendingResumes([...panes.values()].map((pane) => pane.binding), runtimes);
+  if (wanted.length === 0) return;
+  restoring = true;
+  try {
+    for (const { sessionFile, live } of wanted) {
+      const group = (): Pane[] =>
+        [...panes.values()].filter((pane) =>
+          pane.binding.autoResume && pane.binding.runtimeId === null && pane.binding.sessionFile === sessionFile,
+        );
+      if (group().length === 0) continue;
+      if (live) {
+        for (const pane of group()) pane.bind(bindingForRuntime(live, daemonId, displayTitle(live)));
+        continue;
+      }
+      const last = resumeAttempts.get(sessionFile) ?? 0;
+      if (Date.now() - last < RESUME_RETRY_MS) continue;
+      resumeAttempts.set(sessionFile, Date.now());
+      const summary = sessionSummary(sessionFile);
+      setStatus(`resuming ${summary?.title ?? sessionFile}…`, "idle");
+      const { runtime, status } = await requestRuntime({ resume: sessionFile, cwd: summary?.cwd ?? "" }, false);
+      if (runtime) {
+        resumeAttempts.delete(sessionFile);
+        if (!runtime.sessionFile) runtime.sessionFile = sessionFile;
+        for (const pane of group()) {
+          pane.bind(bindingForRuntime(runtime, daemonId, summary?.title ?? displayTitle(runtime)));
+        }
+      } else if (status === 400) {
+        // The daemon refuses the transcript itself (gone, or not under the
+        // session store): stop claiming it is live. The placeholder keeps a
+        // manual resume in case the file comes back.
+        resumeAttempts.delete(sessionFile);
+        for (const pane of group()) pane.clearLiveIntent();
+      }
+    }
+  } finally {
+    restoring = false;
+  }
+}
+
+/**
+ * Give live runtimes no pane claims a view, so a pool restored by the daemon
+ * reappears as the grid it was instead of only as sidebar entries — including
+ * sessions whose pane document was lost (an emptied binding has no transcript
+ * left to resume, but the daemon's ledger still has the session). Runtimes
+ * whose transcript is claimed by any pane are left for that pane, even while
+ * its resume is still in flight; panes with a session (or a runtime) are never
+ * overwritten, and a pane with nothing keeps its placeholder.
+ */
+function adoptUnclaimedRuntimes(): void {
+  const claimedRuntimes = new Set<string>();
+  const claimedSessions = new Set<string>();
+  for (const pane of panes.values()) {
+    if (pane.binding.runtimeId) claimedRuntimes.add(pane.binding.runtimeId);
+    if (pane.binding.sessionFile) claimedSessions.add(pane.binding.sessionFile);
+  }
+  for (const runtime of runtimes) {
+    if (!attachable(runtime) || claimedRuntimes.has(runtime.id)) continue;
+    if (runtime.sessionFile && claimedSessions.has(runtime.sessionFile)) continue;
+    const empty = [...panes.values()].find((pane) => !pane.binding.runtimeId && !pane.binding.sessionFile);
+    if (!empty) return;
+    empty.bind(bindingForRuntime(runtime, daemonId, displayTitle(runtime)));
+  }
 }
 
 // ---------------------------------------------------------------- persistence
@@ -1332,12 +1553,8 @@ function parseStoredLayout(value: unknown): StoredLayout | null {
   if (!tree) return null;
   const storedPanes: Record<string, PaneBinding> = {};
   for (const [id, entry] of Object.entries(value.panes)) {
-    if (!isRecord(entry)) continue;
-    storedPanes[id] = {
-      runtimeId: typeof entry.runtimeId === "string" ? entry.runtimeId : null,
-      title: typeof entry.title === "string" ? entry.title : null,
-      sessionFile: typeof entry.sessionFile === "string" ? entry.sessionFile : null,
-    };
+    const binding = bindingFromStored(entry);
+    if (binding) storedPanes[id] = binding;
   }
   return { tree, panes: storedPanes, focused: typeof value.focused === "string" ? value.focused : null };
 }
@@ -1370,7 +1587,7 @@ function applyStoredLayout(stored: StoredLayout): boolean {
   for (const id of ids) {
     const numeric = Number(id.replace(/\D/g, ""));
     if (Number.isFinite(numeric)) paneSeq = Math.max(paneSeq, numeric);
-    newPane(stored.panes[id] ?? { runtimeId: null, title: null, sessionFile: null }, id);
+    newPane(stored.panes[id] ?? emptyBinding(), id);
   }
   renderLayout();
   return true;
@@ -1387,7 +1604,7 @@ function load(): void {
     restoredLocal = true;
     return;
   }
-  const pane = newPane({ runtimeId: null, title: null, sessionFile: null });
+  const pane = newPane(emptyBinding());
   layout = { tree: { kind: "leaf", pane: pane.id }, panes: {}, focused: pane.id };
 }
 
@@ -1502,7 +1719,9 @@ document.addEventListener("visibilitychange", () => {
 });
 
 async function boot(): Promise<void> {
-  const reachable = await refreshRuntimes();
+  // Adoption may rebuild the panes from the daemon's document, so restoration
+  // waits for it instead of racing the first refresh.
+  const reachable = await refreshRuntimes({ restore: false });
   await refreshSessions();
   if (reachable) {
     await reconcileWorkspaceState();
@@ -1519,16 +1738,16 @@ async function boot(): Promise<void> {
       if (pane) await newSession(pane);
     } else {
       for (const pane of panes.values()) pane.syncFromRuntimes();
-      // Fresh profile or cleared storage next to live sessions: without this the
-      // panes render empty while the sidebar lists sessions already running.
-      const claimed = new Set([...panes.values()].map((pane) => pane.binding.runtimeId));
-      const adopted = [...runtimes].reverse().find((runtime) => !claimed.has(runtime.id));
-      const empty = [...panes.values()].find(
-        (pane) => !pane.binding.runtimeId && !pane.binding.sessionFile,
-      );
-      if (adopted && empty) {
-        empty.bind({ runtimeId: adopted.id, title: displayTitle(adopted), sessionFile: adopted.sessionFile });
-      }
+      // Panes that were live when the workspace was saved and lost their runtime
+      // with a daemon restart reopen their transcripts here.
+      await restoreWantedSessions();
+      // Fresh profile or cleared storage next to a restored pool: bind every
+      // runtime no pane claims to an empty pane (a reserved runtime starts on
+      // the attach this adopts), and keep watching while the daemon restores
+      // the rest of its pool after this boot.
+      adoptPending = true;
+      adoptSeen = runtimes.length;
+      adoptUnclaimedRuntimes();
     }
   } else {
     // Nothing was read, so nothing may be published: this browser's fallback

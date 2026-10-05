@@ -11,7 +11,8 @@
     <!-- No global chrome: the sidebar is the only app-level surface. #status sits
          at its bottom so connection failures stay visible, and #build stays in the
          DOM (hidden) for the client's bundle-reload check. The resizer and the
-         collapsed-state expand control are wired by src/sidebar.ts. -->
+         collapsed-state expand control are wired by src/sidebar.ts; the working-
+         indicator motion control below is wired by src/working-indicator.ts. -->
     <div id="app">
       <aside id="sidebar">
         <div class="side-block side-search">
@@ -35,6 +36,22 @@
         <div id="session-list" class="side-list"></div>
         <div class="side-status">
           <span id="status" class="status" data-kind="idle">connecting…</span>
+          <div class="motion-control" role="group" aria-label="Working indicator motion">
+            <span class="motion-label">Motion</span>
+            <button
+              type="button"
+              data-motion="system"
+              title="Follow the system reduced-motion setting"
+            >
+              System
+            </button>
+            <button type="button" data-motion="animate" title="Always animate the working indicator">
+              On
+            </button>
+            <button type="button" data-motion="reduce" title="Freeze the working indicator">
+              Off
+            </button>
+          </div>
         </div>
       </aside>
       <div

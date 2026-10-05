@@ -10,10 +10,12 @@
  * Phase D exercises the session index behind the sidebar.
  * Phase E covers clipboard image paste: stored bytes, rejected types, empty bodies.
  * Phase H proves resume uses the transcript's recorded cwd, not OMP_DESKTOP_CWD.
+ * Phase I proves the daemon's own restore: a restart brings back the session that
+ * was live, and never the one the user stopped.
  *
  * Run: bun run smoke
  */
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isRecord } from "../src/guards";
@@ -133,6 +135,20 @@ async function runtimes(): Promise<RuntimeInfo[]> {
   const body: unknown = await res.json();
   assert(isRecord(body) && Array.isArray(body.runtimes), "runtimes response has a list");
   return body.runtimes.map(runtimeFrom);
+}
+
+/**
+ * The daemon generation alongside the pool. Clients treat a generation change
+ * as "the daemon restarted, every runtime is gone", so it must be present and
+ * stable for one process and different for the next.
+ */
+async function generation(): Promise<string> {
+  const res = await fetch(`${BASE}/api/runtimes`);
+  assert(res.ok, "GET /api/runtimes");
+  const body: unknown = await res.json();
+  const value = isRecord(body) ? body.generation : undefined;
+  assert(typeof value === "string" && value.length > 0, "runtimes response carries a daemon generation");
+  return value;
 }
 
 async function sessions(limit: number, search?: string): Promise<SessionInfo[]> {
@@ -295,6 +311,59 @@ async function phaseB(): Promise<void> {
   pane.close();
 }
 
+type RestoreFixture = { sessionPath: string; stoppedPath: string; project: string };
+
+/** A minimal resumable transcript: its session header carries the recorded cwd. */
+function writeTranscript(root: string, id: string, cwd: string): string {
+  mkdirSync(join(root, "-tmp-smoke-restore"), { recursive: true });
+  const path = join(root, "-tmp-smoke-restore", `2026-10-04T00-00-00-000Z_${id}.jsonl`);
+  writeFileSync(path, JSON.stringify({ type: "session", version: 3, id, timestamp: new Date().toISOString(), cwd }) + "\n");
+  return path;
+}
+
+/**
+ * Runs on the daemon that owns the pool: one session resumes and stays live,
+ * a second is explicitly stopped. Isolated store, and a stand-in omp that
+ * blocks on stdin, so the pool is genuinely live when the daemon stops.
+ */
+async function phaseIStart(fixture: RestoreFixture): Promise<void> {
+  console.log("\n-- Phase I: the pool survives a daemon restart");
+  const runtime = await createRuntime({ resume: fixture.sessionPath });
+  assert(runtime.sessionFile === fixture.sessionPath, `the resumed session is in the pool (${runtime.sessionFile})`);
+  assert((await runtimes()).find((entry) => entry.id === runtime.id)?.alive === true, "the resumed session is running");
+  const stopped = await createRuntime({ resume: fixture.stoppedPath });
+  const killed = await fetch(`${BASE}/api/runtimes/${stopped.id}`, { method: "DELETE" });
+  assert(killed.ok, "DELETE stops the second session");
+}
+
+/**
+ * Runs on a fresh daemon sharing the state dir of the daemon that just stopped:
+ * the session that was live is restored with no client asking, in its recorded
+ * directory, and the session the user stopped stays stopped.
+ */
+async function phaseIRestored(fixture: RestoreFixture): Promise<void> {
+  await waitFor(
+    async () => (await runtimes()).some((entry) => entry.sessionFile === fixture.sessionPath),
+    20_000,
+    "the session that was live at shutdown to be restored",
+  );
+  const listed = await runtimes();
+  assert(listed.length === 1, `exactly the live session came back (${listed.length})`);
+  assert(listed[0].sessionFile === fixture.sessionPath, "the restored session is the one that was live");
+  assert(listed[0].cwd === fixture.project, `the restored session runs in its recorded cwd (${listed[0].cwd})`);
+  assert(listed[0].alive === true, "the restored session is running");
+  assert(!listed.some((entry) => entry.sessionFile === fixture.stoppedPath), "the stopped session stayed stopped");
+  // Attach and type a line: one line ends the stand-in omp, so this proves the
+  // restored process is real, reachable, and taking input.
+  const pane = await attach(listed[0].id);
+  pane.send("restored\n");
+  await waitFor(
+    async () => (await runtimes()).find((entry) => entry.id === listed[0].id)?.status === "exited",
+    10_000,
+    "the restored process to take input",
+  );
+}
+
 async function phaseE(pasteDir: string): Promise<void> {
   console.log("\n-- Phase E: image paste");
   const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]);
@@ -325,6 +394,8 @@ async function phaseE(pasteDir: string): Promise<void> {
 
 /** The exact document written in phase F; phase G compares the daemon's copy against it. */
 let writtenState = "";
+/** Generation of the first daemon; the restarted one must differ (phase G). */
+let firstGeneration = "";
 
 async function phaseF(stateDir: string): Promise<void> {
   console.log("\n-- Phase F: durable workspace state");
@@ -387,15 +458,16 @@ async function phaseF(stateDir: string): Promise<void> {
 
 /** Runs on a second daemon sharing the state dir: the document survived the restart. */
 async function phaseG(stateDir: string): Promise<void> {
-  console.log("\n-- Phase G: workspace state survives a daemon restart");
+  console.log("\n-- Phase G: workspace state and daemon identity survive a restart");
   assert(await Bun.file(join(stateDir, "state.json")).exists(), "state file is on disk");
   const res = await fetch(`${BASE}/api/state`);
   assert(res.ok, "GET /api/state after restart");
   const body: unknown = await res.json();
   assert(isRecord(body) && JSON.stringify(body.state) === writtenState, "stored document is unchanged");
+  assert((await generation()) !== firstGeneration, "the restarted daemon reports a new generation");
 }
 
-type CwdFixture = { sessionPath: string; project: string; launch: string };
+type CwdFixture = { sessionPath: string; project: string; launch: string; capacityPaths: string[] };
 
 /**
  * Isolated store + transcript: resume must run in the directory recorded in the
@@ -420,10 +492,14 @@ async function phaseH(fixture: CwdFixture): Promise<void> {
   for (const runtime of [resumed, conflicting, fresh]) {
     await fetch(`${BASE}/api/runtimes/${runtime.id}`, { method: "DELETE" });
   }
-  const concurrent = await Promise.all(Array.from({ length: 9 }, () => fetch(`${BASE}/api/runtimes`, {
+  // Distinct transcripts must still not blow past the pool limit when they are
+  // requested at once: every spawn occupies a slot the moment it is reserved.
+  // (Concurrent requests for *one* transcript collapse onto one process, which
+  // the manager regression tests pin.)
+  const concurrent = await Promise.all(fixture.capacityPaths.map((resume) => fetch(`${BASE}/api/runtimes`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ resume: fixture.sessionPath }),
+    body: JSON.stringify({ resume }),
   })));
   assert(concurrent.filter((response) => response.ok).length === 8, "concurrent transcript reads cannot exceed runtime capacity");
   assert(concurrent.filter((response) => response.status === 409).length === 1, "one concurrent resume is rejected at capacity");
@@ -450,6 +526,8 @@ try {
       await phaseD();
       await phaseE(pasteDir);
       await phaseF(stateDir);
+      firstGeneration = await generation();
+      assert(firstGeneration === (await generation()), "the generation is stable within one daemon process");
     },
   );
 
@@ -460,6 +538,39 @@ try {
       await phaseB();
     },
   );
+
+  // Isolated store for phase I: the daemon owns the pool, so a restart brings
+  // the live sessions back with no client asking. The stand-in omp blocks on
+  // stdin, so it is genuinely running when the first daemon stops.
+  const restoreRoot = join(dir, "restore-fixture");
+  const restoreSessions = join(restoreRoot, "sessions");
+  const restoreProject = join(restoreRoot, "project");
+  mkdirSync(restoreProject, { recursive: true });
+  const standIn = join(restoreRoot, "stand-in-omp");
+  writeFileSync(standIn, "#!/bin/sh\nread line\nexit 0\n");
+  chmodSync(standIn, 0o755);
+  const restoreFixture: RestoreFixture = {
+    sessionPath: writeTranscript(restoreSessions, "01a10000-0000-7000-8000-0000000000f1", restoreProject),
+    stoppedPath: writeTranscript(restoreSessions, "01a10000-0000-7000-8000-0000000000f2", restoreProject),
+    project: restoreProject,
+  };
+  const restoreEnv = {
+    OMP_DESKTOP_OMP: standIn,
+    OMP_DESKTOP_OMP_ARGS: "",
+    OMP_DESKTOP_OVERLAY: "",
+    OMP_DESKTOP_EXTENSION: "",
+    OMP_DESKTOP_MAX_RUNTIMES: "4",
+    OMP_DESKTOP_CWD: restoreProject,
+    OMP_DESKTOP_SESSIONS_DIR: restoreSessions,
+    OMP_DESKTOP_PASTE_DIR: join(restoreRoot, "pastes"),
+    OMP_DESKTOP_STATE_DIR: join(restoreRoot, "state"),
+  };
+  await withDaemon(restoreEnv, async () => {
+    await phaseIStart(restoreFixture);
+  });
+  await withDaemon(restoreEnv, async () => {
+    await phaseIRestored(restoreFixture);
+  });
 
   // Isolated store for phase H: the fixture transcript records its own cwd, and
   // the daemon's OMP_DESKTOP_CWD is a different (launch-fallback) directory.
@@ -488,6 +599,27 @@ try {
       }),
     ].join("\n") + "\n",
   );
+  // Nine sibling transcripts for the concurrency/capacity phase, each a valid
+  // session under the same store with its own identity.
+  const capacityPaths = Array.from({ length: 9 }, (_, index) => {
+    const path = join(
+      fixtureSessions,
+      "-tmp-smoke-capacity-fixture",
+      `2026-10-04T00-00-01-000Z_01a10000-0000-7000-8000-0000000000${(index + 10).toString(16)}.jsonl`,
+    );
+    mkdirSync(join(fixtureSessions, "-tmp-smoke-capacity-fixture"), { recursive: true });
+    writeFileSync(
+      path,
+      JSON.stringify({
+        type: "session",
+        version: 3,
+        id: `01a10000-0000-7000-8000-0000000000${(index + 10).toString(16)}`,
+        timestamp: new Date().toISOString(),
+        cwd: fixtureProject,
+      }) + "\n",
+    );
+    return path;
+  });
   await withDaemon(
     {
       OMP_DESKTOP_OMP: "/bin/sh",
@@ -501,7 +633,7 @@ try {
       OMP_DESKTOP_STATE_DIR: join(fixtureRoot, "state"),
     },
     async () => {
-      await phaseH({ sessionPath: fixturePath, project: fixtureProject, launch: fixtureLaunch });
+      await phaseH({ sessionPath: fixturePath, project: fixtureProject, launch: fixtureLaunch, capacityPaths });
     },
   );
   console.log("\nSMOKE PASSED");

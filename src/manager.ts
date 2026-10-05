@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { Runtime, type RuntimeSpec } from "./runtime";
 import type { RuntimeInfo } from "./protocol";
+import type { LiveSession } from "./state";
 
 export type SpawnRequest = {
   /**
@@ -35,12 +36,26 @@ export type ManagerDefaults = {
 export class RuntimeCapacityError extends Error {}
 
 /**
+ * Why the pool changed. The distinction matters to the durable record: a start
+ * or a stop is a deliberate, finished statement and is saved at once, while an
+ * exit is a process death whose cause the daemon cannot see — during a unit
+ * teardown (systemctl stop, logout, reboot) the children die with the daemon and
+ * a naive save would drop sessions that were live a moment ago — so the daemon
+ * treats an exit as provisional (see daemon.ts).
+ */
+export type PoolChange = "started" | "stopped" | "exited";
+
+/**
  * P1: a pool of live omp processes. Runtimes outlive the panes that show them —
  * closing a pane only unbinds it, so a session keeps working (and keeps its
  * scrollback) while the user rearranges the layout.
  */
 export class RuntimeManager {
   #runtimes = new Map<string, Runtime>();
+  /** Transcripts with a create in flight, so concurrent resumes share one process. */
+  #pendingResumes = new Map<string, Promise<Runtime>>();
+  /** Notified after any change to the set `liveSessions()` returns. */
+  #changeSubs = new Set<(change: PoolChange) => void>();
   readonly defaults: ManagerDefaults;
 
   constructor(defaults: ManagerDefaults) {
@@ -55,7 +70,81 @@ export class RuntimeManager {
     return this.#runtimes.get(id);
   }
 
+  /**
+   * The pool's durable meaning: every process that is running (or waiting to be
+   * attached) and has a known transcript, deduplicated by transcript. This is
+   * what a daemon restart must bring back, independent of any pane or client.
+   */
+  liveSessions(): LiveSession[] {
+    const seen = new Set<string>();
+    const sessions: LiveSession[] = [];
+    for (const runtime of this.#runtimes.values()) {
+      const sessionFile = runtime.sessionFile;
+      if (!sessionFile || runtime.status === "exited" || seen.has(sessionFile)) continue;
+      seen.add(sessionFile);
+      sessions.push({
+        sessionFile,
+        cwd: runtime.spec.cwd,
+        cols: runtime.cols,
+        rows: runtime.rows,
+      });
+    }
+    return sessions;
+  }
+
+  /** Run `sub` after every create, exit, kill, and transcript sniff. */
+  subscribeChanges(sub: (change: PoolChange) => void): () => void {
+    this.#changeSubs.add(sub);
+    return () => this.#changeSubs.delete(sub);
+  }
+
+  #changed(change: PoolChange): void {
+    for (const sub of this.#changeSubs) sub(change);
+  }
+
+  /** Watch one runtime's process lifecycle for pool changes. */
+  #track(runtime: Runtime): void {
+    const changed = (change: PoolChange): void => {
+      // A runtime already removed by kill() is out of the pool; its later exit
+      // must not report one more change for a state that is already recorded.
+      if (this.#runtimes.has(runtime.id)) this.#changed(change);
+    };
+    runtime.subscribeExit(() => changed("exited"));
+    runtime.subscribeSessionFile(() => changed("started"));
+  }
+
   async create(request: SpawnRequest = {}): Promise<Runtime> {
+    const resume = request.resume;
+    if (resume) {
+      // Idempotent resume: a transcript already running (or being started right
+      // now by another caller, including the daemon's own restart restore) has
+      // exactly one process. A second writer would make omp fork to a sibling
+      // file, so duplicates are a correctness problem, not just waste.
+      const pending = this.#pendingResumes.get(resume);
+      if (pending) return pending;
+      const existing = [...this.#runtimes.values()].find(
+        (runtime) => runtime.sessionFile === resume && runtime.status !== "exited",
+      );
+      if (existing) {
+        existing.start();
+        return existing;
+      }
+    }
+    const creation = this.#spawn(request);
+    if (resume) {
+      this.#pendingResumes.set(resume, creation);
+      // Clear the slot once the attempt settles, failed or not: a later caller
+      // must be able to retry a transcript that could not be started.
+      void creation
+        .catch(() => {})
+        .finally(() => {
+          if (this.#pendingResumes.get(resume) === creation) this.#pendingResumes.delete(resume);
+        });
+    }
+    return creation;
+  }
+
+  async #spawn(request: SpawnRequest): Promise<Runtime> {
     const cwd = await this.#workingDirectory(request);
     // Check after the async transcript read: concurrent resume requests must
     // not all reserve the same final slot while that read is in flight.
@@ -89,11 +178,25 @@ export class RuntimeManager {
       },
     };
     const runtime = new Runtime(spec);
+    // A resumed transcript is the process's identity from its first frame, not
+    // only after omp's OSC 1337 sniff: dedupe, the durable ledger, and clients
+    // all key sessions by transcript, and a fork to a sibling file (omp's answer
+    // to a foreign writer holding the target) still arrives through the sniff.
+    if (request.resume) runtime.sessionFile = request.resume;
     this.#runtimes.set(id, runtime);
-    // Started on first attach: no client, no process. `resume` must not be delayed
-    // forever though, and the sidebar shows runtimes before any pane attaches, so
-    // an explicitly requested session starts now.
-    if (request.resume) runtime.start();
+    this.#track(runtime);
+    try {
+      // Started on first attach: no client, no process. `resume` must not be delayed
+      // forever though, and the sidebar shows runtimes before any pane attaches, so
+      // an explicitly requested session starts now.
+      if (request.resume) runtime.start();
+    } catch (error) {
+      // A spawn that threw leaves no process behind; do not report a session
+      // that is not running (the ledger would restore a phantom forever).
+      this.#runtimes.delete(id);
+      throw error;
+    }
+    this.#changed("started");
     return runtime;
   }
 
@@ -112,15 +215,27 @@ export class RuntimeManager {
     return request.cwd ?? this.defaults.cwd;
   }
 
-  /** Kill and forget. Panes bound to it fall back to an exited placeholder. */
+  /**
+   * Kill and forget. An explicit stop: the runtime leaves the pool, so a
+   * restart must not bring its session back. Panes bound to it fall back to an
+   * exited placeholder (and their binding's resume claim is the client's
+   * concern, not the pool's).
+   */
   kill(id: string): boolean {
     const runtime = this.#runtimes.get(id);
     if (!runtime) return false;
     this.#runtimes.delete(id);
     runtime.kill();
+    this.#changed("stopped");
     return true;
   }
 
+  /**
+   * Kill every process. Only a daemon shutdown calls this, and a shutdown is
+   * not the sessions ending: this method deliberately emits no change event, so
+   * the durable record keeps describing the pool the next daemon start must
+   * restore (the daemon freezes that record before calling this).
+   */
   killAll(): void {
     for (const runtime of this.#runtimes.values()) runtime.kill();
     this.#runtimes.clear();

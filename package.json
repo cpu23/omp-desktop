@@ -11,7 +11,9 @@
     "app": "tauri dev",
     "app:build": "tauri build --no-bundle",
     "app:install": "bun run app:build && bun run scripts/install-app.ts",
+    "app:webkit:build": "bun run scripts/build-webkit.ts",
     "smoke": "bun run scripts/smoke.ts",
+    "test": "bun test",
     "check": "bunx tsc --noEmit -p tsconfig.json"
   },
   "devDependencies": {

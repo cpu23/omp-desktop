@@ -41,7 +41,7 @@ work. Sources for every borrowed idea are linked in §12.
 | PTY | **`bun-pty`** (MIT, Rust `portable-pty` over FFI) | node-pty has no supported Bun path ([node-pty#632](https://github.com/microsoft/node-pty/issues/632)); Bun's built-in `Bun.Terminal` lacks `setsid`/`TIOCSCTTY` ([bun#33237](https://github.com/oven-sh/bun/issues/33237)). Fallback: 200-line Rust helper with `portable-pty` behind the same PTY interface |
 | Terminal renderer | **xterm.js** + addon-image, fit, web-links, unicode11, clipboard | ZCode ships `@xterm/xterm 6`; addon-image 0.9.0 stable renders **SIXEL + iTerm2**, kitty only in 0.10 betas and without unicode placeholders ([inventory](https://github.com/xtermjs/xterm.js/discussions/5683)) |
 | In-pane images | spawn omp with `PI_FORCE_IMAGE_PROTOCOL=iterm2` (or `sixel` + `PI_ALLOW_SIXEL_PASSTHROUGH=1`) | Both verified in the omp 18.4.9 binary; stable addon-image path. Kitty path revisited if 0.10 lands placeholders |
-| Shell | **Tauri 2** native window over the existing loopback webapp; browser access remains available | Linux uses system WebKitGTK, not Chromium; window lifetime is independent of the Bun daemon. Build/install commands and native prerequisites are in README. |
+| Shell | **Tauri 2** native window over the existing loopback webapp; browser access remains available | Linux uses WebKitGTK, not Chromium: system libraries by default, or the optional app-private high-refresh runtime. Window lifetime is independent of the Bun daemon. Build/install/rollback commands and native prerequisites are in README. |
 | Client transport | WS topics with monotonic seq + bounded delta log + snapshot resync; HTTP POST for commands | Stolen from OmpCode `sessionIndexTopics.ts` / `topicPublisher.ts`; beats omp-mobile's 2–8s polling |
 | Auth | loopback only + launch token → signed HttpOnly cookie, Host/Origin fence | OmpCode's relay has no auth (`127.0.0.1:8765`); dsh's model is stronger ([connection README](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/client/connection/README.md)) |
 | omp integration | TUI via PTY **plus** a desktop extension (fork of `extension.ts`) over a per-runtime unix socket | Extension gives structured state/actions (title, status, session file, cost, capabilities); PTY gives the real UI |
@@ -115,7 +115,7 @@ read/write client (prompt, abort, model, view panes), matching the "shared live"
 | **P0 spike** | daemon spawns one `omp` TUI in PTY (bun-pty), WS byte stream, xterm.js attach | Type a prompt, see streaming response; resize works; paste a screenshot → it renders in the pane; kill/restart daemon → `--resume` restores the session |
 | **P1 grid+sidebar** | split tree ≤4, drag session→pane, recent picker, live session list | Swap two live sessions between panes without restarting either; layout survives client reload |
 | **P2 persistence** | state.json, byte logs, systemd user unit, LRU pool, notifications | Close window → agent keeps working; restart daemon → panes and sessions restored; mobile PWA drives the same runtimes |
-| **P3 shell** | Tauri 2 window/tray/autostart (or Electron if WebKitGTK fails the perf test) | App-like launch, no browser chrome; perf test: 4 panes, 60 fps scroll, input latency < 30 ms measured |
+| **P3 shell** | Tauri 2 window/tray/autostart | App-like launch, no browser chrome; perf test: 4 panes, 60 fps scroll, input latency < 30 ms measured |
 | **P4 polish** | app-side image previews, fork action, layout undo (dockkit-style ops), retire zellij wrappers | zellij unused for a week |
 
 ## 10. Risks
@@ -124,7 +124,7 @@ read/write client (prompt, abort, model, view panes), matching the "shared live"
   degraded, fall back to app-side image rendering from blobs (needs extension data, not PTY sniffing).
 - **Bun PTY maturity**: bun-pty is a third-party FFI wrapper; P0 must stress it (resize storms, SIGWINCH, flow control).
   Rust `portable-pty` helper is the planned fallback.
-- **WebKitGTK (Tauri on Wayland)**: IME/GPU/key handling caveats; P3 perf test decides Tauri vs Electron. P0–P2 stay shell-free.
+- **WebKitGTK (Tauri on Wayland)**: IME/GPU/key handling caveats remain. The app-private WebKitGTK/GTK runtime reached ~119 Hz with four streaming panes on the local NVIDIA workstation; it requires manual security updates. Native clipboard-image paste and pane dragging remain unverified on the actual desktop. System-library rollback is available.
 - **omp lease/fork semantics**: second writer forks a sibling — surfaced as an explicit fork, never silent.
 - **Input semantics**: xterm.js must enable mouse reporting and bracketed paste exactly like zellij does today; verify omp's
   `tui.mouse` interactions in P0.
@@ -169,7 +169,7 @@ read/write client (prompt, abort, model, view panes), matching the "shared live"
 - Stable `addon-image` renders SIXEL + iTerm2 only; **kitty graphics is beta-only and lacks unicode placeholders**, so omp's default kitty image path is unavailable → force `PI_FORCE_IMAGE_PROTOCOL=iterm2|sixel`. If that degrades omp's rendering, fall back to app-side image rendering from the blob store (needs extension data). P0 gate.
 - Kitty keyboard protocol has open bugs in xterm.js → some modifier chords may not reach omp identically to a native terminal.
 - Images are not serialized by the renderer; on re-attach they exist only if still inside the replayed log window (log rotation eventually drops them).
-- Web renderer is slower than a native terminal; 4 busy panes can stutter. WebKitGTK (Tauri) adds IME/GPU caveats on Wayland; Electron is the fallback (heavier).
+- Web rendering remains workload-dependent. The private WebKitGTK/GTK runtime avoids the measured NVIDIA compositing and 60 Hz timing limits without Chromium; shared-memory presentation still copies the final surface. System WebKitGTK remains the rollback path, with its original performance limits.
 
 **PTY / process layer**
 - Bun's built-in PTY lacks `setsid`/`TIOCSCTTY` ([bun#33237](https://github.com/oven-sh/bun/issues/33237)) → `bun-pty` (third-party FFI wrapper). If it proves unstable, swap in a small Rust `portable-pty` helper. P0 gate.
@@ -252,10 +252,17 @@ Four defects the browser acceptance pass had missed, all reproduced and fixed th
    `get_session_stats`, streamed once per `(mtime, size)` and cached. The cost object is matched as a whole,
    so a chunk boundary can never contribute a truncated number; verified against an independent sum
    ($30.4880).
+   Session recency is separate from cost and filesystem activity: the last user/assistant message timestamp
+   determines sidebar age and ordering. Opening a transcript or appending exit metadata leaves that age unchanged.
 
 Operating note: `systemctl --user restart omp-desktopd` kills every pane process (they are in the service
-cgroup), so it is a hard reset, not a reload. Panes come back labelled and resumable, but a graceful
-restart/adopt path remains open work.
+cgroup), so it is a hard reset, not a reload. The daemon persists the entire transcript-backed pool in
+`sessions.json` and restores it before runtime requests, even with no browser or bound pane. Pane intent
+and generation now govern reattachment and legacy workspace migration; transcript-level single-flight
+resume prevents duplicate writers across clients. Explicit stops save immediately. Unknown process exits
+settle for three seconds so child-first service teardown cannot erase still-wanted sessions; shutdown
+freezes the ledger. In-flight tasks and unsaved input are not restored. The first upgrade from the old
+daemon needs the live checkpoint command documented in README; already-lost identities cannot be inferred.
 
 ## 18. Chrome styling follows omp-mobile (2026-10-02)
 
