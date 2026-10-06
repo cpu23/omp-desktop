@@ -34,6 +34,8 @@ export type PaneBinding = {
    * unknown) generation means a restart, where the transcript is reopened.
    */
   daemonGeneration: string | null;
+  /** Explicitly closed view: retain its placeholder instead of adopting a sidebar runtime. */
+  keepEmpty?: true;
 };
 
 /** The state of a pane that has no runtime and no session. */
@@ -76,6 +78,7 @@ export function bindingFromStored(entry: unknown): PaneBinding | null {
     autoResume: entry.autoResume === true ||
       (entry.autoResume === undefined && (runtimeId !== null || sessionFile !== null)),
     daemonGeneration: typeof entry.daemonGeneration === "string" ? entry.daemonGeneration : null,
+    ...(entry.keepEmpty === true && runtimeId === null && sessionFile === null ? { keepEmpty: true as const } : {}),
   };
 }
 

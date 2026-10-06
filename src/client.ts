@@ -918,22 +918,26 @@ function splitLayout(): void {
 function closePane(paneId: string): void {
   const pane = panes.get(paneId);
   if (!pane) return;
-  if (leaves().length <= 1) {
-    pane.detach();
-    pane.binding = emptyBinding();
-    pane.renderPlaceholder();
-    pane.renderHeader();
-    save();
+  const ids = leaves();
+  // Closing a view never kills its runtime. In a four-pane grid, keep the
+  // first closed quadrant in place; the second close removes both slots.
+  const alreadyClosed = ids.find((id) => panes.get(id)?.binding.keepEmpty);
+  if (ids.length === 4 && pane.binding.keepEmpty) return;
+  if (ids.length <= 1 || (ids.length === 4 && !alreadyClosed)) {
+    pane.bind({ ...emptyBinding(), keepEmpty: true });
     return;
   }
-  // The runtime is not killed: panes are views, the pool owns processes.
-  const sibling = removeLeaf(layout.tree, paneId);
-  if (!sibling) return;
-  layout.tree = gridLayout(sibling.tree);
-  panes.delete(paneId);
-  delete layout.panes[paneId];
-  pane.destroy();
-  if (layout.focused === paneId) layout.focused = leaves(sibling.tree)[0] ?? null;
+  const removed = ids.length === 4 && alreadyClosed ? [alreadyClosed, paneId] : [paneId];
+  for (const id of removed) {
+    const remaining = removeLeaf(layout.tree, id);
+    if (!remaining) return;
+    layout.tree = remaining.tree;
+    panes.get(id)?.destroy();
+    panes.delete(id);
+    delete layout.panes[id];
+  }
+  layout.tree = gridLayout(layout.tree);
+  if (layout.focused && removed.includes(layout.focused)) layout.focused = leaves()[0] ?? null;
   renderLayout();
   save();
 }
@@ -1353,8 +1357,8 @@ async function restoreWantedSessions(): Promise<void> {
  * sessions whose pane document was lost (an emptied binding has no transcript
  * left to resume, but the daemon's ledger still has the session). Runtimes
  * whose transcript is claimed by any pane are left for that pane, even while
- * its resume is still in flight; panes with a session (or a runtime) are never
- * overwritten, and a pane with nothing keeps its placeholder.
+ * its resume is still in flight; panes with a session (or a runtime), and
+ * explicitly closed placeholders, are never overwritten.
  */
 function adoptUnclaimedRuntimes(): void {
   const claimedRuntimes = new Set<string>();
@@ -1366,7 +1370,8 @@ function adoptUnclaimedRuntimes(): void {
   for (const runtime of runtimes) {
     if (!attachable(runtime) || claimedRuntimes.has(runtime.id)) continue;
     if (runtime.sessionFile && claimedSessions.has(runtime.sessionFile)) continue;
-    const empty = [...panes.values()].find((pane) => !pane.binding.runtimeId && !pane.binding.sessionFile);
+    const empty = [...panes.values()].find((pane) =>
+      !pane.binding.runtimeId && !pane.binding.sessionFile && !pane.binding.keepEmpty);
     if (!empty) return;
     empty.bind(bindingForRuntime(runtime, daemonId, displayTitle(runtime)));
   }

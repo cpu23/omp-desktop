@@ -19,9 +19,14 @@ types the path, which omp attaches).
 Right-click any pane for the layout-wide split action (`Ctrl+Shift+E` also works):
 the first action changes 1×1 to 1×2 side by side; the next splits both columns
 top/bottom at once, producing 2×2. At four panes the menu action is disabled.
-Closing a pane enables it again to fill missing grid slots. There is no header
-split button. Escape or clicking outside dismisses the menu. Older arbitrary layouts
-are converted to this structure on load, preserving up to four pane bindings.
+In a 2×2 grid, closing the first pane keeps all four quadrants and leaves an empty
+slot with **new session here**. That slot stays empty across reloads; selecting or
+dragging a sidebar session into it also fills it. Closing a second occupied pane
+removes both closed slots and returns to two side-by-side panes, enabling split
+again. Closing an already-empty retained slot does nothing. Closing a view does
+not stop its session in the sidebar. There is no header split button. Escape or
+clicking outside dismisses the menu. Older arbitrary layouts are converted to this
+structure on load, preserving up to four pane bindings.
 `Ctrl+Shift+X` closes a pane; the former
 `Ctrl+Shift+O` direction-specific shortcut is removed.
 To switch sessions, focus a pane and click a session in the sidebar, or drag a
