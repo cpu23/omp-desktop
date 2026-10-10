@@ -5,7 +5,8 @@
  *
  * Run: bun test src/sessions.test.ts
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -320,6 +321,93 @@ describe("message-derived activity", () => {
 
     const sessions = await listSessions({ sessionsRoot: root, search: "zebra" });
     expect(sessions.map((entry) => entry.id)).toEqual(["search-old"]);
+  });
+});
+
+describe("parsed header cache", () => {
+  test("reuses warm headers and invalidates on mtime or size changes", async () => {
+    const root = makeRoot();
+    const path = writeSession(root, "2026-09-01T00-00-00-000Z_cached.jsonl", [
+      session("cached", "2026-09-01T00:00:00.000Z"),
+      { type: "title_change", id: "t1", parentId: null, timestamp: "2026-09-01T00:00:01.000Z", title: "Old title" },
+      user("2026-09-01T00:00:02.000Z", "prompt"),
+      assistant("2026-09-01T00:00:03.000Z"),
+    ]);
+    const unchangedMtime = "2026-09-01T00:00:00.000Z";
+    setMtime(path, unchangedMtime);
+
+    const fileSpy = spyOn(Bun, "file");
+    try {
+      expect((await listSessions({ sessionsRoot: root }))[0]?.title).toBe("Old title");
+      const warmReadCount = fileSpy.mock.calls.length;
+      expect((await listSessions({ sessionsRoot: root }))[0]?.title).toBe("Old title");
+      expect(fileSpy.mock.calls.length).toBe(warmReadCount);
+
+      writeSession(root, "2026-09-01T00-00-00-000Z_cached.jsonl", [
+        session("cached", "2026-09-01T00:00:00.000Z"),
+        { type: "title_change", id: "t1", parentId: null, timestamp: "2026-09-01T00:00:01.000Z", title: "New title" },
+        user("2026-09-01T00:00:02.000Z", "prompt"),
+        assistant("2026-09-01T00:00:03.000Z"),
+      ]);
+      setMtime(path, "2026-09-02T00:00:00.000Z");
+      expect((await listSessions({ sessionsRoot: root }))[0]?.title).toBe("New title");
+
+      writeSession(root, "2026-09-01T00-00-00-000Z_cached.jsonl", [
+        session("cached", "2026-09-01T00:00:00.000Z"),
+        { type: "title_change", id: "t1", parentId: null, timestamp: "2026-09-01T00:00:01.000Z", title: "Longer title" },
+        user("2026-09-01T00:00:02.000Z", "prompt"),
+        assistant("2026-09-01T00:00:03.000Z"),
+      ]);
+      setMtime(path, "2026-09-02T00:00:00.000Z");
+      expect((await listSessions({ sessionsRoot: root }))[0]?.title).toBe("Longer title");
+    } finally {
+      fileSpy.mockRestore();
+    }
+  });
+
+  test("retries a transient header read failure", async () => {
+    const root = makeRoot();
+    const path = writeSession(root, "2026-09-01T00-00-00-000Z_retry.jsonl", [
+      session("retry", "2026-09-01T00:00:00.000Z"),
+      user("2026-09-01T00:00:01.000Z", "prompt"),
+      assistant("2026-09-01T00:00:02.000Z"),
+    ]);
+    const realFile = Bun.file.bind(Bun);
+    let failHeaderRead = true;
+    const fileSpy = spyOn(Bun, "file").mockImplementation((filePath) => {
+      if (String(filePath) === path && failHeaderRead) {
+        failHeaderRead = false;
+        throw new Error("transient read failure");
+      }
+      return Reflect.apply(realFile, Bun, [filePath]);
+    });
+    try {
+      expect(await listSessions({ sessionsRoot: root })).toEqual([]);
+      expect((await listSessions({ sessionsRoot: root })).map((entry) => entry.id)).toEqual(["retry"]);
+    } finally {
+      fileSpy.mockRestore();
+    }
+  });
+
+  test("refreshes history.db titles independently of cached transcript headers", async () => {
+    const root = makeRoot();
+    const sessionsRoot = join(root, "sessions");
+    writeSession(sessionsRoot, "2026-09-01T00-00-00-000Z_history.jsonl", [
+      session("history", "2026-09-01T00:00:00.000Z"),
+      user("2026-09-01T00:00:01.000Z", "prompt"),
+      assistant("2026-09-01T00:00:02.000Z"),
+    ]);
+    const historyPath = join(root, "history.db");
+    const createDb = new Database(historyPath);
+    createDb.run("CREATE TABLE session_titles (session_id TEXT, title TEXT)");
+    createDb.run("INSERT INTO session_titles VALUES ('history', 'First external title')");
+    createDb.close();
+
+    expect((await listSessions({ sessionsRoot }))[0]?.title).toBe("First external title");
+    const renameDb = new Database(historyPath);
+    renameDb.run("UPDATE session_titles SET title = 'Renamed external title' WHERE session_id = 'history'");
+    renameDb.close();
+    expect((await listSessions({ sessionsRoot }))[0]?.title).toBe("Renamed external title");
   });
 });
 

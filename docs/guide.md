@@ -75,6 +75,12 @@ The daemon reads and writes only these locations (all overridable; see [Configur
 | `~/.omp/agent/sessions` | read-only: session index and resume validation |
 | `~/.local/state/omp-mobile/` | per-runtime extension sockets (created when the extension runs) |
 
+History refreshes scan all transcript metadata before sorting by conversation activity, searching, and limiting the
+visible rows. Parsed headers, activity, and costs are cached by path, modification time, and size in bounded
+1,024-entry caches; external history titles are refreshed independently. Directory reads, file stats, summary
+tasks, and cost reads each use at most eight workers per listing rather than launching work for the whole store
+at once.
+
 Development commands:
 
 ```sh

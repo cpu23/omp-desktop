@@ -72,6 +72,9 @@ const DEFAULT_LIMIT = 60;
 const TAIL_CHUNK_BYTES = 64 * 1024;
 /** Roles that form the conversation; tool results and developer context are machinery, not use. */
 const CONVERSATION_ROLES: Record<string, true> = { user: true, assistant: true };
+/** Bound directory, stat, summary, and cost work to avoid a poll-sized I/O burst. */
+const MAX_CONCURRENT_IO = 8;
+
 /** Per-file memoization cap: hot sessions survive, long-abandoned paths are evicted. */
 const CACHE_MAX_ENTRIES = 1024;
 
@@ -83,6 +86,21 @@ function cacheSet<K, V>(cache: Map<K, V>, key: K, value: V): void {
     const oldest = cache.keys().next().value;
     if (oldest !== undefined) cache.delete(oldest);
   }
+}
+
+/** Run a collection of I/O tasks with fixed concurrency, preserving input order. */
+async function mapConcurrent<T, R>(items: readonly T[], worker: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(items.length, MAX_CONCURRENT_IO) }, async () => {
+    for (;;) {
+      const index = next++;
+      if (index >= items.length) return;
+      results[index] = await worker(items[index]!);
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }
 
 /**
@@ -241,6 +259,26 @@ type HeadInfo = {
   startedAtMs: number | null;
 };
 
+const headerCache = new Map<string, { mtimeMs: number; bytes: number; info: HeadInfo }>();
+
+/** Read and parse one header, retrying failures on the next listing. */
+async function readParsedHeader(file: SessionFile): Promise<HeadInfo | null> {
+  const cached = headerCache.get(file.path);
+  if (cached && cached.mtimeMs === file.mtimeMs && cached.bytes === file.bytes) {
+    cacheSet(headerCache, file.path, cached);
+    return cached.info;
+  }
+  let head: string;
+  try {
+    head = await Bun.file(file.path).slice(0, HEADER_BYTES).text();
+  } catch {
+    return null;
+  }
+  const info = parseHead(head);
+  cacheSet(headerCache, file.path, { mtimeMs: file.mtimeMs, bytes: file.bytes, info });
+  return info;
+}
+
 export async function listSessions(
   options: { limit?: number; search?: string; sessionsRoot?: string } = {},
 ): Promise<SessionSummary[]> {
@@ -260,7 +298,7 @@ export async function listSessions(
   // skew can write messages newer than the file's last touch), so filtering by
   // mtime first could hide a recent session, and search must see every match.
   const summaries = (
-    await Promise.all(files.map((file) => readSummary(file, historyTitles)))
+    await mapConcurrent(files, (file) => readSummary(file, historyTitles))
   ).filter((summary): summary is SessionBase => summary !== null);
   summaries.sort(byActivityDesc);
 
@@ -278,12 +316,11 @@ export async function listSessions(
   // A cost sum is a full-file read, unlike the 8 KiB header, so only the rows
   // that actually cross the wire pay for it.
   const byPath = new Map<string, SessionFile>(files.map((file): [string, SessionFile] => [file.path, file]));
-  return Promise.all(
-    matched.slice(0, limit).map(async (summary) => {
-      const file = byPath.get(summary.path);
-      return { ...summary, costUsd: file ? await readCost(file) : 0 };
-    }),
-  );
+
+  return mapConcurrent(matched.slice(0, limit), async (summary) => {
+    const file = byPath.get(summary.path);
+    return { ...summary, costUsd: file ? await readCost(file) : 0 };
+  });
 }
 
 /**
@@ -305,32 +342,27 @@ export async function readSessionCwd(path: string): Promise<string | null> {
 
 /** Stat every `.jsonl` one level below `root`; unreadable entries are skipped. */
 async function collectSessionFiles(root: string): Promise<SessionFile[]> {
-  const files: SessionFile[] = [];
-  const dirs = await readdir(root, { withFileTypes: true }).catch(() => []);
-  await Promise.all(
-    dirs.map(async (dir) => {
-      if (!dir.isDirectory()) return;
-      const dirPath = join(root, dir.name);
-      const entries = await readdir(dirPath, { withFileTypes: true }).catch(() => []);
-      await Promise.all(
-        entries.map(async (entry) => {
-          if (!entry.name.endsWith(".jsonl")) return;
-          const path = join(dirPath, entry.name);
-          const info = await stat(path).catch(() => null); // vanished/unreadable
-          if (info?.isFile()) {
-            files.push({
-              path,
-              dir: dir.name,
-              mtimeMs: info.mtimeMs,
-              bytes: info.size,
-              birthtimeMs: info.birthtimeMs,
-            });
-          }
-        }),
-      );
-    }),
-  );
-  return files;
+  const dirs = (await readdir(root, { withFileTypes: true }).catch(() => [])).filter((dir) => dir.isDirectory());
+  const candidatesByDir = await mapConcurrent(dirs, async (dir) => {
+    const dirPath = join(root, dir.name);
+    const entries = await readdir(dirPath, { withFileTypes: true }).catch(() => []);
+    return entries
+      .filter((entry) => entry.name.endsWith(".jsonl"))
+      .map((entry) => ({ path: join(dirPath, entry.name), dir: dir.name }));
+  });
+  const candidates = candidatesByDir.flat();
+  const files = await mapConcurrent(candidates, async (candidate) => {
+    const info = await stat(candidate.path).catch(() => null); // vanished/unreadable
+    return info?.isFile()
+      ? {
+          ...candidate,
+          mtimeMs: info.mtimeMs,
+          bytes: info.size,
+          birthtimeMs: info.birthtimeMs,
+        }
+      : null;
+  });
+  return files.filter((file): file is SessionFile => file !== null);
 }
 
 /** Read one transcript's header prefix and conversation activity; falls back to path-derived values. */
@@ -338,15 +370,15 @@ async function readSummary(
   file: SessionFile,
   historyTitles: Map<string, string>,
 ): Promise<SessionBase | null> {
-  const [head, activity] = await Promise.all([
-    Bun.file(file.path).slice(0, HEADER_BYTES).text().catch(() => null),
+  const [parsed, activity] = await Promise.all([
+    readParsedHeader(file),
     // A failed activity read is a transient per-listing fallback to creation
     // time; readActivity does not memoize it, so the next poll retries.
     readActivity(file).catch(() => null),
   ]);
-  if (head === null) return null; // Unreadable transcript: skip it, don't fail the listing.
-  const parsed = parseHead(head);
+  if (parsed === null) return null; // Unreadable transcript: skip it, don't fail the listing.
   const id = parsed.id ?? idFromFilename(file.path);
+
   const cwd = parsed.cwd ?? decodeDirName(file.dir);
   const firstPrompt = parsed.firstPrompt;
   const title = parsed.title ?? historyTitles.get(id) ?? firstPrompt ?? basename(cwd);
