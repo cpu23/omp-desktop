@@ -1,142 +1,115 @@
 # omp-desktop
 
-Desktop app for [omp](https://omp.sh) sessions: a daemon owns real `omp` TUI processes on PTYs and renders them in a
-Tauri window or browser surface (sidebar, splits, drag-to-pane). The agent is never re-implemented — panes are the actual TUI.
+Desktop client for [omp](https://omp.sh) coding sessions. A small Bun daemon owns real `omp` TUI processes on
+PTYs; a native window (Tauri 2 / WebKitGTK) or any browser tab renders them in up to four panes with a session
+sidebar. The agent is never re-implemented — every pane is the actual TUI, so the app keeps working across omp
+updates.
 
-Design and decisions: [`docs/desktop-architecture.md`](docs/desktop-architecture.md),
-[`docs/desktop-app-options.md`](docs/desktop-app-options.md), [`docs/desktop-reqs.txt`](docs/desktop-reqs.txt).
+- **Daemon + PTY pool** — several `omp` sessions at once, byte-transparent I/O, resize, a bounded replay tail
+  (512 KiB) for late attach.
+- **Session sidebar** — pinned, live and recent chats from omp's own store, search, and per-session accent /
+  **Working…** / **Done** indicators supplied by the injected `omp-mobile` extension.
+- **Panes** — 1×1 → 1×2 → 2×2, drag a session onto a pane, drag a pane header to swap two panes, draggable
+  dividers, and one terminal WebSocket per pane.
+- **Sessions survive** window close and daemon restarts: the daemon keeps a durable live-session ledger and
+  resumes recorded transcripts (running tasks and unsaved input cannot be restored).
+- **Image paste** — `POST /api/paste` stores the image, the pane types its path, and omp attaches it; images
+  render inline through the forced iTerm2 protocol.
 
-## Status — P1
+Historical design material (proposals and dated measurements from development, not a specification):
+[`docs/desktop-architecture.md`](docs/desktop-architecture.md),
+[`docs/desktop-app-options.md`](docs/desktop-app-options.md),
+[`docs/desktop-reqs.txt`](docs/desktop-reqs.txt).
 
-Daemon + PTY pool, several `omp` sessions at once, byte-transparent I/O, resize, replay buffer for late attach,
-iTerm2 image protocol forced (`PI_FORCE_IMAGE_PROTOCOL=iterm2`) so images render in xterm.js (`addon-image`).
-Collapsible, resizable sidebar (pinned + live + recent sessions, search, owner labels), up to four panes in a 2×2 layout with draggable dividers,
-drag a session onto a pane, drag a pane
-header to swap two panes, layout + bindings persisted in the client and mirrored to a daemon-side state file, resume from the
-sidebar or from a dead pane's placeholder, and image paste (`POST /api/paste` -> daemon stores the file -> the pane
-types the path, which omp attaches).
+## Repository layout
 
-Right-click any pane for the layout-wide split action (`Ctrl+Shift+E` also works):
-the first action changes 1×1 to 1×2 side by side; the next splits both columns
-top/bottom at once, producing 2×2. At four panes the menu action is disabled.
-In a 2×2 grid, closing the first pane keeps all four quadrants and leaves an empty
-slot with **new session here**. That slot stays empty across reloads; selecting or
-dragging a sidebar session into it also fills it. Closing a second occupied pane
-removes both closed slots and returns to two side-by-side panes, enabling split
-again. Closing an already-empty retained slot does nothing. Closing a view does
-not stop its session in the sidebar. There is no header split button. Escape or
-clicking outside dismisses the menu. Older arbitrary layouts are converted to this
-structure on load, preserving up to four pane bindings.
-`Ctrl+Shift+X` closes a pane; the former
-`Ctrl+Shift+O` direction-specific shortcut is removed.
-To switch sessions, focus a pane and click a session in the sidebar, or drag a
-session onto the target pane. Pane headers have no session dropdown.
+omp-desktop is one half of a pair; the mobile client lives in a sibling checkout:
 
-Verified live (not from the spec): two live sessions swapped without losing pids, reload restoring a 2x2 layout with
-all four pids and repainted screens, orphaned live runtime adopted into an empty pane, paste reaching omp's
-attachment chip, panes filling their box (160x42 reported = 42 rows rendered, divider drag reflowing both terminals
-to the new geometry), split/close keyboard controls driven through real key events,
-and `bun run smoke` green.
-
-Closing and reopening Desktop reattaches surviving processes without changing their PIDs. The daemon
-records its complete live pool in `<state dir>/sessions.json`, independently of pane bindings and windows.
-After restart it resumes every recorded transcript before serving runtime requests, including sidebar
-sessions with no pane open. Concurrent resume requests for one transcript share one process. Explicit
-sidebar stops remove their record immediately; ordinary process exits settle after three seconds so a
-service-wide SIGTERM cannot erase the pool while the daemon itself is shutting down. An ordinary exit
-immediately followed by daemon shutdown within that window may resume once. Running tasks, unsaved prompt
-buffers, and empty sessions that never wrote a transcript cannot survive process loss.
-
-Each saved pane records its live intent and daemon generation. Legacy layouts without this intent flag
-resume transcript-backed panes once, including layouts where the old client already cleared the runtime ID;
-the old format cannot distinguish a deliberately stopped pane from a lost process. Stops made after this
-upgrade are preserved. The daemon deduplicates resumed transcripts across panes and clients.
-
-The daemon's `state.json` mirror restores the workspace even when browser storage was cleared. The mirror
-is written only after the client reads it (or proves it absent), so a failed read or a newer document version
-cannot be overwritten by fallback state.
-
-Sidebar session ages and recent-session order use the last user/assistant message timestamp, not file
-modification time or terminal output. Opening/resuming a chat, resizing its terminal, or appending session-exit
-metadata does not make it recent. Sessions with no messages use their recorded creation time, filename time,
-or filesystem birth time. Activity scans are cached by file modification time and size; all transcripts are
-considered before filtering and limiting results.
-
-Live sidebar rows use the CLI's exact per-session accent (gray for an unnamed session), Mobile's braille
-spinner and shimmering **Working…** label, and a green **Done** badge after a turn completes. The extension
-uses OMP 18's `theme.sessionAccentInputs` and the host's OKLCH color algorithm, not a SHA1 hue approximation.
-The algorithm is mirrored because compiled OMP cannot expose its internal color-module import to extensions;
-host upgrades must recheck parity. Missing theme inputs produce neutral gray, not an invented color.
-Working replaces Done on the next turn; Done survives window reload while that process remains alive.
-This is completion state, not an unread counter. Stopped or unavailable sessions show neither indicator.
-
-The sidebar footer's **Motion: System / On / Off** controls only working indicators. Native Desktop defaults
-to On for CLI parity; browsers default to System. System honors `prefers-reduced-motion`, which WebKitGTK
-derives from GTK's animation setting (disabled on the tested KDE host). On animates without changing system
-settings; Off freezes the badge. The choice persists in that webview's local storage. Hidden indicators stop animating.
-
-The daemon reads the injected Mobile extension's authenticated, owner-only `GET /status` socket endpoint
-on the existing runtime polling cadence (2.5 seconds). This small projection supplies accent, agent activity,
-and completion identity without serializing a transcript. Terminal repaints never imply agent activity.
-Unavailable or older extensions omit indicators rather than guess. Deploy the extension and daemon changes
-together; restart the daemon only after current tasks finish (see the warning below). No mobile gateway
-or native-shell rebuild is needed.
-
-Regression verification with four real OMP sessions: closing clients, killing a PTY child before the daemon
-(service-teardown ordering), and restarting without a client restored all four original transcript paths
-in new processes. Reopening restored all four pane bindings; explicitly stopping one left exactly three
-after another restart. In the actual Tauri/private-WebKit window, the native On default produced all eight
-spinner frames and 14 distinct shimmer frames across 24 captures. CLI true-color bytes and the sidebar
-both used `#8378ff` for “Resume previous training session”. Desktop/mobile typechecks, 74 desktop tests,
-22 accent tests, and daemon/PTY smoke passed. The running user daemon was not restarted.
-
-Each pane owns exactly one terminal WebSocket. Selecting its current session keeps that connection;
-switching sessions closes the old stream before attaching the new one. Late events from replaced
-sockets are ignored, and a new connection resets the terminal before replay. This prevents repeated
-sidebar selections or pane swaps from multiplying terminal output, mixing sessions, and increasing
-typing/render latency. Browser verification reproduced six open streams in one pane before the fix;
-afterward eight repeated selections kept one stream, and repeated cross-session switches left only
-two open streams for two panes (all twelve replaced connections closed).
-
-Isolated browser verification with real omp terminals: reload preserved both runtime PIDs; restarting the
-test daemon automatically resumed the same transcript with a new PID; an already-broken legacy pane with
-`runtimeId: null` resumed without a click; an explicit stop remained stopped after reopening. A September
-message still displayed **1mo** after resume/stop in October. TypeScript checking, 38 regression tests and
-the daemon/PTY smoke suite passed. Native backend and rendering verification is described below.
-
-Session-code changes require a daemon restart to load the new backend and client bundle. Do this only when
-current tasks have finished: `systemctl --user restart omp-desktopd` terminates its running processes.
-
-**First upgrade from a daemon without the live-pool ledger:** after tasks finish, checkpoint the running
-pool immediately before restarting, from this directory:
-
-```sh
-bun run scripts/checkpoint-sessions.ts && systemctl --user restart omp-desktopd
+```
+<parent>/
+├─ omp-desktop/      # this repository — daemon, browser client, native shell
+└─ omp-mobile/       # mobile gateway + PWA + the omp extension this daemon injects
 ```
 
-The checkpoint command does not stop processes; it refuses to write if a live session has no saved
-transcript. It discovers the workspace location through the daemon. For custom installations, pass the
-same `OMP_DESKTOP_PORT`, `OMP_DESKTOP_STATE_DIR` / `OMP_DESKTOP_LEDGER_FILE` overrides as the service.
-This bridges the old daemon's missing pool record; later restarts maintain it automatically. A checkpoint
-cannot identify sessions already lost before this upgrade—reopen those from the saved-session sidebar.
+The daemon injects `../omp-mobile/extension.ts` into every spawned `omp` by default. With the sibling missing the
+app still works — panes stream and the sidebar falls back to file-based discovery; only the structured
+accent/Working/Done state and the mobile client's structured actions are unavailable. Set `OMP_DESKTOP_EXTENSION`
+to another path, or to an empty string to disable it. `bun run release:check` requires both sibling checkouts;
+the desktop-only `bun run smoke` also works without the companion.
 
-Not yet: daemon-owned multi-client layout (the mobile gateway drives these same live runtimes — list, new/resume/stop,
-prompts and terminal — and the desktop's workspace now has a durable daemon-side mirror, but the pane grid is not yet
-a layout service other clients read), idle unload, desktop notifications.
+## Requirements
 
-## Run
+- Linux. The browser client runs anywhere Bun runs; the native shell is Linux-only.
+- **Bun ≥ 1.3.0** (`package.json` `engines`); install from <https://bun.sh>.
+- The **OMP CLI** on `PATH`, or `OMP_DESKTOP_OMP` pointing at it. This project targets OMP 18 (tested with
+  18.8.4). The daemon only relies on stable surfaces — terminal bytes, `--resume <path>`, environment variables —
+  so terminal streaming is not tied to a specific release; the injected extension consumes OMP 18's
+  `theme.sessionAccentInputs` token and silently drops accents / structured status when the host does not expose
+  it. Re-check the mirrored accent algorithm when upgrading OMP.
+- First-time OMP users: run `omp` in a terminal and complete its provider setup before using Mobile for prompts.
+  A fresh home with no credentials opens OMP's provider-login screen; Desktop displays that screen unchanged,
+  while Mobile's raw terminal is read-only. Provider credentials stay in OMP's own store and are not supplied
+  by either app.
+- For the native shell: Rust/Cargo and the WebKitGTK 4.1 build dependencies (below).
+
+## Quick start (browser)
 
 ```sh
 bun install
-bun run start        # http://127.0.0.1:4180
-bun run smoke        # end-to-end check (bash round-trip + real omp TUI + reap)
-bun run check        # typecheck
+bun run start     # serves http://127.0.0.1:4180
 ```
 
-### Native Linux app (Tauri 2, no Chromium)
+Open `http://127.0.0.1:4180` and click **+ New session**, or resume a recent chat from the sidebar. Panes run
+with your own `~/.omp/agent/config.yml`; the daemon never modifies your omp configuration. No service, systemd
+unit or pre-existing state is required.
 
-The shell uses **WebKitGTK** and the existing daemon; it does not bundle Chromium or another session backend.
-System WebKitGTK is the default; an optional app-private high-refresh runtime is described below.
+The daemon reads and writes only these locations (all overridable; see [Configuration](#configuration)):
+
+| Path | Purpose |
+| --- | --- |
+| `$XDG_STATE_HOME/omp-desktop/state.json` | workspace mirror (layout, pins, settings) |
+| `$XDG_STATE_HOME/omp-desktop/sessions.json` | durable live-session ledger used for restore |
+| `$TMPDIR/omp-desktop-pastes/` | pasted images |
+| `~/.omp/agent/sessions` | read-only: session index and resume validation |
+| `~/.local/state/omp-mobile/` | per-runtime extension sockets (created when the extension runs) |
+
+Development commands:
+
+```sh
+bun run check   # typecheck
+bun test        # unit/regression tests
+bun run smoke   # end-to-end daemon + PTY pool check (needs a real omp on PATH; runs in a disposable temp HOME)
+```
+
+The smoke command selects an unused local port (or checks `OMP_DESKTOP_SMOKE_PORT` if supplied) and does not
+inherit configuration-path overrides or provider credentials. It launches test processes only; it does not
+control your running daemon or user services.
+
+### Fresh-install release check
+
+With both sibling Git checkouts present, Bun, Git, and the OMP CLI installed, run:
+
+```sh
+bun run release:check
+```
+
+This snapshots the current public working-tree files (including uncommitted edits), installs both projects
+with frozen lockfiles in a temporary workspace, runs their typechecks/tests and Desktop's PTY smoke, builds
+Mobile, and verifies token creation/reuse plus authenticated Mobile → Desktop runtime start/state/stop.
+Tracked files covered by the ignore rules cause a refusal rather than being copied into the test workspace.
+The command uses a fresh HOME/XDG tree, private token/socket/state/paste paths, and unused loopback ports.
+It stops only the processes it starts and deletes its temporary workspace, including test credentials.
+
+Native release build/install/launch, provider authentication, and real-device push delivery are separate
+checks. The native build needs the Linux dependencies below; provider and push credentials are deliberately
+not inherited by `release:check`.
+
+## Native Linux app
+
+The native shell is a thin window over the same loopback daemon: it reuses the daemon and its sessions, does not
+bundle Chromium, and does not install a service. System WebKitGTK is the default engine; the optional app-private
+high-refresh runtime is described [below](#advanced-app-private-high-refresh-webkitgtk).
+
 Install Rust/Cargo and the native build dependencies first. On Ubuntu/Debian:
 
 ```sh
@@ -147,257 +120,192 @@ From `omp-desktop/`:
 
 ```sh
 bun install
-bun run app          # development native window
+bun run app          # development native window (tauri dev)
+bun run app:build    # release build only
 bun run app:install  # release build + per-user application-menu launcher
 ```
 
-After installation, open **OMP Desktop** from the application menu or run `~/.local/bin/omp-desktop`.
-`bun run app:build` builds only the native executable, without installing it. The installer copies it to
-`~/.local/bin/omp-desktop` and writes `omp-desktop.desktop` under `$XDG_DATA_HOME/applications`
-(default `~/.local/share/applications`). Re-run `app:install` to update the shell.
+`app:install` copies the binary to `~/.local/bin/omp-desktop`, writes `omp-desktop.desktop` under
+`$XDG_DATA_HOME/applications` (default `~/.local/share/applications`), and installs the π icon as
+`$XDG_DATA_HOME/icons/hicolor/scalable/apps/sh.omp.desktop.svg`. The desktop-entry filename matches GTK's Wayland
+app ID (`omp-desktop`), so KDE associates the window with the correct icon. After installation, open **OMP
+Desktop** from the application menu or run `~/.local/bin/omp-desktop`; re-run `app:install` to update the shell.
+This installs a client only — the WebKitGTK runtime libraries must remain installed.
 
-The native icon uses the same π artwork as `omp-mobile/public/icon.svg`: the SVG is kept in
-`src-tauri/icons/icon.svg`, with an RGBA PNG for Tauri's embedded icon. The installer adds the SVG as
-`$XDG_DATA_HOME/icons/hicolor/scalable/apps/sh.omp.desktop.svg`. The desktop-entry filename matches GTK's
-Wayland app ID (`omp-desktop`), so KDE can associate the window with the correct icon.
-When a session bus and `gdbus` are available, installation also emits KDE's icon-cache invalidation signal.
-This refreshes a running Plasma taskbar that cached a missing icon before installation; updating the desktop
-database alone is insufficient. Verified by observing the π taskbar icon without restarting Plasma or the app.
+To uninstall the shell, remove `~/.local/bin/omp-desktop`, the `omp-desktop.desktop` entry and the installed
+`sh.omp.desktop.svg` icon. Sessions, daemon state and the daemon itself are untouched.
 
-The app connects to `http://127.0.0.1:4180`. If the default daemon is unavailable, it attempts to start the existing
-`omp-desktopd.service` user unit—not restart it. It does not install that service. Without a user unit, start the
-daemon separately using `bun run start`. Set `OMP_DESKTOP_PORT` when launching the app to connect to a different
-local port; custom ports require an already-running daemon. Connection failures appear in the window with a retry
-action.
+### How the shell finds the daemon
+
+The app connects to `http://127.0.0.1:4180` (set `OMP_DESKTOP_PORT` when launching the app to use another
+port). If nothing answers and an `omp-desktopd` systemd user unit exists, the shell starts that unit; it never
+installs, restarts or stops it. No unit is required — running `bun run start` in a terminal is enough, and custom
+ports require an already-running daemon. Connection failures appear in the window with a retry action.
 
 Closing the window leaves the daemon and its sessions running. Launching the app again reuses the existing
-window and requests focus (subject to the compositor's focus policy). Browser and native-window storage are separate:
-saved pane layouts, pinned chats, sidebar width and font size are not imported from your browser, but the daemon's
-live/recent sessions are shared, and every client mirrors its workspace to the daemon's durable state file — a
-native window whose webview storage was lost rebuilds its panes, pins and settings from that file on boot. Native
-settings persist across app launches. External HTTP(S) links open in your default browser; the daemon page receives
-no native IPC permissions.
+window and requests focus (subject to the compositor's focus policy). Browser and native-window storage are
+separate: pane layouts, pins, sidebar width and font size are not imported between them, but both clients share
+the daemon's live/recent sessions and mirror their workspace to the daemon's durable state file, so a native
+window whose webview storage was lost rebuilds its panes, pins and settings from that file on boot.
 
-This is a local client installation, not a self-contained daemon/Bun/omp distribution. WebKitGTK runtime libraries
-must remain installed. To uninstall the shell, remove `~/.local/bin/omp-desktop`, its application-menu entry and
-the installed `sh.omp.desktop.svg` icon; this does not remove sessions or stop the daemon.
+Click plain-text HTTP(S) URLs or labelled terminal hyperlinks to open them in your default browser; both pass
+their destination directly to the native navigation policy, without xterm's confirmation/blank-popup flow. File
+links remain disabled, and the daemon page receives no native IPC permissions. In the browser client the same
+links open in a separate tab with no opener access. Clipboard image paste and pane dragging depend on the
+compositor and are not verified on every desktop.
 
-Verified on KDE/Wayland: release build and installation, actual WebKit terminal rendering, split/close controls,
-layout restoration after reopening, one native process after repeated launches, the custom-port error screen and
-Retry action, and the π title-bar icon. The live session kept the same PID across window close/reopen.
-TypeScript checking, native daemon handshake, navigation URL boundaries and desktop-entry validation also passed.
-Native clipboard-image paste and pane dragging were attempted under Xvfb, but neither probe completed
-with either the system or private engine. Those interactions remain unverified on the actual desktop;
-compositor-driven focus activation is not guaranteed.
+On Wayland sessions with the NVIDIA driver loaded and a local XWayland socket available, the shell prefers
+`GDK_BACKEND=x11,wayland` before GTK initializes (X11 first, Wayland as fallback). Any explicit `GDK_BACKEND`
+value wins, so `GDK_BACKEND=wayland` opts out; WebGL, hardware acceleration and DMABUF settings are untouched.
+Close and reopen the app after changing backends.
 
-Backend selection on Wayland with NVIDIA: before GTK initializes, the shell prefers the X11 (XWayland) backend
-when the session is Wayland, the NVIDIA kernel driver is loaded (`/proc/driver/nvidia/version` exists) and
-`DISPLAY` names a local socket in `/tmp/.X11-unix`; it sets `GDK_BACKEND=x11,wayland` (X11 first, Wayland as a
-fallback if XWayland cannot be opened). Any explicit `GDK_BACKEND` is preserved, so `GDK_BACKEND=wayland` opts
-out; WebGL, hardware acceleration and DMABUF settings are untouched. Measured with an actual four-WebGL-pane
-terminal window (2100x1100, real xterm streaming) on the KDE Wayland / RTX 5070 Ti workstation at fractional
-scale 1.15: Wayland chose device pixel ratio 2 and rendered 18.5 fps (p95 frame 61 ms, max 66 ms), while
-XWayland rendered at DPR 1.15 and 61.3 fps (p95 19 ms, max 27 ms). A single-pane window (1600x950) with row
-updates and simulated drag events measured 39.4 vs 62.5 fps with UI-process CPU time 3.05 s vs 0.635 s over the same
-10.9 s wall, and a synthetic animated WebGL canvas measured ~27 vs ~70 fps. XWayland glyph edges can be
-marginally softer because 1.15 is not an integer pixel ratio. These are representative measurements, not a
-frame-rate guarantee for other workloads.
-The installed shell was also launched against an isolated four-pane daemon without a `GDK_BACKEND`
-override: its visible X11 window and native terminal rendering were confirmed. Close and reopen the app
-after installing the shell to use the new backend; this does not require restarting the daemon or its sessions.
+## Mobile companion (omp-mobile)
 
-### App-private high-refresh WebKitGTK
+The two projects connect in one direction — the phone is another client of this daemon, not a second session
+pool:
 
-This local Linux x86_64 build pins Ubuntu WebKitGTK **2.52.6** and GTK **3.24.52**, applies their
-distribution patch sets, then makes these app-local changes:
+- The daemon spawns each runtime with `omp -e ../omp-mobile/extension.ts` and `OMP_MOBILE_SLOT=<runtime id>`. The
+  extension serves a per-runtime Unix socket (`<state dir>/<runtime-id>.sock`) for that exact process.
+- The mobile gateway (in `omp-mobile`) is an HTTP client of this daemon (`OMP_MOBILE_DESKTOP_URL`, default
+  `http://127.0.0.1:4180`): it lists the same runtimes, starts/resumes/stops them, and serves the installable PWA
+  to the phone.
+- The desktop reads the extension's `/status` endpoint on its 2.5 s runtime poll for sidebar accents and
+  working/done indicators; terminal repaints never imply agent activity. Without the extension the indicators are
+  omitted rather than guessed.
+- Deploy both checkouts together, and restart the daemon only when no session is running.
 
-- WebKit's timer-backed display monitor uses the GDK monitor refresh rate instead of a hardcoded 60 Hz,
-  with nanosecond rather than truncated-millisecond sleeps. Unknown refresh retains the 60 Hz fallback.
-  The GTK build also defaults `PreferPageRenderingUpdatesNear60FPS` to false.
-- GTK's X11 paint clock uses the monitor rate when compositor presentation feedback is absent. Actual
-  presentation feedback stays authoritative; Wayland's GTK clock is unchanged.
-- NVIDIA keeps DMA-buffer imports disabled, but uses WebKit's shared-memory compositor transport
-  instead of disabling accelerated compositing altogether. Rendering remains GPU-accelerated; the final
-  surface crosses to GTK through shared memory. No force-DMABuf or driver environment overrides are needed.
+**Token.** The extension sockets are owner-only (`0600` inside a `0700` directory) and additionally require a
+shared token when one is configured: `OMP_MOBILE_IPC_TOKEN` / `OMP_MOBILE_TOKEN`, or the file named by
+`OMP_MOBILE_TOKEN_FILE`. The default `$HOME/.config/zellij/ompbox-mobile.token` is a legacy path kept for
+existing installations. New setups can point the daemon and the mobile gateway at a portable location (for
+example under `$XDG_STATE_HOME`) by setting the same `OMP_MOBILE_TOKEN_FILE` for both; if they disagree, the
+gateway's calls are rejected. Spawned extensions read the token file themselves, so a runtime started before the
+daemon saw a token still authenticates gateway calls.
 
-On the 119.953 Hz workstation, the patched GTK clock painted at **119.99 Hz** with an **8336 μs**
-interval. On an isolated Xvfb display reporting unknown refresh, it retained **60.00 Hz / 16667 μs**.
-An empty WebKit page on that unknown-refresh display ran at **59.78 Hz**.
+## Security boundaries
 
-A controlled four-terminal WebGL workload at 1571×766 / DPR 1.15 measured **119.15 animation frames/s**,
-**115.11–115.54 redraws/s per terminal**, and **118.60 GTK paint callbacks/s**; p50/p95 frame intervals
-were **8/9 ms**. System WebKitGTK with the near-60 preference explicitly disabled measured **35.42 frames/s**
-and **34.94 redraws/s per terminal** on the same workload. These are application counters, not physical
-scanout measurements or guarantees for every workload. `webkit://gpu` confirmed the RTX 5070 Ti,
-threaded GPU rendering, shared-memory-only transport and a 120 Hz display timer.
+- The daemon binds loopback only (`OMP_DESKTOP_HOST`, default `127.0.0.1`) and **has no authentication on its
+  HTTP/WebSocket API**. Any local process can list, spawn, stop and read sessions. Keep it on loopback: do not
+  point `OMP_DESKTOP_HOST` at a LAN or public interface, and avoid running it on a multi-user host where local
+  users are untrusted.
+- Resume is fenced: only real `.jsonl` files under `OMP_DESKTOP_SESSIONS_DIR` are accepted, so a request cannot
+  make the daemon run an arbitrary path.
+- The paste endpoint accepts only `image/png`, `image/jpeg`, `image/webp` and `image/gif` up to 32 MiB and writes
+  only inside `OMP_DESKTOP_PASTE_DIR`.
+- Native shell: the window may navigate only between the bundled connection page and the daemon origin;
+  everything else opens in the system browser. The daemon origin is remote content and gets no native IPC
+  permissions — only the local connection page can call the `connect` command, and it re-checks the caller.
+- Extension sockets are owner-only and, when a token is configured, every request must present it
+  (`x-omp-mobile-token` header or `Authorization: Bearer`). An ownership record prevents serving a socket that
+  was replaced by another process.
+- The daemon serves its client bundle and stylesheet with `cache-control: no-store` and publishes a build hash at
+  `/api/build`.
 
-The private runtime was installed and exercised in an isolated Tauri window. Process mappings confirmed
-all four private rendering libraries; terminal input, resizing and reattachment to the same live PID
-worked. Scratch installation and rollback both selected the expected library set. The user installation
-was then updated atomically without replacing any of its three live terminal processes. Close/reopen
-loads the engine; the separate session-code changes require a daemon restart when work is idle.
+## Configuration
 
-`scripts/build-webkit.ts` verifies pinned source-archive checksums, applies the distribution and local
-patches, builds into the user cache, and installs only into the selected private prefix. The system
-libraries, loader configuration, GTK themes and input-method modules are not replaced. WebKit's process
-sandbox stays enabled. The installer gives the copied app executable a private ELF RUNPATH, checks all
-four rendering libraries, and atomically replaces the installed executable; it does not export
-`LD_LIBRARY_PATH` into browsers or other programs launched by the app.
+Every variable is optional; defaults match a normal single-user machine.
 
-The current workstation's build tools and development packages were extracted without root into
-`~/.cache/omp-desktop/webkit-2.52.6/sysroot`. Keep that cache for reproducible local rebuilds. A fresh
-machine needs the matching distribution's WebKitGTK/GTK development dependencies plus Clang/LLD,
-CMake, Ninja, Meson, Ruby, Bison, Flex, gperf, unifdef, gettext, sassc and patchelf; the script does
-not install system packages. Without `OMP_DESKTOP_WEBKIT_SYSROOT`, it uses build tools and dependencies
-already installed on the host.
+| Variable | Default | Meaning |
+|---|---|---|
+| `OMP_DESKTOP_HOST` | `127.0.0.1` | listen address. Loopback only: the API is unauthenticated |
+| `OMP_DESKTOP_PORT` | `4180` | listen port |
+| `OMP_DESKTOP_MAX_RUNTIMES` | `8` | cap on live `omp` processes in the pool |
+| `OMP_DESKTOP_CWD` | `$HOME` | fallback working directory for new sessions; a resume uses the transcript's recorded cwd, with this value only the fallback when that directory is gone |
+| `OMP_DESKTOP_OMP` | `omp` | omp binary (overridable for tests) |
+| `OMP_DESKTOP_OMP_ARGS` | empty | extra arguments for the omp binary |
+| `OMP_DESKTOP_OVERLAY` | empty (no overlay) | optional `--config` overlay for experiments; omp otherwise runs with the user's own config |
+| `OMP_DESKTOP_SESSIONS_DIR` | `$HOME/.omp/agent/sessions` | session store used by the sidebar index and resume validation |
+| `OMP_DESKTOP_PASTE_DIR` | `$TMPDIR/omp-desktop-pastes` | destination for pasted images |
+| `OMP_DESKTOP_STATE_DIR` | `$XDG_STATE_HOME/omp-desktop` (or `~/.local/state/omp-desktop`) | directory for the durable `state.json` workspace mirror; point it elsewhere to keep tests or secondary daemons off your state |
+| `OMP_DESKTOP_STATE_FILE` | `<state dir>/state.json` | explicit state-file path; overrides the directory |
+| `OMP_DESKTOP_LEDGER_FILE` | `<state dir>/sessions.json` | durable live-session pool, separate from the workspace document; explicit stops remove entries |
+| `OMP_DESKTOP_EXTENSION` | `../omp-mobile/extension.ts` | omp extension injected into every spawn (`-e`, can repeat); empty or missing disables the mobile structured state |
+| `OMP_MOBILE_IPC_DIR` | `$HOME/.local/state/omp-mobile` | directory for the per-runtime extension sockets (`<runtime-id>.sock`); the mobile gateway reads the same default |
+| `OMP_MOBILE_IPC_TOKEN` / `OMP_MOBILE_TOKEN` | unset | shared token for the extension sockets; when unset, `OMP_MOBILE_TOKEN_FILE` is read |
+| `OMP_MOBILE_TOKEN_FILE` | `$HOME/.config/zellij/ompbox-mobile.token` | token file (legacy default path kept for existing installations; point both the daemon and the mobile gateway at a portable path for new setups) |
+| `GDK_BACKEND` | auto: `x11,wayland` on Wayland with NVIDIA and XWayland, otherwise unset | native shell GTK backend list; any non-empty value disables the preference (e.g. `wayland`) |
+| `PI_FORCE_IMAGE_PROTOCOL` | `iterm2` | image protocol passed to omp so images render in xterm.js |
 
-From `omp-desktop/`, using the existing private dependency cache:
+Every spawned runtime also gets `TERM=xterm-256color`, `COLORTERM=truecolor`, `TERM_PROGRAM=tern` (so omp emits
+the OSC 1337 session-file marker the sidebar sniffs), `OMP_DESKTOP_RUNTIME=<id>` and `OMP_MOBILE_SLOT=<id>`.
+
+## Behavior notes
+
+**Panes.** Right-click any pane for the layout-wide split action (`Ctrl+Shift+E`); the first use turns 1×1 into
+1×2, the next splits both columns into 2×2, and at four panes the action is disabled. `Ctrl+Shift+X` closes a
+pane — closing a view never stops its session. In a 2×2 grid, closing one pane keeps the quadrant as an empty
+slot with **new session here** (select or drag a sidebar session into it); closing a second occupied pane
+collapses back to two side-by-side panes. Switch sessions by focusing a pane and clicking a sidebar session, or
+drag a session onto a pane; drag a pane header onto another pane to swap them. Escape or a click outside dismisses
+the menu.
+
+**Sessions and the sidebar.** Closing and reopening the app reattaches surviving processes without changing their
+PIDs. The daemon restores every ledger-recorded transcript before serving runtime requests, including sessions
+with no pane open; concurrent resume requests for one transcript share one process, and explicit stops are
+removed immediately. Pins persist by transcript path, survive stop/resume, and keep older chats reachable beyond
+the recent-session limit. Session ages and ordering use the last user/assistant message timestamp, not file
+modification time or terminal output. Sidebar live rows show the CLI's per-session accent and working/done
+indicators, with a **Motion: System / On / Off** control that only affects animations (native defaults to On,
+browsers to System, which honors `prefers-reduced-motion`).
+
+**Rendering.** Terminal and chrome text use bundled fonts under `public/fonts/` (Hack regular/bold, with
+JetBrainsMono Nerd Font Mono restricted to private-use icon planes and bundled DejaVu Sans Mono as the fallback),
+so rendering does not depend on host fonts. Panes use xterm.js 6 with the WebGL addon; if WebGL is unavailable or
+its context is lost, a visible **DOM** warning marks the fallback. `Ctrl/Cmd +`/`-`/`0` adjust the shared font
+size. The app chrome reuses omp-mobile's palette and tokens verbatim; update both stylesheets together.
+
+**Client bundle.** The daemon bundles the client and stylesheet at startup, serves them with
+`cache-control: no-store`, and publishes their content hash at `/api/build`; open tabs reload themselves when the
+hash changes. Applying client or style changes therefore requires a daemon restart, which ends live PTY children
+— transcript-backed sessions resume on the next start.
+
+**Not yet.** Daemon-owned multi-client pane layout (the mobile gateway drives the same live runtimes and the
+desktop mirrors its workspace to the daemon, but the pane grid is not yet a layout service other clients read),
+idle session unload, desktop notifications, and mirroring the pane grid on the phone.
+
+## Advanced: app-private high-refresh WebKitGTK
+
+System WebKitGTK is the default. For higher refresh rates with streaming terminals, `scripts/build-webkit.ts`
+pins Ubuntu WebKitGTK **2.52.6** and GTK **3.24.52**, applies their distribution patch sets plus two local
+patches (timer-backed display monitor uses the monitor refresh rate; GTK's X11 paint clock uses the monitor rate
+when compositor feedback is absent; NVIDIA keeps DMA-buffer imports disabled but keeps the shared-memory
+compositor transport), and builds only into a user cache/prefix. The system libraries, loader configuration, GTK
+themes and input-method modules are not replaced, WebKit's process sandbox stays enabled, and the copied app
+executable gets a private ELF RUNPATH instead of exporting `LD_LIBRARY_PATH`.
+
+A fresh machine needs the distribution's WebKitGTK/GTK development dependencies plus Clang/LLD, CMake, Ninja,
+Meson, Ruby, Bison, Flex, gperf, unifdef, gettext, sassc and patchelf; the script does not install system
+packages. Without `OMP_DESKTOP_WEBKIT_SYSROOT` it uses the build tools and dependencies already installed on the
+host. From `omp-desktop/`:
 
 ```sh
-export OMP_DESKTOP_WEBKIT_SYSROOT="$HOME/.cache/omp-desktop/webkit-2.52.6/sysroot"
 export OMP_DESKTOP_WEBKIT_PREFIX="$HOME/.local/share/omp-desktop/webkitgtk-2.52.6-refresh1"
 bun run app:webkit:build
-PATH="$OMP_DESKTOP_WEBKIT_SYSROOT/usr/bin:$PATH" bun run app:install
+bun run app:install
+# With an extracted sysroot, put its tools first for the install step:
+#   PATH="$OMP_DESKTOP_WEBKIT_SYSROOT/usr/bin:$PATH" bun run app:install
 ```
 
-`OMP_DESKTOP_WEBKIT_JOBS` defaults to 4 compilation jobs; linking is limited to one job.
-`OMP_DESKTOP_WEBKIT_CACHE` changes the build-cache root. Completed prefixes contain `runtime.json`;
-the installer refuses incomplete runtimes. Changing patches requires a **new prefix** rather than
-overwriting shared libraries that a running app could still be using.
-
-Close and reopen the native app after installation. Engine activation does not require a daemon restart.
-To return to system WebKitGTK, reinstall without the prefix override and reopen:
+`OMP_DESKTOP_WEBKIT_JOBS` defaults to 4 compilation jobs (linking is limited to one). `OMP_DESKTOP_WEBKIT_CACHE`
+changes the build-cache root. Completed prefixes contain `runtime.json`; the installer refuses incomplete
+runtimes, and changing patches requires a **new prefix** rather than overwriting libraries a running app may
+still be using. Close and reopen the app after installation — no daemon restart is needed. To return to system
+WebKitGTK:
 
 ```sh
 env -u OMP_DESKTOP_WEBKIT_PREFIX bun run app:install
 ```
 
-Private engines do **not** receive system package security updates. Re-pin source versions/checksums,
-rebase the two patch files, build a new prefix and reinstall when WebKitGTK/GTK updates are needed.
-Do not remove an old runtime prefix while an app or its helper processes still use it.
+Private engines do **not** receive system package security updates: re-pin source versions/checksums, rebase the
+two patch files, build a new prefix and reinstall when WebKitGTK/GTK updates are needed. Do not remove an old
+runtime prefix while an app or its helper processes still use it.
 
-Environment:
+## License
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `OMP_DESKTOP_HOST` | `127.0.0.1` | listen address (loopback only by design in P0) |
-| `OMP_DESKTOP_PORT` | `4180` | listen port |
-| `OMP_DESKTOP_CWD` | `$HOME` | working directory for new sessions; a resume runs in the transcript's recorded cwd, with this value only the fallback when that directory is gone |
-| `OMP_DESKTOP_OMP` | `omp` | omp binary (overridable for tests) |
-| `OMP_DESKTOP_OMP_ARGS` | empty | extra args for the omp binary |
-| `OMP_DESKTOP_OVERLAY` | empty (no overlay) | optional `--config` overlay for experiments; omp otherwise runs with the user's own config |
-| `OMP_DESKTOP_SESSIONS_DIR` | `$HOME/.omp/agent/sessions` | session store used by the sidebar index and by `POST /api/runtimes` resume validation |
-| `OMP_DESKTOP_STATE_DIR` | `$XDG_STATE_HOME/omp-desktop` (or `~/.local/state/omp-desktop`) | directory for the durable `state.json` workspace mirror; point it elsewhere to keep tests and secondary daemons off the user's state |
-| `OMP_DESKTOP_STATE_FILE` | `<state dir>/state.json` | explicit state-file path; overrides the directory |
-| `OMP_DESKTOP_LEDGER_FILE` | `<state dir>/sessions.json` | durable live-session pool, separate from the client workspace; explicit stops remove entries |
-| `OMP_DESKTOP_EXTENSION` | `../omp-mobile/extension.ts` | omp extension injected into every spawn (`-e`, can repeat); empty or missing disables the mobile structured state |
-| `GDK_BACKEND` | auto: `x11,wayland` on Wayland with NVIDIA and XWayland, otherwise unset | explicit GTK backend list; any non-empty value disables the preference (e.g. `wayland`) |
-| `OMP_MOBILE_IPC_DIR` | `$HOME/.local/state/omp-mobile` | directory for the per-runtime extension sockets (`<rt-id>.sock`); the mobile gateway reads the same default |
-| `OMP_MOBILE_IPC_TOKEN` / `OMP_MOBILE_TOKEN_FILE` | `$HOME/.config/zellij/ompbox-mobile.token` | shared token for those sockets; spawned extensions also read the file directly, so a runtime started before the daemon saw a token still authenticates gateway calls |
+MIT — see [`LICENSE`](LICENSE).
 
-Every spawned runtime gets `OMP_MOBILE_SLOT=<rt-id>` (its socket identity), so the phone reaches exactly the process
-shown in the sidebar — same runtime ids, same session files, no second session pool.
+Bundled fonts under `public/fonts/` keep their own licenses:
 
-## Terminal look
-
-Terminal panes and app chrome use bundled **Hack**, with real regular and bold faces
-(`public/fonts/`, MIT/Bitstream Vera). The terminal starts at 10pt (`13.33px`)
-with fixed xterm.js `lineHeight: 1`; it does not depend on a host-installed text font.
-Both panes keep identical text geometry when resized; only whole-row/column counts change.
-The WebGL renderer uses xterm's custom box/block glyphs to join frame strokes and logo blocks
-to cell edges, rather than relying on font glyphs. A **DOM** warning in the pane header means
-GPU rendering is unavailable or its context was lost; that fallback can still show seams.
-The fit measures the actual scrollbar reserve and accepts unused space smaller than a cell
-instead of stretching the font or line spacing. Constants live at the top of `src/client.ts`;
-`Ctrl/Cmd +`/`-`/`0` adjust the font size across panes (persisted in `localStorage` and the daemon's workspace state).
-
-The app consumes OSC 8 `file://` link markers to avoid xterm's permanent dashed
-path underline (its default handler cannot open file links). HTTP links and
-explicit SGR underlining remain intact. Sidebar live sessions have a thin OMP-blue
-left edge instead of indicator dots. Session PID labels and sidebar costs are hidden;
-the omp TUI's own cost display is unchanged. Sidebar and terminal scrollbars share
-a 6px track (40% thinner than the original 10px) and rounded grey thumb with the same hover colour.
-
-While dragging, terminal selections use neutral grey (`#444444`) and retain the
-original text colours. Highlighting stops at each line's last non-whitespace cell:
-trailing padding and blank lines are not painted, while spaces within text remain
-part of the highlight. Wide and combining characters keep their terminal-cell widths.
-Releasing a left-button selection copies its text to the system clipboard and
-clears the highlight after a successful copy. Empty/whitespace-only selections
-clear without replacing the clipboard. If clipboard access is blocked, the
-selection stays available for manual copy and the sidebar reports the failure.
-Clipboard access requires browser permission and a secure context (localhost works).
-
-`src/selection.ts` adapts xterm 6's private WebGL/DOM selection paint hooks because
-the public API cannot express per-line highlight extents. Recheck both renderers
-when upgrading xterm/addon-webgl, including normal/alternate buffers and wide text.
-
-The daemon passes **no** config overlay: panes run with the user's own `~/.omp/agent/config.yml`, so glyphs, theme,
-model roles and cost reporting are exactly what the same session shows in Konsole. (An earlier build forced
-`symbolPreset: nerd` through a vendored overlay; that silently rewrote the status line with PUA icons the user never
-chose, which read as random floating glyphs. `OMP_DESKTOP_OVERLAY` still exists for experiments, but is off by
-default.)
-
-The app vendors `JetBrainsMonoNerdFontMono-Regular.ttf` (`public/fonts/`, SIL OFL) and serves it from `/fonts/`,
-gated by `unicode-range` to the private-use planes: it is the **Mono** patch of a real base
-font, so its icons advance exactly one Hack cell (8.02px) and its ~8px ink sits inside that cell. Nerd Fonts'
-*Symbols-only* builds render icons at ~1em ink with a 1em advance, which overflowed and clipped in a 0.6em cell.
-`document.fonts` gates the first `fit()`, and a missing icon font is reported in the status chip instead of silently
-rendering non-mono fallbacks.
-
-The daemon serves its bundle with `cache-control: no-store` and publishes the content hash of the client bundle
-**and** stylesheet at `/api/build`; the client polls that hash and reloads itself when it changes.
-The global brand/build header is hidden; connection status sits at the bottom of the sidebar.
-Asset changes require a daemon restart, which stops live processes.
-
-## Chrome styling
-
-The app chrome is [omp-mobile](../omp-mobile)'s design language, so the two clients read as one product: the palette
-and font tokens in `public/styles.css` are copied **verbatim** from `omp-mobile/public/styles.css` (OLED black
-`#000` page with `#0a0b0d`/`#121316`/`#1c1e22` surfaces, `#00b4ff` accent, `#d4c090` cost, `#00ff88`/`#ffb347`/
-`#ff4757` status, `#e8ecf4` text on `#262a30` lines), and so are the treatments: raised-border buttons, black
-bordered inputs that focus to accent and `2px` accent focus rings. Both terminal and UI text use
-bundled Hack; DejaVu remains a bundled fallback. xterm's theme matches the palette
-(`#000` background, `#e8ecf4` foreground, `#00b4ff` cursor, neutral grey selection).
-
-The sidebar is one list: pinned chats first, then unpinned live and recent chats.
-Use each row's pushpin icon (outlined when unpinned, filled and accented when pinned);
-its tooltip and accessible label say **Pin chat** or **Unpin chat**. Pins persist by transcript path (browser cache plus
-the daemon's workspace state file), survive stop/resume, and keep older chats reachable beyond the recent-session limit.
-Rows label a chat with its transcript's recorded working directory, not the daemon's launch directory: resuming without
-an explicit cwd spawns omp in the cwd stored in the transcript's `session` header (the launch cwd is only the fallback
-when that directory no longer exists), and a live row prefers the transcript summary when the process was started elsewhere.
-A new live chat becomes pinnable when omp reports its session file. Search still filters pins.
-Running sessions have a thin `#00b4ff` left edge only, not a full accent outline.
-Pane ownership remains in the meta line ("pane 2"); a running chat is not duplicated as a saved row.
-
-Collapse with the sidebar's top-right button; the remaining narrow edge button reopens it.
-Drag the divider to resize (190–560px, constrained by window width), double-click to reset.
-The focused divider accepts Left/Right, Shift for larger steps, and Home/End.
-Width and collapsed state persist locally; pane terminals refit as the sidebar changes.
-
-Deviations, all density rather than looks: control heights are mouse-sized (22px
-pane-header buttons vs 40px icon buttons), row cards do not lift `translateY(-1px)` on hover (it shimmers in a 60-row
-list), and the pane area has no outer padding, square corners and no pane-body padding, so a terminal starts exactly
-at the pane border with no gap around it. Update the tokens in both files together — the mobile stylesheet is the
-source of truth.
-
-## Layout
-
-- `src/daemon.ts` — HTTP + websocket server; one `TEXT_ASSETS` dispatch for index/client/styles/xterm CSS, `/api/build`, `/api/state`, `/api/paste`, resume validation; owns the runtime pool and wires the optional mobile extension.
-- `src/manager.ts` — `RuntimeManager`: the pool of live omp processes (spawn, list, kill, capacity cap).
-- `src/runtime.ts` — one PTY-backed omp process: spawn, byte fan-out, bounded replay tail, byte-rate status, process-group kill.
-- `src/sessions.ts` — full-store sidebar index: message-derived recency, stable creation fallback, `history.db` titles, 8 KiB headers, cached activity and cost scans.
-- `src/sniff.ts` — OSC 1337 `omp_session_file` sniff: learns a freshly started session's file from the PTY stream.
-- `src/state.ts` — durable workspace store: atomic, fsynced `state.json` writes behind `GET`/`PUT /api/state`.
-- `src/protocol.ts` — wire types plus the boundary validators shared by daemon and client.
-- `src/guards.ts` — `isRecord`, the shape guard every validator starts from.
-- `src/client.ts` — xterm.js pane (binary output in, JSON input/resize out) plus the pane menu/split layout, pin list, and workspace mirroring.
-- `src/lifecycle.ts` — saved live intent, legacy binding migration, daemon-generation reconciliation and deduplicated pane resume decisions.
-- `src/sidebar.ts` — persisted sidebar collapse/resize controls.
-- `src/selection.ts` — text-bounded selection painting for WebGL and DOM renderers.
-- `scripts/smoke.ts` — end-to-end acceptance test; one `withDaemon` lifetime helper per scenario set.
-- `scripts/install-app.ts` — installs the built native release binary and per-user application-menu entry.
-- `src-tauri/` — native shell: `main.rs` entry, `daemon.rs` daemon identity probe and systemd start, `shell.rs` window policy, `bootstrap/` connection page.
-
-Cleanup note (behavior-preserving): dead helpers/exports removed (`headerButton`, `renderFocus`, `liveTitle`, `bindings`, `isString`/`isFiniteNumber`/`isBoolean`, `Runtime.exit`, the `Runtime` replay-limit constructor parameter); sidebar rows use one `sessionByPath` lookup map plus one `paneForRuntime` map instead of repeated `find`/`some` scans, and layout rendering walks the tree once per call; static responses share the `TEXT_ASSETS` dispatch and `no-store` headers; smoke starts one daemon per scenario set through `withDaemon`.
+- Hack (regular/bold) — MIT/Bitstream Vera; [`LICENSE-Hack.txt`](public/fonts/LICENSE-Hack.txt)
+- JetBrainsMono Nerd Font Mono — SIL OFL; [`LICENSE-JetBrainsMonoNerdFont.txt`](public/fonts/LICENSE-JetBrainsMonoNerdFont.txt)
+- DejaVu Sans Mono — Bitstream Vera license, DejaVu changes public domain, Arev-derived glyphs © Tavmjong Bah; [`LICENSE-DejaVu.txt`](public/fonts/LICENSE-DejaVu.txt)

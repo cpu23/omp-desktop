@@ -3,7 +3,7 @@
  *
  *   ESC ] 1337 ; SetUserVar = omp_session_file = <base64 of the absolute path> BEL|ST
  *
- * (iTerm2 user-var encoding; verified against omp on this machine). Sniffing it is
+ * (iTerm2 user-var encoding; verified against a real omp process). Sniffing it is
  * the only way to learn the file of a *freshly started* session without parsing
  * omp's internals, and it keeps working when the TUI itself switches sessions.
  *

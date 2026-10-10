@@ -3,14 +3,19 @@
 Date: 2026-10-02. **Historical design document — README is authoritative for current behavior.** This is the
 from-scratch proposal. Implements the decision in [desktop-app-options.md](./desktop-app-options.md):
 GUI outside omp, real `omp` CLI/TUI processes in panes, desktop daemon is the source of truth.
-Status: P1 is built and running (see README). Two pieces below were proposed and are not shipped:
-daemon-owned layout/bindings (`LayoutStore`) and daemon-side `state.json` runtime/layout persistence
-(layout lives in browser storage, so a phone cannot see the desktop's panes yet), and the seq/delta topic
-transport (transports are one WebSocket per pane plus plain HTTP commands). The per-runtime extension socket
-**is** wired: the daemon spawns each runtime with the optional `../omp-mobile/extension.ts` when present plus
-the shared `OMP_MOBILE_IPC_DIR`/token env (`src/daemon.ts`); session identity still comes from the PTY replay
-buffer and omp's OSC 1337 `omp_session_file` sniff (`src/sniff.ts`), which is what makes resume-after-restart
-work. Sources for every borrowed idea are linked in §12.
+
+Status of the proposals below: the daemon, PTY pool, byte-transparent streaming, pane grid, durable live-session
+ledger, workspace mirror and the per-runtime extension socket are shipped. **Not shipped:** the auth fence (see
+§3 — the daemon is loopback-only with no API authentication), the seq/delta topic transport (sections that
+mention it predate the shipped one-WebSocket-per-pane + plain HTTP transport), a daemon-owned pane layout
+service (`LayoutStore`; the client owns the grid and only mirrors its workspace document to
+`<state dir>/state.json`), notification fan-out, idle unload, and automatic idle restarts. Sections describing
+those items are design intent, and the dated measurements in §13 and §15–19 are historical records from one
+development workstation, not release verification or guarantees for other systems. The per-runtime extension socket **is**
+wired: the daemon spawns each runtime with the optional `../omp-mobile/extension.ts` when present plus the shared
+`OMP_MOBILE_IPC_DIR`/token env (`src/daemon.ts`); session identity still comes from the PTY replay buffer and
+omp's OSC 1337 `omp_session_file` sniff (`src/sniff.ts`), which is what makes resume-after-restart work. Sources
+for every borrowed idea are linked in §12.
 
 ## 1. Principle
 
@@ -33,6 +38,9 @@ work. Sources for every borrowed idea are linked in §12.
                                                             └───────────────────────────────────────────────────────────┘
 ```
 
+*The diagram shows the original proposal. The shipped transport is one WebSocket per pane plus plain HTTP commands;
+`LayoutStore` (daemon-owned layout service) and Notifications were not implemented — see the status note at the top.*
+
 ## 3. Components
 
 | Component | Choice | Why / evidence |
@@ -42,8 +50,8 @@ work. Sources for every borrowed idea are linked in §12.
 | Terminal renderer | **xterm.js** + addon-image, fit, web-links, unicode11, clipboard | ZCode ships `@xterm/xterm 6`; addon-image 0.9.0 stable renders **SIXEL + iTerm2**, kitty only in 0.10 betas and without unicode placeholders ([inventory](https://github.com/xtermjs/xterm.js/discussions/5683)) |
 | In-pane images | spawn omp with `PI_FORCE_IMAGE_PROTOCOL=iterm2` (or `sixel` + `PI_ALLOW_SIXEL_PASSTHROUGH=1`) | Both verified in the omp 18.4.9 binary; stable addon-image path. Kitty path revisited if 0.10 lands placeholders |
 | Shell | **Tauri 2** native window over the existing loopback webapp; browser access remains available | Linux uses WebKitGTK, not Chromium: system libraries by default, or the optional app-private high-refresh runtime. Window lifetime is independent of the Bun daemon. Build/install/rollback commands and native prerequisites are in README. |
-| Client transport | WS topics with monotonic seq + bounded delta log + snapshot resync; HTTP POST for commands | Stolen from OmpCode `sessionIndexTopics.ts` / `topicPublisher.ts`; beats omp-mobile's 2–8s polling |
-| Auth | loopback only + launch token → signed HttpOnly cookie, Host/Origin fence | OmpCode's relay has no auth (`127.0.0.1:8765`); dsh's model is stronger ([connection README](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/client/connection/README.md)) |
+| Client transport | **proposed, not implemented:** WS topics with monotonic seq + bounded delta log + snapshot resync; HTTP POST for commands. Shipped: one WebSocket per pane plus plain HTTP | Stolen from OmpCode `sessionIndexTopics.ts` / `topicPublisher.ts`; beats omp-mobile's 2–8s polling |
+| Auth | **proposed, not implemented** — loopback only + launch token → signed HttpOnly cookie, Host/Origin fence. Shipped: loopback-only binding with **no API authentication** (README “Security boundaries”) | OmpCode's relay has no auth (`127.0.0.1:8765`); dsh's model is stronger ([connection README](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/client/connection/README.md)) |
 | omp integration | TUI via PTY **plus** a desktop extension (fork of `extension.ts`) over a per-runtime unix socket | Extension gives structured state/actions (title, status, session file, cost, capabilities); PTY gives the real UI |
 
 ## 4. Data model
@@ -85,7 +93,10 @@ spawns a real omp fork and is labeled as such.
 - **Images**: paste in webview → write image to system clipboard (`navigator.clipboard.write`) → send `0x16` (omp's paste
   chord) → omp attaches it and draws via iTerm2/SIXEL → addon-image renders it in-pane. App-side blob previews
   (`~/.omp/agent/blobs/<sha256>`, from the extension's message snapshot) give click-to-zoom as a bonus.
+  *(Shipped flow differs: the client uploads the image to `POST /api/paste`, the daemon stores it and types the
+  path into the pane. The `0x16` chord and side-panel blob previews were not built.)*
 - **Notifications**: extension events → daemon → desktop notification + web-push to the existing PWA (reuse `notifications.ts`).
+  *(Not implemented in this daemon; desktop notifications remain open work, and Web Push lives in the mobile gateway.)*
 
 ## 6. PTY/daemon engineering rules (from the research)
 
@@ -118,13 +129,17 @@ read/write client (prompt, abort, model, view panes), matching the "shared live"
 | **P3 shell** | Tauri 2 window/tray/autostart | App-like launch, no browser chrome; perf test: 4 panes, 60 fps scroll, input latency < 30 ms measured |
 | **P4 polish** | app-side image previews, fork action, layout undo (dockkit-style ops), retire zellij wrappers | zellij unused for a week |
 
+*Shipped status (README is authoritative): P0/P1 done. P2 partial — durable ledger, workspace mirror and restore
+are shipped; the repository does not install a systemd unit, and notifications/idle unload are not. P3 shipped as
+a single Tauri 2 window (no tray/autostart). P4 not started.*
+
 ## 10. Risks
 
 - **addon-image kitty gap**: unicode placeholders unsupported → we force iTerm2/SIXEL. If omp's rendering with iTerm2 is
   degraded, fall back to app-side image rendering from blobs (needs extension data, not PTY sniffing).
 - **Bun PTY maturity**: bun-pty is a third-party FFI wrapper; P0 must stress it (resize storms, SIGWINCH, flow control).
   Rust `portable-pty` helper is the planned fallback.
-- **WebKitGTK (Tauri on Wayland)**: IME/GPU/key handling caveats remain. The app-private WebKitGTK/GTK runtime reached ~119 Hz with four streaming panes on the local NVIDIA workstation; it requires manual security updates. Native clipboard-image paste and pane dragging remain unverified on the actual desktop. System-library rollback is available.
+- **WebKitGTK (Tauri on Wayland)**: IME/GPU/key handling caveats remain. The app-private WebKitGTK/GTK runtime reached ~119 Hz with four streaming panes on an NVIDIA development workstation; it requires manual security updates. Native clipboard-image paste and pane dragging remain unverified on the actual desktop. System-library rollback is available.
 - **omp lease/fork semantics**: second writer forks a sibling — surfaced as an explicit fork, never silent.
 - **Input semantics**: xterm.js must enable mouse reporting and bracketed paste exactly like zellij does today; verify omp's
   `tui.mouse` interactions in P0.
@@ -138,13 +153,16 @@ read/write client (prompt, abort, model, view panes), matching the "shared live"
 - Attach/detach terminal controller, follow stream, one input owner: DeepSeek Harness `terminal-controller`.
 - Invertible layout ops + content identity `(kind, contentId)`: DeepSeek Harness `ui-dockkit`.
 - Session list/pin/archive/search UX: dsh `ui-sidebar`; ZCode `taskIndexRepo.ts`.
-- Loopback token→cookie trust fence: dsh `connection`.
+- Loopback token→cookie trust fence: dsh `connection` *(proposed; not implemented — see §3 Auth).*
 - Raw-byte-log replay + portable-pty daemon: WezTerm mux; VS Code ptyHost for revive/replay semantics; raw log rotation and
   attach semantics from tmux control mode (`-CC`).
 - omp-specific: `--mode rpc-ui` embedders (OmpCode), OSC 1337 `omp_session_file` (omp CHANGELOG 18.4.4, Tern),
   `PI_FORCE_IMAGE_PROTOCOL`/`PI_ALLOW_SIXEL_PASSTHROUGH` (env docs), blob store (blob-artifact docs).
 
 ## 12. User requirements v2 (`desktop-reqs`, 2026-10-02) — disposition
+
+*The "Mechanism" column records the planned mechanism at design time, not a shipped-state audit; see the status
+note at the top and the README for what is implemented.*
 
 | # | Requirement | Mechanism |
 |---|---|---|
@@ -201,12 +219,12 @@ read/write client (prompt, abort, model, view panes), matching the "shared live"
 3. Scrollback budget and whether the daemon writes logs on every runtime or only when detached.
 4. Whether to keep `--mode rpc` child processes for sidebar metadata or rely solely on the extension + file scan.
 
-## 15. Measured baseline (this machine, 2026-10-02)
+## 15. Measured baseline (development workstation, 2026-10-02) — historical
 
 - **Startup is cheap.** Fresh `omp` TUI first frame: **0.23 s** (pty, new session). `omp --mode rpc` ready frame: **0.22 s**.
 - **Memory is the constrained resource.** Fresh TUI: **368 MB RSS / 246 MB PSS / 236 MB private**, of which ~131 MB is
   shared code pages the OS dedupes across all omp processes. RPC-only: 335 MB RSS / 218 MB PSS / 208 MB private.
-- **Current hot-set cost**: the 5 live zellij sessions on this machine hold **~404–605 MB RSS each (~2.4 GB total)**.
+- **Current hot-set cost**: the five live zellij sessions on the development machine hold **~404–605 MB RSS each (~2.4 GB total)**.
 - **No TUI process reuse exists**: interactive omp is one session per process; `--rpc-project` is absent in omp 18.4.9
   (OmpCode's fork has it, headless `rpc-ui` only).
 - **Caching strategy**: hot/cold session pool — evict idle sessions (frees private memory), reattach costs ~0.2 s + resume
@@ -255,14 +273,15 @@ Four defects the browser acceptance pass had missed, all reproduced and fixed th
    Session recency is separate from cost and filesystem activity: the last user/assistant message timestamp
    determines sidebar age and ordering. Opening a transcript or appending exit metadata leaves that age unchanged.
 
-Operating note: `systemctl --user restart omp-desktopd` kills every pane process (they are in the service
-cgroup), so it is a hard reset, not a reload. The daemon persists the entire transcript-backed pool in
-`sessions.json` and restores it before runtime requests, even with no browser or bound pane. Pane intent
-and generation now govern reattachment and legacy workspace migration; transcript-level single-flight
-resume prevents duplicate writers across clients. Explicit stops save immediately. Unknown process exits
-settle for three seconds so child-first service teardown cannot erase still-wanted sessions; shutdown
-freezes the ledger. In-flight tasks and unsaved input are not restored. The first upgrade from the old
-daemon needs the live checkpoint command documented in README; already-lost identities cannot be inferred.
+Operating note: restarting the daemon (for example `systemctl --user restart omp-desktopd` when it runs as a
+user unit) kills every pane process — they are children in its cgroup — so it is a hard reset, not a reload.
+The daemon persists the entire transcript-backed pool in `sessions.json` and restores it before runtime
+requests, even with no browser or bound pane. Pane intent and generation now govern reattachment and legacy
+workspace migration; transcript-level single-flight resume prevents duplicate writers across clients. Explicit
+stops save immediately. Unknown process exits settle for three seconds so child-first service teardown cannot
+erase still-wanted sessions; shutdown freezes the ledger. In-flight tasks and unsaved input are not restored.
+The first upgrade from a daemon that predates the ledger needs the one-time live checkpoint command in
+`scripts/checkpoint-sessions.ts` (see its header); already-lost identities cannot be inferred.
 
 ## 18. Chrome styling follows omp-mobile (2026-10-02)
 

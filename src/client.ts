@@ -4,6 +4,7 @@ import { doneIndicator, syncWorkingAnimation, workingIndicator } from "./working
 import { Terminal } from "@xterm/xterm";
 import { ImageAddon } from "@xterm/addon-image";
 import { WebglAddon } from "@xterm/addon-webgl";
+import { WebLinksAddon } from "@xterm/addon-web-links";
 import { isRecord } from "./guards";
 import {
   attachable,
@@ -61,6 +62,14 @@ const RATIO_MIN = 0.15;
 const RATIO_MAX = 0.85;
 const FONT_STACK =
   '"Hack", "JetBrainsMono Nerd Font Mono", "DejaVu Sans Mono", ui-monospace, SFMono-Regular, monospace';
+
+function openTerminalLink(_event: MouseEvent, uri: string): void {
+  const url = new URL(uri);
+  if (url.protocol !== "http:" && url.protocol !== "https:") return;
+  // Give the native new-window policy the destination immediately; xterm's
+  // default blank popup is denied before it can assign the destination.
+  window.open(url.href, "_blank", "noopener,noreferrer");
+}
 
 function storedCellSize(): number {
   const raw = Number(localStorage.getItem(CELL_KEY));
@@ -372,6 +381,7 @@ class Pane {
 
     this.term = new Terminal({
       allowProposedApi: true,
+      linkHandler: { activate: openTerminalLink },
       cursorBlink: true,
       scrollback: 20_000,
       fontSize: cellSize,
@@ -417,6 +427,7 @@ class Pane {
       console.warn("omp-desktop: GPU renderer unavailable", error);
     }
     this.term.loadAddon(new ImageAddon());
+    this.term.loadAddon(new WebLinksAddon(openTerminalLink));
     this.term.onData((data) => {
       if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: "input", data }));
     });

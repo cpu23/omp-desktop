@@ -1,7 +1,9 @@
 # omp Desktop App — Requirements & Options
 
-Date: 2026-10-02. Status: decision input for moving off the zellij workflow.
-Scope: desktop app hosting omp sessions; Linux/Wayland first (this machine).
+Date: 2026-10-02. Status: **historical decision input, kept for reference only** — the project did not take
+options A/B; the shipped design is the from-scratch daemon described in
+[desktop-architecture.md](./desktop-architecture.md), and the README is authoritative for current behavior.
+Scope: desktop app hosting omp sessions; Linux/Wayland first.
 
 **Decision (2026-10-02): build from scratch.** No omp GUI inside the app: the app hosts real
 `omp` CLI/TUI processes in panes. The desktop daemon is the source of truth (owns PTYs,
@@ -24,7 +26,7 @@ Fork options A/B below are kept for reference only. Architecture: see
 
 ## 2. Environment and hard facts
 
-- omp `18.4.9` at `/home/mrw/.local/bin/omp`. Modes: interactive TUI, `-p/--print`, `--mode=text|json|rpc|rpc-ui`, `acp`. No HTTP serve/daemon subcommand.
+- omp `18.4.9` (version observed at the time) at `/home/user/.local/bin/omp`. Modes: interactive TUI, `-p/--print`, `--mode=text|json|rpc|rpc-ui`, `acp`. No HTTP serve/daemon subcommand.
 - Sessions: `~/.omp/agent/sessions/<encoded-cwd>/<timestamp>_<sessionId>.jsonl`; global blobs `~/.omp/agent/blobs/<sha256>` for images; `history.db` title index; resume by path or id prefix; `--session-dir` for scoping.
 - RPC mode (`omp --mode rpc`, docs: <https://github.com/can1357/oh-my-pi/blob/main/docs/rpc.md>) is newline-JSON over stdio and already exposes: `prompt`/`steer`/`follow_up` with `images`, `switch_session`, `new_session`, `get_messages_page`, `get_entries`, `get_state`, model/thinking, subagents (`get_subagents`, `steer_subagent`), extension UI requests (`select`/`input`/`editor`/`confirm`), host tools. `rpc-ui` keeps tool UI such as `ask` enabled. This is the documented path community GUIs use.
 - SDK (`@oh-my-pi/pi-coding-agent`) supports in-process embedding and multiple concurrent top-level sessions (private `AgentRegistry` per session).
@@ -85,7 +87,7 @@ A "session" must have exactly one runtime (one omp process/RPC channel) because 
 
 ## 6. Recommendation
 
-1. Day-0 spike: run the A and B Linux builds on this machine; verify Wayland, omp 18.4.9 compatibility, image paste, resume, and inspect how hard the tab→pane refactor is in each codebase.
+1. Day-0 spike: run the A and B Linux builds on a Linux/Wayland workstation; verify Wayland, omp 18.4.9 compatibility, image paste, resume, and inspect how hard the tab→pane refactor is in each codebase.
 2. Default route: **fork A (nornzach) if velocity matters** — it already ships renderers, session library, images, layout restore; replace its 2-pane split with a small N-pane tree (up to 4+), add session→pane drag + recent-session picker + layout JSON. Choose **B (apoc, Tauri)** if Electron is unacceptable; more pane work, cleaner stack.
 3. Take **C** only if owning the stack matters more than time; vendor collab-web renderers and reuse this repo's extension/gateway protocol knowledge (plus notifications) for the daemon.
 4. Join the Tern waitlist now; re-evaluate when Linux GA + CLI docs land. Try Superset as a stopgap if a usable app is needed this week.

@@ -1,3 +1,6 @@
+Historical document — raw requirements and dated status log, kept for reference. It is not a specification and
+its "done" entries are not current verification claims; the README is authoritative for shipped behavior.
+
 omp desktop requirements:
 1. preserve the cli/tui of omp, only have gui around it, also be version agnostic, so updates are unlikely to break everything
 2. window/session split 2 and 4 ways, side by side and top and bottom
@@ -45,7 +48,7 @@ status 2026-10-02 (later, from live use in the browser):
     the rendered grid: 56x42 at a 449px screen = 8.018px cells). Side-by-side is no longer fixed 50/50.
  5. done+ — sidebar rows show per-session cost when the session is priced (sum of every usage.cost.total,
     same accounting as omp's get_session_stats; parsed once per mtime change). Unpriced models — the
-    codex subscription and local EXL3 models this machine's default roles use — show nothing, which is
+    codex subscription and local EXL3 models the development setup used — show nothing, which is
     also why omp's own status line has no cost segment for them: 43 of the 60 newest transcripts carry
     cost, the ones in this repo's default workspace do not.
  +) the app passes no config overlay any more. Panes run with the user's own ~/.omp/agent/config.yml, so

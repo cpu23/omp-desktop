@@ -36,8 +36,8 @@ describe("runtime ledger", () => {
     const dir = await tempDir();
     const store = new RuntimeLedgerStore(join(dir, "sessions.json"));
     const sessions = [
-      { sessionFile: "/home/mrw/.omp/agent/sessions/-dev/2026-10-05T00-00-00-000Z_a.jsonl", cwd: "/home/mrw/dev", cols: 123, rows: 35 },
-      { sessionFile: "/home/mrw/.omp/agent/sessions/-dev/2026-10-05T00-00-00-000Z_b.jsonl", cwd: "/home/mrw/dev/ai-wordle" },
+      { sessionFile: "/home/user/.omp/agent/sessions/-dev/2026-10-05T00-00-00-000Z_a.jsonl", cwd: "/home/user/dev", cols: 123, rows: 35 },
+      { sessionFile: "/home/user/.omp/agent/sessions/-dev/2026-10-05T00-00-00-000Z_b.jsonl", cwd: "/home/user/dev/demo-project" },
     ];
     await store.save(sessions);
     expect(await store.read()).toEqual(sessions);

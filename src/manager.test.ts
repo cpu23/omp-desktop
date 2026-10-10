@@ -66,7 +66,7 @@ afterAll(() => {
 });
 
 describe("durable pool snapshots", () => {
-  const transcript = "/home/mrw/.omp/agent/sessions/-dev/2026-10-05T00-00-00-000Z_a.jsonl";
+  const transcript = "/home/user/.omp/agent/sessions/-dev/2026-10-05T00-00-00-000Z_a.jsonl";
 
   test("a resume claims its transcript before omp sniffs it and joins the pool", async () => {
     const pool = manager();

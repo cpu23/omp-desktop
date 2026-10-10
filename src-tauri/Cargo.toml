@@ -3,6 +3,7 @@ name = "omp-desktop"
 version = "0.1.0"
 description = "Native shell for the omp-desktop daemon (Tauri 2 / WebKitGTK)"
 edition = "2021"
+license = "MIT"
 publish = false
 
 [build-dependencies]

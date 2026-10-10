@@ -14,16 +14,32 @@
  * was live, and never the one the user stopped.
  *
  * Run: bun run smoke
+ *
+ * The whole run uses a disposable temp root (and a disposable HOME/XDG set for
+ * every daemon), so it never reads or writes the user's real omp session store,
+ * config, workspace state or pasted images. Phase D runs against a seeded
+ * session store instead of the user's real `~/.omp/agent/sessions`.
  */
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { isRecord } from "../src/guards";
 
 const ROOT = join(import.meta.dir, "..");
-const PORT = Number(process.env.OMP_DESKTOP_SMOKE_PORT ?? 4199);
+// Refuse an occupied explicit port; otherwise choose an unused ephemeral port.
+const portProbe = Bun.serve({
+  hostname: "127.0.0.1",
+  port: Number(process.env.OMP_DESKTOP_SMOKE_PORT ?? 0),
+  fetch: () => new Response(null),
+});
+const PORT = portProbe.port;
+portProbe.stop(true);
 const BASE = `http://127.0.0.1:${PORT}`;
 const WS_URL = `ws://127.0.0.1:${PORT}/ws/term`;
+
+/** Phase D fixtures: fixed ids so the expected session row is deterministic. */
+const INDEX_FIXTURE_A = "01a10000-0000-7000-8000-0000000000a1";
+const INDEX_FIXTURE_B = "01a10000-0000-7000-8000-0000000000b2";
 
 type RuntimeInfo = {
   id: string;
@@ -83,7 +99,16 @@ function sessionFrom(value: unknown): SessionInfo {
 
 async function startDaemon(env: Record<string, string>): Promise<Bun.Subprocess> {
   const proc = Bun.spawn(["bun", "run", join(ROOT, "src", "daemon.ts")], {
-    env: { ...process.env, OMP_DESKTOP_PORT: String(PORT), ...env },
+    // Do not inherit config paths, credentials, or service environment overrides.
+    env: {
+      PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
+      LANG: process.env.LANG ?? "C.UTF-8",
+      TERM: "xterm-256color",
+      COLORTERM: "truecolor",
+      OMP_DESKTOP_OMP: process.env.OMP_DESKTOP_OMP ?? "omp",
+      OMP_DESKTOP_PORT: String(PORT),
+      ...env,
+    },
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -279,19 +304,21 @@ function isAlive(pid: number): boolean {
 async function phaseD(): Promise<void> {
   console.log("\n-- Phase D: session index");
   const recent = await sessions(5);
-  assert(recent.length > 0, `recent sessions come back (${recent.length})`);
+  assert(recent.length === 2, `the seeded store lists exactly its two fixtures (${recent.length})`);
   assert(recent.every((session) => session.path.endsWith(".jsonl")), "sessions carry transcript paths");
   assert(recent.every((session) => session.id.length > 0 && session.title.length > 0), "sessions carry ids and titles");
   const newest = recent[0];
+  assert(newest.id === INDEX_FIXTURE_B, `the newest fixture sorts first (${newest.id})`);
+  assert(newest.title === "smoke index beta", `the fixture title round-trips (${newest.title})`);
   const found = await sessions(5, newest.id.slice(0, 8));
   assert(found.some((session) => session.id === newest.id), "search finds a session by id prefix");
   const byTitle = await sessions(5, newest.title.slice(0, 6));
   assert(byTitle.some((session) => session.id === newest.id), "search finds a session by title");
 }
 
-async function phaseB(): Promise<void> {
+async function phaseB(home: string): Promise<void> {
   console.log("\n-- Phase B: real omp TUI + session-file sniff");
-  const runtime = await createRuntime({ cwd: process.env.HOME ?? "/tmp" });
+  const runtime = await createRuntime({ cwd: home });
   assert(runtime.pid === null, "new runtime is not spawned until a pane attaches");
   const pane = await attach(runtime.id);
   await waitFor(() => pane.text().length > 2000, 25_000, "omp TUI output");
@@ -508,15 +535,53 @@ async function phaseH(fixture: CwdFixture): Promise<void> {
 const dir = mkdtempSync(join(tmpdir(), "omp-smoke-"));
 const pasteDir = join(dir, "pastes");
 const stateDir = join(dir, "state");
+// Disposable HOME/XDG for every daemon (and for the real omp they spawn): the
+// smoke must never touch the user's ~/.omp store, config, state or caches.
+const home = join(dir, "home");
+const sessionsDir = join(home, ".omp/agent/sessions");
+mkdirSync(home, { recursive: true });
+const isolatedHome = {
+  HOME: home,
+  XDG_CONFIG_HOME: join(home, ".config"),
+  XDG_STATE_HOME: join(home, ".local/state"),
+  XDG_DATA_HOME: join(home, ".local/share"),
+  XDG_CACHE_HOME: join(home, ".cache"),
+};
+// Phase D fixtures: two transcripts with stable ids, titles and creation days,
+// so the session index has exactly one deterministic answer.
+for (const [stamp, id, title] of [
+  ["2026-01-01T00-00-00-000Z", INDEX_FIXTURE_A, "smoke index alpha"],
+  ["2026-01-02T00-00-00-000Z", INDEX_FIXTURE_B, "smoke index beta"],
+] as const) {
+  const file = join(sessionsDir, "-home-smoke-index", `${stamp}_${id}.jsonl`);
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(
+    file,
+    [
+      JSON.stringify({
+        type: "session",
+        version: 3,
+        id,
+        timestamp: stamp.replace(/-(\d{2})-(\d{2})-(\d{3})Z$/, ":$1:$2.$3Z"),
+        cwd: join(home, "smoke-index"),
+      }),
+      JSON.stringify({ type: "title", v: 1, title, updatedAt: new Date().toISOString() }),
+    ].join("\n") + "\n",
+  );
+}
 console.log(`smoke: omp-desktopd + PTY pool (tmp ${dir})`);
 let failed = false;
 try {
   await withDaemon(
     {
+      ...isolatedHome,
       OMP_DESKTOP_OMP: "/bin/bash",
       OMP_DESKTOP_OMP_ARGS: "-i",
       OMP_DESKTOP_OVERLAY: "",
+      // A stand-in binary is not omp and must never receive the extension flag.
+      OMP_DESKTOP_EXTENSION: "",
       OMP_DESKTOP_CWD: dir,
+      OMP_DESKTOP_SESSIONS_DIR: sessionsDir,
       OMP_DESKTOP_PASTE_DIR: pasteDir,
       OMP_DESKTOP_STATE_DIR: stateDir,
     },
@@ -532,10 +597,15 @@ try {
   );
 
   await withDaemon(
-    { OMP_DESKTOP_CWD: dir, OMP_DESKTOP_STATE_DIR: stateDir },
+    {
+      ...isolatedHome,
+      OMP_DESKTOP_CWD: dir,
+      OMP_DESKTOP_SESSIONS_DIR: sessionsDir,
+      OMP_DESKTOP_STATE_DIR: stateDir,
+    },
     async () => {
       await phaseG(stateDir);
-      await phaseB();
+      await phaseB(home);
     },
   );
 
@@ -555,6 +625,7 @@ try {
     project: restoreProject,
   };
   const restoreEnv = {
+    ...isolatedHome,
     OMP_DESKTOP_OMP: standIn,
     OMP_DESKTOP_OMP_ARGS: "",
     OMP_DESKTOP_OVERLAY: "",
@@ -622,6 +693,7 @@ try {
   });
   await withDaemon(
     {
+      ...isolatedHome,
       OMP_DESKTOP_OMP: "/bin/sh",
       OMP_DESKTOP_OMP_ARGS: "-c pwd",
       OMP_DESKTOP_OVERLAY: "",

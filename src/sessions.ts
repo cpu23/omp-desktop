@@ -445,7 +445,7 @@ function filenameStartedAtMs(path: string): number | null {
 }
 
 /**
- * Best-effort reversal of omp's cwd encoding (`-home-mrw-dev`). Dashes that
+ * Best-effort reversal of omp's cwd encoding (`-home-user-dev`). Dashes that
  * were part of a path segment are indistinguishable from separators, so this
  * only serves as a fallback when the transcript has no `session` event.
  */
