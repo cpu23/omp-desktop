@@ -11,7 +11,7 @@ Use [OMP](https://omp.sh) in a browser or a native Linux window. Open up to four
   <a href="docs/images/desktop-search.png"><img src="docs/images/desktop-search.png" alt="Find a session by title while terminal sessions keep working" width="49%"></a>
 </p>
 
-*Two panes · Four-pane workspace · Session search. Select an image for full resolution (2400 × 1350). Demo sessions use a local test stream. No personal data is shown.*
+*Two panes · Four-pane workspace · Session search. Demo sessions use a local test stream.*
 
 ## Requirements
 
