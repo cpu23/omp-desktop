@@ -204,8 +204,8 @@ window
   .matchMedia?.("(prefers-reduced-motion: reduce)")
   .addEventListener("change", syncWorkingAnimation);
 
-/* The footer control is static markup, so one query at page load is enough
-   (client.js is a deferred module script) and the client never has to wire it. */
+/* The sidebar settings control is static markup, so one query at page load is
+   enough (client.js is a deferred module script). */
 const motionButtons = Array.from(
   document.querySelectorAll<HTMLButtonElement>(".motion-control [data-motion]"),
 );

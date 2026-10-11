@@ -252,9 +252,16 @@ PIDs. The daemon restores every ledger-recorded transcript before serving runtim
 with no pane open; concurrent resume requests for one transcript share one process, and explicit stops are
 removed immediately. Pins persist by transcript path, survive stop/resume, and keep older chats reachable beyond
 the recent-session limit. Session ages and ordering use the last user/assistant message timestamp, not file
-modification time or terminal output. Sidebar live rows show the CLI's per-session accent and working/done
-indicators, with a **Motion: System / On / Off** control that only affects animations (native defaults to On,
-browsers to System, which honors `prefers-reduced-motion`).
+modification time or terminal output. Loaded sessions (the daemon pool counted by the bottom **live** status)
+have grey backgrounds; alive processes also show the CLI's per-session accent and working/done indicators.
+The sidebar gear replaces the list with **Settings**, leaving terminal panes untouched; **Back** or Escape
+returns to the list. Settings contains **View: Sessions / Folders** and **Motion: System / On / Off**.
+Sessions is the default view. Folders groups chats by their recorded project/working directory (falling back
+to the runtime's launch directory when no transcript summary is available); folders initially start collapsed.
+Expand a folder to see session-title rows with the same selection, drag, pin, stop and status behavior as
+session cards, without repeating the folder label. Pins remain first within each folder. View mode and expanded
+folders persist in the browser cache and the daemon's durable workspace mirror. Motion only affects animations
+(native defaults to On; browsers to System, which honors `prefers-reduced-motion`).
 
 **Rendering.** Terminal and chrome text use bundled fonts under `public/fonts/` (Hack regular/bold, with
 JetBrainsMono Nerd Font Mono restricted to private-use icon planes and bundled DejaVu Sans Mono as the fallback),

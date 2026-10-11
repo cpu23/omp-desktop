@@ -4,8 +4,8 @@
  * The controls are static in index.html: #sidebar-collapse (in the search row),
  * #sidebar-resizer (role="separator" between the sidebar and the panes) and
  * #sidebar-expand (the strip shown only while collapsed). State is one record
- * under omp-desktop.sidebar.v1 — the user's width intent in CSS px plus the
- * collapsed flag — so both survive a reload. Width is applied as the --sidebar-w
+ * under omp-desktop.sidebar.v1 — width, collapse, view and expanded folders —
+ * so preferences survive a reload. Width is applied as the --sidebar-w
  * variable that #sidebar's flex-basis reads, so the panes refit through normal
  * flex layout.
  *
@@ -13,6 +13,8 @@
  * stored width cannot swallow a narrow window. Only user-driven changes
  * overwrite the stored intent; a shrinking window just clamps the display.
  */
+import { syncWorkingAnimation } from "./working-indicator";
+
 export const STORE_KEY = "omp-desktop.sidebar.v1";
 /** Default width and the fallback in #sidebar's flex-basis; keep the two in sync. */
 const DEFAULT_WIDTH = 278;
@@ -23,7 +25,25 @@ const PANE_RESERVE = 320;
 const KEY_STEP = 16;
 const KEY_STEP_LARGE = 64;
 
-type SidebarState = { width: number; collapsed: boolean };
+type SidebarState = { width: number; collapsed: boolean; view: "sessions" | "folders"; expandedFolders: string[] };
+
+let view: SidebarState["view"] = "sessions";
+let expandedFolders = new Set<string>();
+let savePreferences: (() => void) | null = null;
+
+export function sidebarFolderView(): boolean {
+  return view === "folders";
+}
+
+export function sidebarFolderExpanded(cwd: string): boolean {
+  return expandedFolders.has(cwd);
+}
+
+export function toggleSidebarFolder(cwd: string): void {
+  if (expandedFolders.has(cwd)) expandedFolders.delete(cwd);
+  else expandedFolders.add(cwd);
+  savePreferences?.();
+}
 
 /** Set by init(); null only in the instant before the controls are wired. */
 let applyExternalState: ((state: SidebarState) => void) | null = null;
@@ -76,9 +96,13 @@ function parseSidebarState(value: unknown): SidebarState {
         ? Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, record.width))
         : DEFAULT_WIDTH,
       collapsed: record.collapsed === true,
+      view: record.view === "folders" ? "folders" : "sessions",
+      expandedFolders: Array.isArray(record.expandedFolders)
+        ? record.expandedFolders.filter((cwd): cwd is string => typeof cwd === "string")
+        : [],
     };
   }
-  return { width: DEFAULT_WIDTH, collapsed: false };
+  return { width: DEFAULT_WIDTH, collapsed: false, view: "sessions", expandedFolders: [] };
 }
 
 function readState(): SidebarState {
@@ -86,7 +110,7 @@ function readState(): SidebarState {
     return parseSidebarState(JSON.parse(localStorage.getItem(STORE_KEY) ?? "null"));
   } catch {
     // Corrupt JSON or storage denied (private mode): defaults are fine.
-    return { width: DEFAULT_WIDTH, collapsed: false };
+    return parseSidebarState(null);
   }
 }
 
@@ -104,16 +128,60 @@ function init(): void {
   const stored = readState();
   let width = stored.width;
   let collapsed = stored.collapsed;
+  view = stored.view;
+  expandedFolders = new Set(stored.expandedFolders);
+
+  const settings = document.getElementById("sidebar-settings")!;
+  const settingsOpen = document.getElementById("sidebar-settings-open")!;
+  const settingsBack = document.getElementById("sidebar-settings-back")!;
+  const search = document.getElementById("search")!;
+  const newSession = document.getElementById("sidebar-new-session")!;
+  const list = document.getElementById("session-list")!;
+  const viewButtons = document.querySelectorAll<HTMLButtonElement>("[data-sidebar-view]");
+
+  function renderView(): void {
+    for (const button of viewButtons) {
+      button.setAttribute("aria-pressed", String(button.dataset.sidebarView === view));
+    }
+  }
+
+  function showSettings(show: boolean): void {
+    settings.hidden = !show;
+    search.hidden = show;
+    settingsOpen.hidden = show;
+    newSession.hidden = show;
+    list.hidden = show;
+    settingsOpen.setAttribute("aria-expanded", String(show));
+    (show ? settingsBack : settingsOpen).focus();
+    syncWorkingAnimation();
+  }
+
+  settingsOpen.addEventListener("click", () => showSettings(true));
+  settingsBack.addEventListener("click", () => showSettings(false));
+  settings.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      showSettings(false);
+    }
+  });
+  for (const button of viewButtons) {
+    button.addEventListener("click", () => {
+      view = button.dataset.sidebarView === "folders" ? "folders" : "sessions";
+      renderView();
+      saveState();
+    });
+  }
 
   function saveState(): void {
     try {
-      localStorage.setItem(STORE_KEY, JSON.stringify({ width, collapsed } satisfies SidebarState));
+      localStorage.setItem(STORE_KEY, JSON.stringify({ width, collapsed, view, expandedFolders: [...expandedFolders] } satisfies SidebarState));
     } catch {
       // Storage denied: the sidebar still works for this page life.
     }
     // A settled width/collapse change is workspace state: let the client mirror it.
     notifyStateChange?.();
   }
+  savePreferences = saveState;
 
   const render = (): void => {
     // Clamp for display only; the stored width is the user's intent and survives
@@ -223,12 +291,16 @@ function init(): void {
   applyExternalState = (state) => {
     width = clampWidth(state.width);
     collapsed = state.collapsed === true;
+    view = state.view;
+    expandedFolders = new Set(state.expandedFolders);
+    renderView();
     saveState();
     render();
     applyCollapsed();
   };
 
   render();
+  renderView();
   applyCollapsed();
 }
 

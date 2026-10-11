@@ -1,5 +1,8 @@
 import { trimSelectionHighlight } from "./selection";
-import { applySidebarState, onSidebarStateChange, STORE_KEY as SIDEBAR_KEY } from "./sidebar";
+import {
+  applySidebarState, onSidebarStateChange, sidebarFolderView, sidebarFolderExpanded,
+  toggleSidebarFolder, STORE_KEY as SIDEBAR_KEY,
+} from "./sidebar";
 import { doneIndicator, syncWorkingAnimation, workingIndicator } from "./working-indicator";
 import { Terminal } from "@xterm/xterm";
 import { ImageAddon } from "@xterm/addon-image";
@@ -27,9 +30,11 @@ import {
   type SessionSummaryLike,
 } from "./protocol";
 
-// Sidebar width/collapse is workspace state; the sidebar announces settled
-// changes so they take the same durable-save path as panes, pins and font size.
-onSidebarStateChange(() => queueStateSave());
+// Sidebar preferences share the durable-save path with panes, pins and font size.
+onSidebarStateChange(() => {
+  renderSidebar();
+  queueStateSave();
+});
 
 const statusEl = document.getElementById("status") as HTMLElement;
 const buildEl = document.getElementById("build") as HTMLElement;
@@ -1121,6 +1126,8 @@ function renderSidebar(): void {
   sessionListEl.replaceChildren();
 
   const query = searchEl.value.trim().toLowerCase();
+  const folderView = sidebarFolderView();
+  const folders = new Map<string, HTMLElement[]>();
   const sessionByPath = new Map<string, SessionSummaryLike>();
   for (const session of sessions) {
     if (!sessionByPath.has(session.path)) sessionByPath.set(session.path, session);
@@ -1180,7 +1187,8 @@ function renderSidebar(): void {
     const summary = runtime.sessionFile ? sessionSummary(runtime.sessionFile) : undefined;
     const cwd = summary?.cwd ?? runtime.cwd;
     const row = document.createElement("div");
-    row.className = runtime.alive ? "row live" : "row recent";
+    row.className = runtime.alive ? "row live loaded" : "row recent loaded";
+    row.dataset.cwd = cwd;
     // The live edge and the working shimmer both read this one session colour;
     // without a validated accent they fall back to mobile's grey.
     row.style.setProperty("--row-accent", runtimeAccent(runtime));
@@ -1190,7 +1198,8 @@ function renderSidebar(): void {
     const name = rowName(title, runtimeIndicator(runtime));
     const sub = document.createElement("span");
     sub.className = "sub";
-    sub.textContent = ownerId ? ownerId.replace("p", "pane ") : cwd.replace(/^\/home\/[^/]+/, "~");
+    sub.textContent = ownerId ? ownerId.replace("p", "pane ") : folderView ? "" : cwd.replace(/^\/home\/[^/]+/, "~");
+    sub.hidden = !sub.textContent;
     const kill = document.createElement("button");
     kill.className = "kill";
     kill.textContent = "✕";
@@ -1225,6 +1234,7 @@ function renderSidebar(): void {
   for (const session of recent) {
     const row = document.createElement("div");
     row.className = "row recent";
+    row.dataset.cwd = session.cwd;
     row.draggable = true;
     row.title = `${session.cwd}\n${session.path}`;
     const name = rowName(session.title || session.cwd, null);
@@ -1236,7 +1246,8 @@ function renderSidebar(): void {
     const cwdEl = document.createElement("span");
     cwdEl.className = "cwd";
     cwdEl.textContent = session.cwd.split("/").filter(Boolean).pop() ?? "/";
-    sub.append(rel, cwdEl);
+    sub.append(rel);
+    if (!folderView) sub.append(cwdEl);
     const actions = document.createElement("div");
     actions.className = "row-actions";
     actions.append(pinButton(session));
@@ -1254,7 +1265,49 @@ function renderSidebar(): void {
     });
     (pinnedPaths.has(session.path) ? pinnedRows : otherRows).push(row);
   }
-  sessionListEl.append(...pinnedRows, ...otherRows);
+  if (folderView) {
+    for (const row of [...pinnedRows, ...otherRows]) {
+      const cwd = row.dataset.cwd!;
+      const rows = folders.get(cwd) ?? [];
+      folders.set(cwd, rows);
+      rows.push(row);
+    }
+    for (const [cwd, rows] of folders) {
+      const folder = document.createElement("div");
+      folder.className = "sidebar-folder";
+      const heading = document.createElement("button");
+      heading.type = "button";
+      heading.className = "folder-heading";
+      heading.dataset.cwd = cwd;
+      heading.title = cwd;
+      const expanded = sidebarFolderExpanded(cwd);
+      heading.setAttribute("aria-expanded", String(expanded));
+      const marker = document.createElement("span");
+      marker.className = "folder-marker";
+      marker.textContent = expanded ? "▾" : "▸";
+      marker.setAttribute("aria-hidden", "true");
+      const label = document.createElement("span");
+      label.className = "folder-label";
+      label.textContent = cwd.replace(/^\/home\/[^/]+/, "~") || "(unknown folder)";
+      heading.append(marker, label);
+      const contents = document.createElement("div");
+      contents.className = "folder-sessions";
+      contents.id = `sidebar-folder-${sessionListEl.childElementCount}`;
+      heading.setAttribute("aria-controls", contents.id);
+      contents.hidden = !expanded;
+      contents.append(...rows);
+      heading.addEventListener("click", () => {
+        toggleSidebarFolder(cwd);
+        for (const button of sessionListEl.querySelectorAll<HTMLButtonElement>(".folder-heading")) {
+          if (button.dataset.cwd === cwd) button.focus();
+        }
+      });
+      folder.append(heading, contents);
+      sessionListEl.append(folder);
+    }
+  } else {
+    sessionListEl.append(...pinnedRows, ...otherRows);
+  }
   // New rows bring new spinner/shimmer nodes: the loop is only alive while one
   // of them paints.
   syncWorkingAnimation();
@@ -1547,12 +1600,12 @@ async function reconcileWorkspaceState(): Promise<void> {
     }
     const remoteCellSize = typeof state.cellSize === "number" && Number.isFinite(state.cellSize) ? state.cellSize : null;
     if (remoteCellSize !== null && localStorage.getItem(CELL_KEY) === null) setCellSize(remoteCellSize);
-    const remoteSidebar = typeof state.sidebar === "string" && state.sidebar.length <= 4096 ? state.sidebar : null;
+    const remoteSidebar = typeof state.sidebar === "string" && state.sidebar.length <= STATE_LIMIT_BYTES ? state.sidebar : null;
     if (remoteSidebar && localStorage.getItem(SIDEBAR_KEY) === null) {
       try {
         applySidebarState(JSON.parse(remoteSidebar));
       } catch {
-        // A malformed sidebar cache only costs the preferred width; ignore it.
+        // Malformed sidebar preferences are ignored.
       }
     }
   }

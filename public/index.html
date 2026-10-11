@@ -17,6 +17,12 @@
       <aside id="sidebar">
         <div class="side-block side-search">
           <input id="search" type="search" placeholder="search sessions…" autocomplete="off" spellcheck="false" />
+          <button id="sidebar-settings-open" class="sidebar-toggle" type="button" title="Sidebar settings" aria-label="Sidebar settings" aria-controls="sidebar-settings" aria-expanded="false">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+              <path d="m9 3-1 3-3 1-2 3 2 2-1 3 3 2 3-1 2 2 3-2v-3l3-2-1-3-3-1-1-3z" />
+              <circle cx="12" cy="12" r="3" />
+            </svg>
+          </button>
           <button
             id="sidebar-collapse"
             class="sidebar-toggle"
@@ -28,14 +34,22 @@
             «
           </button>
         </div>
-        <div class="side-block">
+        <div id="sidebar-new-session" class="side-block">
           <button id="new-session" class="side-action" title="Start a new omp session in the focused pane">
             + new session
           </button>
         </div>
         <div id="session-list" class="side-list"></div>
-        <div class="side-status">
-          <span id="status" class="status" data-kind="idle">connecting…</span>
+        <section id="sidebar-settings" class="side-settings" aria-label="Sidebar settings" hidden>
+          <div class="side-block settings-heading">
+            <button id="sidebar-settings-back" class="side-action" type="button">← Back</button>
+            <h2>Settings</h2>
+          </div>
+          <div class="motion-control" role="group" aria-label="Sidebar view">
+            <span class="motion-label">View</span>
+            <button type="button" data-sidebar-view="sessions">Sessions</button>
+            <button type="button" data-sidebar-view="folders">Folders</button>
+          </div>
           <div class="motion-control" role="group" aria-label="Working indicator motion">
             <span class="motion-label">Motion</span>
             <button
@@ -52,6 +66,9 @@
               Off
             </button>
           </div>
+        </section>
+        <div class="side-status">
+          <span id="status" class="status" data-kind="idle">connecting…</span>
         </div>
       </aside>
       <div
