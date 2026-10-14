@@ -8,7 +8,7 @@
  * client's workspace document to one small JSON file on disk so a restart — or
  * a wiped browser profile — cannot lose the workspace description.
  *
- * The document is owned and versioned by the client (`version: 1`); the daemon
+ * The document is owned and versioned by the client (`version: 2`); the daemon
  * only bounds its size and writes it atomically, so the wire format can evolve
  * without a daemon change.
  */

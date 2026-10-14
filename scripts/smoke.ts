@@ -233,7 +233,21 @@ async function phaseA(dir: string): Promise<void> {
   console.log("ok - input -> PTY -> output -> websocket round-trip");
   const listed = await runtimes();
   assert(listed.some((entry) => entry.id === runtime.id), "runtime shows up in /api/runtimes");
+  // Output must keep draining with no subscribers, not merely keep a pid alive.
+  const detachedTag = `detached-${Date.now()}`;
+  pane.send(`sleep 1; printf '\\n%s%s\\n' 'detached-' '${detachedTag.slice(9)}'\n`);
   pane.close();
+  const before = (await runtimes()).find((entry) => entry.id === runtime.id)!;
+  await waitFor(async () => {
+    const current = (await runtimes()).find((entry) => entry.id === runtime.id);
+    return !!current && current.bytesOut > before.bytesOut;
+  }, 10_000, "output advances after the last pane closes");
+  await Bun.sleep(1200);
+  const reattached = await attach(runtime.id);
+  await waitFor(() => reattached.text().includes(`\r\n${detachedTag}\r\n`), 10_000, "detached output is replayed on reopen");
+  assert((await runtimes()).find((entry) => entry.id === runtime.id)?.pid === before.pid,
+    "closing and reopening a streaming view preserves its process");
+  reattached.close();
 }
 
 async function phaseC(dir: string): Promise<void> {
@@ -472,9 +486,9 @@ async function phaseF(stateDir: string): Promise<void> {
   const wrongVersion = await fetch(`${BASE}/api/state`, {
     method: "PUT",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ version: 2, savedAt: new Date().toISOString() }),
+    body: JSON.stringify({ version: 3, savedAt: new Date().toISOString() }),
   });
-  assert(wrongVersion.status === 400, "PUT rejects a non-v1 document");
+  assert(wrongVersion.status === 400, "PUT rejects an unsupported workspace version");
   const notJson = await fetch(`${BASE}/api/state`, {
     method: "PUT",
     headers: { "content-type": "application/json" },

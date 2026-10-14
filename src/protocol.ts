@@ -236,6 +236,6 @@ export function parseStateResponse(payload: unknown): WorkspaceStatePayload | nu
   const state = payload.state;
   if (state === null || state === undefined) return { kind: "none", corrupt: payload.corrupt === true };
   if (!isRecord(state)) return null;
-  if (state.version !== 1) return { kind: "unsupported", version: state.version };
+  if (state.version !== 1 && state.version !== 2) return { kind: "unsupported", version: state.version };
   return { kind: "state", state };
 }

@@ -112,7 +112,7 @@ describe("workspace state store", () => {
     const dir = await tempDir();
     const store = new WorkspaceStateStore(join(dir, "state.json"));
     expect((await store.read()).state).toBeNull();
-    const doc = { version: 1, savedAt: new Date().toISOString(), layout: { tree: { kind: "leaf", pane: "p1" } } };
+    const doc = { version: 2, savedAt: new Date().toISOString(), layout: { tree: { kind: "leaf", pane: "p1" } } };
     await store.write(doc);
     const snapshot = await store.read();
     expect(snapshot.state).toEqual(doc);

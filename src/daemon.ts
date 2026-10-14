@@ -243,11 +243,10 @@ const server = Bun.serve<WsData>({
         } catch {
           return new Response("state document must be JSON", { status: 400 });
         }
-        // The client owns the document shape; the daemon pins only `version` and
-        // `savedAt`, so a future format needs no daemon change. A malformed
-        // layout cannot hurt the daemon because it never acts on this document.
-        if (!isRecord(body) || body.version !== 1 || typeof body.savedAt !== "string") {
-          return new Response("state document must be a version 1 workspace", { status: 400 });
+        // The client owns the layout shape; accept supported workspace versions.
+        // The daemon never acts on the pane document.
+        if (!isRecord(body) || (body.version !== 1 && body.version !== 2) || typeof body.savedAt !== "string") {
+          return new Response("state document must be a version 1 or 2 workspace", { status: 400 });
         }
         try {
           return Response.json(

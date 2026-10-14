@@ -8,11 +8,11 @@
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
-    <!-- No global chrome: the sidebar is the only app-level surface. #status sits
-         at its bottom so connection failures stay visible, and #build stays in the
-         DOM (hidden) for the client's bundle-reload check. The resizer and the
-         collapsed-state expand control are wired by src/sidebar.ts; the working-
-         indicator motion control below is wired by src/working-indicator.ts. -->
+    <!-- Space tabs sit above the pane workspace. #status remains in the sidebar
+         so connection failures stay visible, and #build stays in the DOM (hidden)
+         for the client's bundle-reload check. The resizer and collapsed-state
+         expand control are wired by src/sidebar.ts; motion settings are wired
+         by src/working-indicator.ts. -->
     <div id="app">
       <aside id="sidebar">
         <div class="side-block side-search">
@@ -95,7 +95,13 @@
       >
         »
       </button>
-      <main id="panes"></main>
+      <section id="workspace">
+        <nav class="space-bar" aria-label="Browser spaces">
+          <div id="space-tabs" role="tablist" aria-label="Spaces"></div>
+          <button id="new-space" type="button" title="New space" aria-label="New space">+</button>
+        </nav>
+        <main id="panes"></main>
+      </section>
     </div>
     <span id="build" hidden></span>
     <script type="module" src="/client.js"></script>

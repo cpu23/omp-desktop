@@ -2,7 +2,7 @@
 
 **Your OMP sessions. One workspace.**
 
-Use [OMP](https://omp.sh) in a browser or a native Linux window. Open up to four terminal panes. Switch between live and saved sessions. Keep sessions running when you close the window.
+Use [OMP](https://omp.sh) in a browser or a native Linux window. Organize chats into spaces using the top tab bar; each space holds up to four terminal panes. Switch between live and saved sessions. Keep sessions running when you close a pane or the window.
 
 ![Two working sessions with live status in the sidebar](docs/images/desktop.png)
 
@@ -38,6 +38,13 @@ bun run app:install
 Open **OMP Desktop** from your application menu. Keep the first terminal running; the window needs the local daemon.
 
 > Keep port 4180 local. The desktop API has no authentication. Setup does not change your OMP configuration.
+
+## Spaces and files
+
+- Click **+** in the top tab bar to create a space. Each space has its own pane layout and focused chat; spaces restore after reload.
+- Drag a pane header onto another space's tab to move its chat, or drag a sidebar session onto a tab to open it there. Switching spaces does not stop their sessions.
+- Drop files onto a terminal pane to insert their paths without submitting the message. Native drops preserve the original paths, including video, image and JSON files.
+- Closing a pane only detaches the view. Output continues in the daemon and is replayed when reopened; use the sidebar's stop action to terminate a session.
 
 ## More
 

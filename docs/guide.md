@@ -239,6 +239,27 @@ the OSC 1337 session-file marker the sidebar sniffs), `OMP_DESKTOP_RUNTIME=<id>`
 
 ## Behavior notes
 
+**Spaces.** The top tab bar groups independent pane layouts. Click **+** to add a space; each supports the
+same 1×1 → 1×2 → 2×2 splits. Drag a pane header onto another tab to move its session, or a sidebar session
+onto a tab to open it there. Space selection, layouts and focused panes persist in browser storage and the
+daemon workspace mirror. Hidden spaces keep their sessions running. The daemon's runtime limit applies
+across all spaces (`OMP_DESKTOP_MAX_RUNTIMES`, default 8), not separately to each tab.
+Session moves use captured pointer gestures within the page rather than OS HTML drag transport, so native
+WebKitGTK can move chats without interfering with its separate filesystem-drop handler. Releasing outside
+a pane or space tab, or cancelling the gesture, leaves the session in place.
+
+Closing a pane or switching spaces is not a stop request: the daemon continues reading process output
+without any attached terminal, and replays its bounded output tail when a view reconnects. Explicitly
+stopping a session in the sidebar terminates it. A daemon restart can resume transcripts, but cannot recover
+an in-flight provider request or unsaved input.
+
+**File drops.** Drop one or more files onto a terminal pane to insert quoted paths without submitting.
+The native window uses original filesystem paths for any file type, including videos, images and JSON,
+without uploading their contents. Browser file URI lists can also supply paths; when browser security hides
+the original path, only images fall back to the existing image upload endpoint. Other pathless browser files
+are not inserted. Paths containing control characters are rejected so a drop cannot submit terminal commands.
+Image fallback retains the paste endpoint's supported formats and 32 MiB limit.
+
 **Panes.** Right-click any pane for the layout-wide split action (`Ctrl+Shift+E`); the first use turns 1×1 into
 1×2, the next splits both columns into 2×2, and at four panes the action is disabled. `Ctrl+Shift+X` closes a
 pane — closing a view never stops its session. In a 2×2 grid, closing one pane keeps the quadrant as an empty

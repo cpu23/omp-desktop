@@ -9,6 +9,7 @@ import { ImageAddon } from "@xterm/addon-image";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { isRecord } from "./guards";
+import { insertFilePaths, wireFileDrop } from "./file-drop";
 import {
   attachable,
   bindingForRuntime,
@@ -38,6 +39,8 @@ onSidebarStateChange(() => {
 
 const statusEl = document.getElementById("status") as HTMLElement;
 const buildEl = document.getElementById("build") as HTMLElement;
+const spaceTabsEl = document.getElementById("space-tabs") as HTMLElement;
+const newSpaceEl = document.getElementById("new-space") as HTMLButtonElement;
 const panesEl = document.getElementById("panes") as HTMLElement;
 const sessionListEl = document.getElementById("session-list") as HTMLElement;
 const searchEl = document.getElementById("search") as HTMLInputElement;
@@ -58,7 +61,7 @@ const CELL_MAX = 28;
 const CELL_KEY = "omp-desktop.cellSize";
 const LAYOUT_KEY = "omp-desktop.layout.v1";
 /** Workspace document format mirrored to the daemon's durable state file. */
-const STATE_VERSION = 1;
+const STATE_VERSION = 2;
 /** Keep in sync with src/state.ts so an oversized document fails before the wire. */
 const STATE_LIMIT_BYTES = 1024 * 1024;
 const MAX_PANES = 4;
@@ -91,9 +94,15 @@ type LayoutNode =
   | { kind: "leaf"; pane: string }
   | { kind: "split"; dir: "row" | "col"; ratio: number; a: LayoutNode; b: LayoutNode };
 type StoredLayout = { tree: LayoutNode; panes: Record<string, PaneBinding>; focused: string | null };
+type SpaceLayout = { id: string; layout: StoredLayout };
+type StoredWorkspace = { spaces: SpaceLayout[]; activeSpaceId: string };
 
 const panes = new Map<string, Pane>();
+const spaces = new Map<string, StoredLayout>();
 let layout: StoredLayout = { tree: { kind: "leaf", pane: "p1" }, panes: {}, focused: "p1" };
+let activeSpaceId = "s1";
+spaces.set(activeSpaceId, layout);
+let spaceSeq = 1;
 /** True when the current panes came from a stored document (browser or daemon). */
 let restoredLocal = false;
 let runtimes: RuntimeInfo[] = [];
@@ -169,13 +178,74 @@ let paneSeq = 0;
 let dragging = false;
 let renderPending = false;
 
-document.addEventListener("dragstart", () => {
-  dragging = true;
-});
-document.addEventListener("dragend", () => {
-  dragging = false;
-  if (renderPending) renderSidebar();
-});
+/** Pointer capture keeps session moves inside the page: WebKitGTK's OS drag
+ * transport can end custom-MIME HTML drags before delivering a drop. */
+function wireSessionDrag(element: HTMLElement, payload: Record<string, unknown>): void {
+  let origin: { x: number; y: number; pointer: number } | null = null;
+  let moved = false;
+  let suppressClick = false;
+  let target: HTMLElement | null = null;
+  element.style.touchAction = "none";
+  element.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0 || (event.target as Element).closest("button, a, input")) return;
+    origin = { x: event.clientX, y: event.clientY, pointer: event.pointerId };
+    moved = false;
+    suppressClick = false;
+    dragging = true;
+    element.setPointerCapture(event.pointerId);
+  });
+  element.addEventListener("pointermove", (event) => {
+    if (!origin || event.pointerId !== origin.pointer) return;
+    if (!moved && Math.hypot(event.clientX - origin.x, event.clientY - origin.y) < 8) return;
+    moved = true;
+    event.preventDefault();
+    const hit = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>(".space-tab, .pane") ?? null;
+    if (hit !== target) {
+      target?.classList.remove("drop");
+      target = hit;
+      target?.classList.add("drop");
+    }
+  });
+  const finish = (event: PointerEvent): void => {
+    if (!origin || event.pointerId !== origin.pointer) return;
+    const destination = target;
+    const shouldDrop = moved && event.type === "pointerup";
+    suppressClick = moved;
+    target?.classList.remove("drop");
+    target = null;
+    origin = null;
+    if (element.hasPointerCapture(event.pointerId)) element.releasePointerCapture(event.pointerId);
+    if (shouldDrop && destination) {
+      event.preventDefault();
+      if (destination.dataset.space) handleSpaceDrop(destination.dataset.space, payload);
+      else if (destination.dataset.pane) handlePaneDrop(destination.dataset.pane, payload);
+    }
+    dragging = false;
+    if (renderPending) renderSidebar();
+  };
+  element.addEventListener("pointerup", finish);
+  element.addEventListener("pointercancel", finish);
+  element.addEventListener("lostpointercapture", finish);
+  element.addEventListener("click", (event) => {
+    if (!suppressClick) return;
+    suppressClick = false;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  }, true);
+}
+
+function handlePaneDrop(paneId: string, payload: Record<string, unknown>): void {
+  const pane = panes.get(paneId);
+  if (!pane) return;
+  if (payload.kind === "pane" && typeof payload.paneId === "string") swapPanes(payload.paneId, paneId);
+  else if (payload.kind === "runtime" && typeof payload.runtimeId === "string") {
+    const runtime = runtimes.find((candidate) => candidate.id === payload.runtimeId);
+    if (runtime) pane.bind(bindingForRuntime(runtime, daemonId, displayTitle(runtime)));
+  } else if (payload.kind === "session" && typeof payload.path === "string"
+      && typeof payload.cwd === "string" && typeof payload.title === "string") {
+    void openSession(pane, { path: payload.path, cwd: payload.cwd, title: payload.title });
+  }
+}
 
 // ---------------------------------------------------------------- daemon API
 
@@ -350,6 +420,7 @@ class Pane {
   #resizeTimer: number | undefined;
   #selectionEvents = new AbortController();
   #selectionRevision = 0;
+  #disposeFileDrop: (() => void) | null = null;
 
   constructor(id: string, binding: PaneBinding) {
     this.id = id;
@@ -360,7 +431,6 @@ class Pane {
 
     const header = document.createElement("header");
     header.className = "pane-header";
-    header.draggable = true;
     this.#titleEl = document.createElement("span");
     this.#titleEl.className = "pane-title";
     this.#stateEl = document.createElement("span");
@@ -460,11 +530,12 @@ class Pane {
     this.#observer = new ResizeObserver(() => this.#scheduleFit());
     this.#observer.observe(this.#body);
 
-    header.addEventListener("dragstart", (event) => {
-      event.dataTransfer?.setData("text/omp-payload", JSON.stringify({ kind: "pane", paneId: this.id }));
-      if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
-    });
+    wireSessionDrag(header, { kind: "pane", paneId: this.id });
     this.#wireDrop();
+    this.#disposeFileDrop = wireFileDrop(this.el, {
+      onPaths: (paths) => insertFilePaths(this.ws, paths),
+      upload: uploadPaste,
+    });
     this.el.addEventListener("paste", (event) => this.#handlePaste(event));
     this.renderPlaceholder();
   }
@@ -518,34 +589,12 @@ class Pane {
     this.el.addEventListener("drop", (event) => {
       event.preventDefault();
       this.el.classList.remove("drop");
-      const raw = event.dataTransfer?.getData("text/omp-payload");
-      if (!raw) return;
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(raw);
-      } catch {
-        return;
-      }
-      if (!isRecord(parsed) || typeof parsed.kind !== "string") return;
-      if (parsed.kind === "pane" && typeof parsed.paneId === "string") {
-        swapPanes(parsed.paneId, this.id);
-      } else if (parsed.kind === "runtime" && typeof parsed.runtimeId === "string") {
-        const runtime = runtimes.find((candidate) => candidate.id === parsed.runtimeId);
-        if (runtime) {
-          this.bind(bindingForRuntime(runtime, daemonId, displayTitle(runtime)));
-        }
-      } else if (
-        parsed.kind === "session" &&
-        typeof parsed.path === "string" &&
-        typeof parsed.cwd === "string" &&
-        typeof parsed.title === "string"
-      ) {
-        void openSession(this, { path: parsed.path, cwd: parsed.cwd, title: parsed.title });
-      }
     });
   }
 
   focus(): void {
+    const owner = spaceForPane(this.id);
+    if (owner && owner.id !== activeSpaceId) switchSpace(owner.id);
     if (layout.focused !== this.id) {
       layout.focused = this.id;
       renderSidebar();
@@ -636,9 +685,13 @@ class Pane {
       // Attached means live under the daemon that answered this open.
       this.binding.autoResume = true;
       this.binding.daemonGeneration = daemonId;
-      this.sendResize(true);
-      this.fitPane();
-      if (layout.focused === this.id) this.term.focus();
+      // Detached spaces keep their terminal stream but must not resize a live
+      // PTY to stale geometry while the view is hidden.
+      if (this.visible) {
+        this.sendResize(true);
+        this.fitPane();
+      }
+      if (layout.focused === this.id && this.visible) this.term.focus();
       save();
     };
     socket.onmessage = (event) => {
@@ -810,6 +863,8 @@ class Pane {
   destroy(): void {
     this.#selectionEvents.abort();
     this.#observer.disconnect();
+    this.#disposeFileDrop?.();
+    this.#disposeFileDrop = null;
     this.detach();
     this.term.dispose();
     this.el.remove();
@@ -913,7 +968,7 @@ function gridLayout(tree: LayoutNode): LayoutNode {
 function splitLayout(): void {
   const tree = layout.tree;
   if (leaves(tree).length >= MAX_PANES) return;
-  const shown = new Set([...panes.values()].map((pane) => pane.binding.runtimeId));
+  const shown = new Set([...panes.values()].map((pane) => pane.binding.runtimeId).filter((id): id is string => id !== null));
   const split = (node: LayoutNode, dir: "row" | "col"): LayoutNode => {
     if (node.kind !== "leaf") return node;
     const candidate = runtimes.find((runtime) => !shown.has(runtime.id));
@@ -969,6 +1024,148 @@ function removeLeaf(node: LayoutNode, paneId: string): { tree: LayoutNode } | nu
   return { tree: { ...node, a: left.tree, b: right.tree } };
 }
 
+function spaceForPane(paneId: string): SpaceLayout | null {
+  for (const [id, stored] of spaces) {
+    if (leaves(stored.tree).includes(paneId)) return { id, layout: stored };
+  }
+  return null;
+}
+
+function replacePaneId(node: LayoutNode, from: string, to: string): LayoutNode {
+  if (node.kind === "leaf") return node.pane === from ? { ...node, pane: to } : node;
+  return {
+    ...node,
+    a: replacePaneId(node.a, from, to),
+    b: replacePaneId(node.b, from, to),
+  };
+}
+
+function renderSpaceTabs(): void {
+  spaceTabsEl.replaceChildren();
+  let index = 0;
+  for (const id of spaces.keys()) {
+    const tab = document.createElement("button");
+    tab.className = "space-tab";
+    tab.dataset.space = id;
+    tab.type = "button";
+    tab.setAttribute("role", "tab");
+    tab.textContent = `Space ${++index}`;
+    tab.setAttribute("aria-selected", String(id === activeSpaceId));
+    tab.tabIndex = id === activeSpaceId ? 0 : -1;
+    tab.addEventListener("click", () => switchSpace(id));
+    spaceTabsEl.append(tab);
+  }
+}
+
+function switchSpace(id: string): void {
+  const target = spaces.get(id);
+  if (!target || id === activeSpaceId) return;
+  closePaneMenu();
+  activeSpaceId = id;
+  layout = target;
+  renderLayout();
+  renderSpaceTabs();
+  save();
+  focusedPane()?.term.focus();
+}
+
+function createSpace(): void {
+  let id = `s${++spaceSeq}`;
+  while (spaces.has(id)) id = `s${++spaceSeq}`;
+  const fresh: StoredLayout = {
+    tree: { kind: "leaf", pane: `empty-${id}` },
+    panes: {},
+    focused: null,
+  };
+  spaces.set(id, fresh);
+  activeSpaceId = id;
+  layout = fresh;
+  const pane = newPane(emptyBinding());
+  layout.tree = { kind: "leaf", pane: pane.id };
+  layout.focused = pane.id;
+  renderLayout();
+  renderSpaceTabs();
+  save();
+}
+
+function movePaneToSpace(paneId: string, targetSpaceId: string): void {
+  const source = spaceForPane(paneId);
+  const target = spaces.get(targetSpaceId);
+  if (!source || !target) return;
+  if (source.id === targetSpaceId) {
+    switchSpace(targetSpaceId);
+    panes.get(paneId)?.focus();
+    return;
+  }
+  const targetPaneId = target.focused && leaves(target.tree).includes(target.focused)
+    ? target.focused
+    : leaves(target.tree)[0];
+  if (!targetPaneId || paneId === targetPaneId) return;
+
+  // Exchange tree slots instead of rebinding either pane: both terminal views
+  // and their live streams move intact, and neither space loses a slot.
+  source.layout.tree = replacePaneId(source.layout.tree, paneId, targetPaneId);
+  target.tree = replacePaneId(target.tree, targetPaneId, paneId);
+  if (source.layout.focused === paneId) source.layout.focused = targetPaneId;
+  if (target.focused === targetPaneId) target.focused = paneId;
+  if (targetSpaceId === activeSpaceId) {
+    renderLayout();
+    renderSpaceTabs();
+    save();
+  } else {
+    switchSpace(targetSpaceId);
+  }
+  panes.get(paneId)?.focus();
+}
+
+function handleSpaceDrop(spaceId: string, payload: Record<string, unknown>): void {
+  if (payload.kind === "pane" && typeof payload.paneId === "string") {
+    movePaneToSpace(payload.paneId, spaceId);
+    return;
+  }
+  if (payload.kind === "runtime" && typeof payload.runtimeId === "string") {
+    const runtime = runtimes.find((candidate) => candidate.id === payload.runtimeId);
+    if (!runtime) return;
+    const existing = [...panes.values()].find((pane) => pane.binding.runtimeId === runtime.id);
+    if (existing) {
+      if (spaceForPane(existing.id)?.id !== spaceId) movePaneToSpace(existing.id, spaceId);
+      else {
+        switchSpace(spaceId);
+        existing.focus();
+      }
+      return;
+    }
+    switchSpace(spaceId);
+    const pane = focusedPane();
+    if (pane) {
+      pane.bind(bindingForRuntime(runtime, daemonId, displayTitle(runtime)));
+      pane.focus();
+    }
+    return;
+  }
+  if (
+    payload.kind === "session" &&
+    typeof payload.path === "string" &&
+    typeof payload.cwd === "string" &&
+    typeof payload.title === "string"
+  ) {
+    const session = { path: payload.path, cwd: payload.cwd, title: payload.title };
+    const existing = [...panes.values()].find((pane) => pane.binding.sessionFile === session.path);
+    if (existing) {
+      if (spaceForPane(existing.id)?.id !== spaceId) movePaneToSpace(existing.id, spaceId);
+      else {
+        switchSpace(spaceId);
+        existing.focus();
+      }
+      void openSession(existing, session);
+      return;
+    }
+    switchSpace(spaceId);
+    const pane = focusedPane();
+    if (pane) void openSession(pane, session);
+  }
+}
+
 function swapPanes(aId: string, bId: string): void {
   if (aId === bId) return;
   const a = panes.get(aId);
@@ -984,13 +1181,12 @@ function renderLayout(): void {
   const tree = layout.tree;
   const ids = leaves(tree);
   panesEl.replaceChildren(buildNode(tree));
-  for (const pane of panes.values()) {
+  for (const id of ids) {
+    const pane = panes.get(id);
+    if (!pane) continue;
     pane.renderHeader();
     pane.renderPlaceholder();
     window.setTimeout(() => pane.fitPane(), 0);
-  }
-  for (const pane of panes.values()) {
-    if (!ids.includes(pane.id)) panes.delete(pane.id);
   }
 }
 
@@ -1058,9 +1254,10 @@ function startResize(
     save();
     // The observer's debounced fit can land mid-drag, so force every pane onto its
     // final geometry once the pointer is up rather than trusting the last callback.
-    for (const pane of panes.values()) {
-      pane.fitPane();
-      pane.sendResize(true);
+    for (const id of leaves()) {
+      const pane = panes.get(id);
+      pane?.fitPane();
+      pane?.sendResize(true);
     }
   };
   divider.addEventListener("pointermove", onMove);
@@ -1192,7 +1389,6 @@ function renderSidebar(): void {
     // The live edge and the working shimmer both read this one session colour;
     // without a validated accent they fall back to mobile's grey.
     row.style.setProperty("--row-accent", runtimeAccent(runtime));
-    row.draggable = true;
     row.title = `${cwd}\n${runtime.sessionFile ?? "(session file not known yet)"}\n${runtime.id}`;
     const ownerId = paneForRuntime.get(runtime.id);
     const name = rowName(title, runtimeIndicator(runtime));
@@ -1224,10 +1420,7 @@ function renderSidebar(): void {
       const pane = focusedPane();
       if (pane) pane.bind(bindingForRuntime(runtime, daemonId, displayTitle(runtime)));
     });
-    row.addEventListener("dragstart", (event) => {
-      event.dataTransfer?.setData("text/omp-payload", JSON.stringify({ kind: "runtime", runtimeId: runtime.id }));
-      if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
-    });
+    wireSessionDrag(row, { kind: "runtime", runtimeId: runtime.id });
     (runtime.sessionFile && pinnedPaths.has(runtime.sessionFile) ? pinnedRows : otherRows).push(row);
   }
 
@@ -1235,7 +1428,6 @@ function renderSidebar(): void {
     const row = document.createElement("div");
     row.className = "row recent";
     row.dataset.cwd = session.cwd;
-    row.draggable = true;
     row.title = `${session.cwd}\n${session.path}`;
     const name = rowName(session.title || session.cwd, null);
     const sub = document.createElement("span");
@@ -1256,13 +1448,7 @@ function renderSidebar(): void {
       const pane = focusedPane();
       if (pane) void openSession(pane, session);
     });
-    row.addEventListener("dragstart", (event) => {
-      event.dataTransfer?.setData(
-        "text/omp-payload",
-        JSON.stringify({ kind: "session", path: session.path, cwd: session.cwd, title: session.title }),
-      );
-      if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
-    });
+    wireSessionDrag(row, { kind: "session", path: session.path, cwd: session.cwd, title: session.title });
     (pinnedPaths.has(session.path) ? pinnedRows : otherRows).push(row);
   }
   if (folderView) {
@@ -1443,11 +1629,24 @@ function adoptUnclaimedRuntimes(): void {
 
 // ---------------------------------------------------------------- persistence
 
+function workspaceLayoutDocument(): StoredWorkspace {
+  const savedSpaces: SpaceLayout[] = [];
+  for (const [id, stored] of spaces) {
+    const bindings: Record<string, PaneBinding> = {};
+    for (const paneId of leaves(stored.tree)) {
+      const pane = panes.get(paneId);
+      if (pane) bindings[paneId] = pane.binding;
+    }
+    stored.panes = bindings;
+    savedSpaces.push({ id, layout: stored });
+  }
+  return { spaces: savedSpaces, activeSpaceId };
+}
+
 function save(): void {
-  layout.panes = {};
-  for (const [id, pane] of panes) layout.panes[id] = pane.binding;
+  const document = workspaceLayoutDocument();
   try {
-    localStorage.setItem(LAYOUT_KEY, JSON.stringify(layout));
+    localStorage.setItem(LAYOUT_KEY, JSON.stringify(document));
   } catch {
     console.warn("omp-desktop: workspace layout cannot be cached in browser storage");
     setStatus("Browser storage unavailable — workspace is kept on the daemon only", "warn");
@@ -1455,12 +1654,11 @@ function save(): void {
   queueStateSave();
 }
 
-/** Everything a restart or a cleared browser profile needs to rebuild the workspace. */
 function workspaceStateDoc(): unknown {
   return {
     version: STATE_VERSION,
     savedAt: new Date().toISOString(),
-    layout,
+    layout: workspaceLayoutDocument(),
     pins: pinnedSessions,
     cellSize,
     sidebar: localStorage.getItem(SIDEBAR_KEY),
@@ -1504,12 +1702,12 @@ async function deliverState(): Promise<void> {
     do {
       stateQueued = false;
       const fingerprint = JSON.stringify({
-        layout,
+        layout: workspaceLayoutDocument(),
         pins: pinnedSessions,
         cellSize,
         sidebar: localStorage.getItem(SIDEBAR_KEY),
       });
-      if (fingerprint === deliveredState) break;
+      if (fingerprint === deliveredState && !stateSaveError) break;
       const body = JSON.stringify(workspaceStateDoc());
       const bodyBytes = new TextEncoder().encode(body).length;
       if (bodyBytes > STATE_LIMIT_BYTES) {
@@ -1582,9 +1780,8 @@ async function reconcileWorkspaceState(): Promise<void> {
   } else {
     const state = payload.state;
     if (!restoredLocal) {
-      const stored = parseStoredLayout(state.layout);
-      if (stored && applyStoredLayout(stored)) {
-        restoredLocal = true;
+      const stored = parseStoredWorkspace(state.layout);
+      if (stored && applyStoredWorkspace(stored)) {
         // Repopulate the browser cache from the adopted document, so a later
         // reload (even with the daemon down) still has the workspace. The publish
         // this queues is held by the gate until adoption finishes.
@@ -1628,6 +1825,28 @@ function parseStoredLayout(value: unknown): StoredLayout | null {
   return { tree, panes: storedPanes, focused: typeof value.focused === "string" ? value.focused : null };
 }
 
+function parseStoredWorkspace(value: unknown): StoredWorkspace | null {
+  if (isRecord(value) && Array.isArray(value.spaces)) {
+    const parsed: SpaceLayout[] = [];
+    const seen = new Set<string>();
+    for (const entry of value.spaces) {
+      if (!isRecord(entry) || typeof entry.id !== "string" || seen.has(entry.id)) continue;
+      const stored = parseStoredLayout(entry.layout);
+      if (!stored) continue;
+      seen.add(entry.id);
+      parsed.push({ id: entry.id, layout: stored });
+    }
+    if (!parsed.length) return null;
+    const activeSpaceId = typeof value.activeSpaceId === "string" && seen.has(value.activeSpaceId)
+      ? value.activeSpaceId
+      : parsed[0].id;
+    return { spaces: parsed, activeSpaceId };
+  }
+  // Documents written before browser spaces stored one layout directly.
+  const legacy = parseStoredLayout(value);
+  return legacy ? { spaces: [{ id: "s1", layout: legacy }], activeSpaceId: "s1" } : null;
+}
+
 function parseTree(value: unknown, depth: number): LayoutNode | null {
   if (!isRecord(value) || depth > 8) return null;
   if (value.kind === "leaf") return typeof value.pane === "string" ? { kind: "leaf", pane: value.pane } : null;
@@ -1641,41 +1860,64 @@ function parseTree(value: unknown, depth: number): LayoutNode | null {
   return null;
 }
 
-/** Rebuilds the pane grid from a stored document; false when it has no usable leaf. */
-function applyStoredLayout(stored: StoredLayout): boolean {
-  const tree = gridLayout(stored.tree);
-  const ids = leaves(tree);
-  if (!ids.length) return false;
+/** Rebuild every space while keeping pane IDs unique in the shared Pane map. */
+function applyStoredWorkspace(stored: StoredWorkspace): boolean {
+  if (!stored.spaces.length) return false;
   for (const pane of panes.values()) pane.destroy();
   panes.clear();
-  layout = {
-    tree,
-    panes: stored.panes,
-    focused: stored.focused && ids.includes(stored.focused) ? stored.focused : ids[0],
-  };
-  for (const id of ids) {
-    const numeric = Number(id.replace(/\D/g, ""));
-    if (Number.isFinite(numeric)) paneSeq = Math.max(paneSeq, numeric);
-    newPane(stored.panes[id] ?? emptyBinding(), id);
+  spaces.clear();
+  paneSeq = 0;
+  spaceSeq = 0;
+  for (const entry of stored.spaces) {
+    let id = entry.id;
+    while (spaces.has(id)) id = `s${++spaceSeq}`;
+    const tree = gridLayout(entry.layout.tree);
+    const ids = leaves(tree);
+    if (!ids.length) continue;
+    const rebuilt: StoredLayout = { tree, panes: {}, focused: null };
+    spaces.set(id, rebuilt);
+    const remapped = new Map<string, string>();
+    for (const oldId of ids) {
+      let paneId = oldId;
+      while (panes.has(paneId)) paneId = `${oldId}-space-${++paneSeq}`;
+      if (paneId !== oldId) {
+        rebuilt.tree = replacePaneId(rebuilt.tree, oldId, paneId);
+      }
+      remapped.set(oldId, paneId);
+      const numeric = Number(oldId.replace(/\D/g, ""));
+      if (Number.isFinite(numeric)) paneSeq = Math.max(paneSeq, numeric);
+      const binding = entry.layout.panes[oldId] ?? emptyBinding();
+      rebuilt.panes[paneId] = binding;
+      panes.set(paneId, new Pane(paneId, binding));
+    }
+    rebuilt.focused = entry.layout.focused
+      ? remapped.get(entry.layout.focused) ?? leaves(rebuilt.tree)[0]
+      : leaves(rebuilt.tree)[0];
   }
+  if (!spaces.size) return false;
+  activeSpaceId = spaces.has(stored.activeSpaceId) ? stored.activeSpaceId : spaces.keys().next().value!;
+  layout = spaces.get(activeSpaceId)!;
   renderLayout();
+  renderSpaceTabs();
   return true;
 }
 
 function load(): void {
-  let stored: StoredLayout | null = null;
+  let stored: StoredWorkspace | null = null;
   try {
-    stored = parseStoredLayout(JSON.parse(localStorage.getItem(LAYOUT_KEY) ?? "null"));
+    stored = parseStoredWorkspace(JSON.parse(localStorage.getItem(LAYOUT_KEY) ?? "null"));
   } catch {
     stored = null;
   }
-  if (stored && applyStoredLayout(stored)) {
+  if (stored && applyStoredWorkspace(stored)) {
     restoredLocal = true;
     return;
   }
   const pane = newPane(emptyBinding());
   layout = { tree: { kind: "leaf", pane: pane.id }, panes: {}, focused: pane.id };
+  spaces.set(activeSpaceId, layout);
 }
+
 
 // ---------------------------------------------------------------- chrome
 
@@ -1738,9 +1980,10 @@ function setCellSize(size: number): void {
   } catch {
     console.warn("omp-desktop: font size cannot be cached in browser storage");
   }
-  for (const pane of panes.values()) {
-    pane.fitPane();
-    pane.sendResize(true);
+  for (const id of leaves()) {
+    const pane = panes.get(id);
+    pane?.fitPane();
+    pane?.sendResize(true);
   }
   queueStateSave();
 }
@@ -1770,6 +2013,7 @@ newSessionEl.addEventListener("click", () => {
   const pane = focusedPane();
   if (pane) void newSession(pane);
 });
+newSpaceEl.addEventListener("click", createSpace);
 let searchTimer: number | undefined;
 searchEl.addEventListener("input", () => {
   window.clearTimeout(searchTimer);
@@ -1780,6 +2024,7 @@ searchEl.addEventListener("input", () => {
 
 load();
 renderLayout();
+renderSpaceTabs();
 renderSidebar();
 void checkBuild();
 window.setInterval(() => void checkBuild(), 10_000);

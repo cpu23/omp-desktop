@@ -57,6 +57,30 @@ pub fn build_main_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn s
         })
         .build()?;
 
+    // Native file drops are delivered by Tauri rather than the WebView's
+    // HTML drag/drop API. Forward only the drop data into the page as a DOM
+    // event, so the daemon-origin client needs no Tauri IPC permissions.
+    let drop_app = app.clone();
+    let window = app.get_webview_window(MAIN_WINDOW).ok_or("main window disappeared")?;
+    window.on_window_event(move |event| {
+        let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, position }) = event else {
+            return;
+        };
+        if paths.is_empty() {
+            return;
+        }
+        let payload = serde_json::json!({
+            "paths": paths.iter().map(|path| path.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+            "x": position.x,
+            "y": position.y,
+        });
+        if let Some(window) = drop_app.get_webview_window(MAIN_WINDOW) {
+            let script = format!(
+                "window.dispatchEvent(new CustomEvent('omp-desktop-file-drop', {{ detail: {payload} }}));"
+            );
+            let _ = window.eval(script);
+        }
+    });
     Ok(())
 }
 

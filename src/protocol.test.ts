@@ -10,6 +10,7 @@ import {
   parseRuntimeOne,
   parseRuntimesResponse,
   parseServerMessage,
+  parseStateResponse,
 } from "./protocol";
 
 function runtime(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -114,5 +115,15 @@ describe("runtime presentation parsing", () => {
       expect(hello.runtime.presentation).toBeUndefined();
       expect(hello.replayBytes).toBe(4);
     }
+  });
+});
+describe("workspace state version parsing", () => {
+  test("accepts the single-layout and spaces workspace document versions", () => {
+    expect(parseStateResponse({ state: { version: 1 } })?.kind).toBe("state");
+    expect(parseStateResponse({ state: { version: 2 } })?.kind).toBe("state");
+  });
+
+  test("leaves newer workspace documents unsupported", () => {
+    expect(parseStateResponse({ state: { version: 3 } })).toEqual({ kind: "unsupported", version: 3 });
   });
 });

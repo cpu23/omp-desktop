@@ -110,6 +110,76 @@ select:focus-visible {
   display: flex;
 }
 
+#workspace {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.space-bar {
+  display: flex;
+  flex: 0 0 38px;
+  align-items: stretch;
+  gap: 6px;
+  padding: 4px 8px 0;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+
+#space-tabs {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: stretch;
+  gap: 4px;
+  min-width: 0;
+  overflow-x: auto;
+}
+
+.space-tab,
+#new-space {
+  flex: 0 0 auto;
+  min-width: 76px;
+  padding: 0 14px;
+  border: 1px solid var(--line);
+  border-bottom: 0;
+  border-radius: 8px 8px 0 0;
+  background: var(--panel-soft);
+  color: var(--muted);
+  font: 600 11px var(--mono);
+  cursor: pointer;
+}
+
+.space-tab[aria-selected="true"] {
+  background: var(--bg);
+  color: var(--text);
+  border-color: var(--line);
+}
+
+.space-tab.drop {
+  border-color: var(--text);
+  color: var(--text);
+}
+
+#new-space {
+  min-width: 32px;
+  padding: 0 10px;
+  font-size: 16px;
+}
+
+.space-tab:hover,
+#new-space:hover {
+  color: var(--text);
+  border-color: var(--dim);
+}
+
+#panes {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+}
 /* Sidebar ---------------------------------------------------------------- */
 
 /* Width is a variable so src/sidebar.ts can resize without touching flex; the
@@ -651,12 +721,6 @@ body.sidebar-resizing * {
 
 /* Panes ------------------------------------------------------------------ */
 
-#panes {
-  flex: 1;
-  min-width: 0;
-  min-height: 0;
-  display: flex;
-}
 
 .split {
   display: flex;
