@@ -9,15 +9,11 @@ Use [OMP](https://omp.sh) in a browser or a native Linux window. Organize chats 
   <br><a href="https://github.com/cpu23/omp-desktop/releases/download/v0.1.0/launch.mp4">Watch the launch video — 26 seconds, 1080p (MP4)</a> · <a href="docs/media/demo.gif">Open demo GIF</a>
 </p>
 
-[Video file in this repository](docs/media/launch.mp4). The GIF above links to the full video with instrumental audio.
-
 <p align="center">
   <a href="docs/images/desktop.png"><img src="docs/images/desktop.png" alt="Two working sessions with live status in the sidebar" width="32%"></a>
   <a href="docs/images/desktop-grid.png"><img src="docs/images/desktop-grid.png" alt="Four-pane workspace with three working sessions" width="32%"></a>
   <a href="docs/images/desktop-search.png"><img src="docs/images/desktop-search.png" alt="Find a session by title while terminal sessions keep working" width="32%"></a>
 </p>
-
-*Real browser footage with Codex GPT-6 Luna: one session → two panes → four panes, session drag-and-drop, a shared theme change, and workspace restoration after reload. The 26-second, 1080p60 film uses fixed framing, minimal headings, tracked drag feedback, and original audio. Source footage is native 1920 × 1080 with disposable demo data—not the native window. Static screenshots use a local test stream. [Capture and rendering details](docs/media/README.md).*
 
 ## Requirements
 
@@ -53,6 +49,8 @@ Open **OMP Desktop** from your application menu. Keep the first terminal running
 - Closing a pane only detaches the view. Output continues in the daemon and is replayed when reopened; use the sidebar's stop action to terminate a session.
 
 ## Releases
+
+**v0.1.1.** [GitHub release](https://github.com/cpu23/omp-desktop/releases/tag/v0.1.1) · [Changelog](docs/release-v0.1.1.md).
 
 **v0.1.0 — Initial source release.** [GitHub release](https://github.com/cpu23/omp-desktop/releases/tag/v0.1.0) · [Launch video (MP4)](https://github.com/cpu23/omp-desktop/releases/download/v0.1.0/launch.mp4) · [Demo GIF](https://github.com/cpu23/omp-desktop/releases/download/v0.1.0/demo.gif) · [Release notes](docs/release-v0.1.0.md).
 
