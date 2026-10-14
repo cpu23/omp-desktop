@@ -4,14 +4,20 @@
 
 Use [OMP](https://omp.sh) in a browser or a native Linux window. Organize chats into spaces using the top tab bar; each space holds up to four terminal panes. Switch between live and saved sessions. Keep sessions running when you close a pane or the window.
 
-![Two working sessions with live status in the sidebar](docs/images/desktop.png)
-
 <p align="center">
-  <a href="docs/images/desktop-grid.png"><img src="docs/images/desktop-grid.png" alt="Four-pane workspace with three working sessions" width="49%"></a>
-  <a href="docs/images/desktop-search.png"><img src="docs/images/desktop-search.png" alt="Find a session by title while terminal sessions keep working" width="49%"></a>
+  <a href="https://github.com/cpu23/omp-desktop/releases/download/v0.1.0/launch.mp4"><img src="docs/media/demo.gif" alt="Recorded interaction in the real OMP Desktop browser client" width="100%"></a>
+  <br><a href="https://github.com/cpu23/omp-desktop/releases/download/v0.1.0/launch.mp4">Watch the launch video — 26 seconds, 1080p (MP4)</a> · <a href="docs/media/demo.gif">Open demo GIF</a>
 </p>
 
-*Two panes · Four-pane workspace · Session search. Demo sessions use a local test stream.*
+[Video file in this repository](docs/media/launch.mp4). The GIF above links to the full video with instrumental audio.
+
+<p align="center">
+  <a href="docs/images/desktop.png"><img src="docs/images/desktop.png" alt="Two working sessions with live status in the sidebar" width="32%"></a>
+  <a href="docs/images/desktop-grid.png"><img src="docs/images/desktop-grid.png" alt="Four-pane workspace with three working sessions" width="32%"></a>
+  <a href="docs/images/desktop-search.png"><img src="docs/images/desktop-search.png" alt="Find a session by title while terminal sessions keep working" width="32%"></a>
+</p>
+
+*Real browser footage with Codex GPT-6 Luna: one session → two panes → four panes, session drag-and-drop, a shared theme change, and workspace restoration after reload. The 26-second, 1080p60 film uses fixed framing, minimal headings, tracked drag feedback, and original audio. Source footage is native 1920 × 1080 with disposable demo data—not the native window. Static screenshots use a local test stream. [Capture and rendering details](docs/media/README.md).*
 
 ## Requirements
 
@@ -45,6 +51,18 @@ Open **OMP Desktop** from your application menu. Keep the first terminal running
 - Drag a pane header onto another space's tab to move its chat, or drag a sidebar session onto a tab to open it there. Switching spaces does not stop their sessions.
 - Drop files onto a terminal pane to insert their paths without submitting the message. Native drops preserve the original paths, including video, image and JSON files.
 - Closing a pane only detaches the view. Output continues in the daemon and is replayed when reopened; use the sidebar's stop action to terminate a session.
+
+## Releases
+
+**v0.1.0 — Initial source release.** [GitHub release](https://github.com/cpu23/omp-desktop/releases/tag/v0.1.0) · [Launch video (MP4)](https://github.com/cpu23/omp-desktop/releases/download/v0.1.0/launch.mp4) · [Demo GIF](https://github.com/cpu23/omp-desktop/releases/download/v0.1.0/demo.gif) · [Release notes](docs/release-v0.1.0.md).
+
+Source only: no prebuilt binary installers. Follow [Quick setup](#quick-setup); build the optional Linux native window locally using the [Native Linux app guide](docs/guide.md#native-linux-app).
+
+## Upstream & ecosystem
+
+[OMP](https://omp.sh) · [Source](https://github.com/can1357/oh-my-pi) · [Releases](https://github.com/can1357/oh-my-pi/releases) · [Skills](https://omp.sh/docs/skills) · [Plugins](https://omp.sh/docs/plugins) · [Community (Discord)](https://discord.com/invite/4NMW9cdXZa)
+
+[OMP Mobile companion](https://github.com/cpu23/omp-mobile) · [Tauri 2](https://v2.tauri.app/develop/) · [xterm.js](https://xtermjs.org/) · [Bun](https://bun.sh/docs)
 
 ## More
 

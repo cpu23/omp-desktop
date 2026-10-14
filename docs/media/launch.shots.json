@@ -1,0 +1,55 @@
+{
+  "product": "desktop",
+  "fps": 60,
+  "width": 1920,
+  "height": 1080,
+  "duration": 26.083333333333332,
+  "source": "desktop-master-v4.mp4",
+  "shots": [
+    {
+      "id": "intro",
+      "time": 0,
+      "duration": 2.4
+    },
+    {
+      "id": "single",
+      "time": 2.4,
+      "duration": 2.5
+    },
+    {
+      "id": "two",
+      "time": 4.9,
+      "duration": 2.7333333333333334
+    },
+    {
+      "id": "four",
+      "time": 7.633333333333334,
+      "duration": 1.1
+    },
+    {
+      "id": "drag",
+      "time": 8.733333333333333,
+      "duration": 5.6
+    },
+    {
+      "id": "setting-detail",
+      "time": 14.333333333333334,
+      "duration": 2.9833333333333334
+    },
+    {
+      "id": "setting-wide",
+      "time": 17.316666666666666,
+      "duration": 2.4
+    },
+    {
+      "id": "restored",
+      "time": 19.716666666666665,
+      "duration": 3.3666666666666667
+    },
+    {
+      "id": "outro",
+      "time": 23.083333333333332,
+      "duration": 3
+    }
+  ]
+}
