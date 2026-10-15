@@ -185,19 +185,43 @@ function wireSessionDrag(element: HTMLElement, payload: Record<string, unknown>)
   let moved = false;
   let suppressClick = false;
   let target: HTMLElement | null = null;
+  let preview: HTMLElement | null = null;
+  let offsetX = 0;
+  let offsetY = 0;
   element.style.touchAction = "none";
   element.addEventListener("pointerdown", (event) => {
-    if (event.button !== 0 || (event.target as Element).closest("button, a, input")) return;
+    if (origin || dragging || !event.isPrimary || event.button !== 0
+        || (event.target as Element).closest("button, a, input")) return;
+    event.preventDefault();
     origin = { x: event.clientX, y: event.clientY, pointer: event.pointerId };
     moved = false;
     suppressClick = false;
     dragging = true;
+    document.body.classList.add("session-dragging");
     element.setPointerCapture(event.pointerId);
   });
   element.addEventListener("pointermove", (event) => {
     if (!origin || event.pointerId !== origin.pointer) return;
     if (!moved && Math.hypot(event.clientX - origin.x, event.clientY - origin.y) < 8) return;
-    moved = true;
+    if (!moved) {
+      moved = true;
+      window.getSelection()?.removeAllRanges();
+      for (const pane of panes.values()) pane.term.clearSelection();
+      const rect = element.getBoundingClientRect();
+      preview = element.cloneNode(true) as HTMLElement;
+      preview.removeAttribute("id");
+      preview.querySelectorAll("[id]").forEach((child) => child.removeAttribute("id"));
+      preview.classList.add("session-drag-preview");
+      preview.setAttribute("aria-hidden", "true");
+      preview.inert = true;
+      const width = Math.min(rect.width, 360);
+      preview.style.width = `${width}px`;
+      offsetX = Math.min(origin.x - rect.left, width - 12);
+      offsetY = origin.y - rect.top;
+      document.body.append(preview);
+      element.classList.add("session-drag-source");
+    }
+    preview!.style.transform = `translate3d(${event.clientX - offsetX}px, ${event.clientY - offsetY}px, 0)`;
     event.preventDefault();
     const hit = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>(".space-tab, .pane") ?? null;
     if (hit !== target) {
@@ -214,6 +238,10 @@ function wireSessionDrag(element: HTMLElement, payload: Record<string, unknown>)
     target?.classList.remove("drop");
     target = null;
     origin = null;
+    preview?.remove();
+    preview = null;
+    element.classList.remove("session-drag-source");
+    document.body.classList.remove("session-dragging");
     if (element.hasPointerCapture(event.pointerId)) element.releasePointerCapture(event.pointerId);
     if (shouldDrop && destination) {
       event.preventDefault();

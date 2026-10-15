@@ -481,6 +481,33 @@ body.sidebar-resizing * {
   user-select: none !important;
 }
 
+body.session-dragging,
+body.session-dragging * {
+  cursor: grabbing !important;
+  -webkit-user-select: none !important;
+  user-select: none !important;
+}
+
+.session-drag-source {
+  opacity: 0.35;
+}
+
+.session-drag-preview {
+  position: fixed !important;
+  top: 0;
+  left: 0;
+  z-index: 10000;
+  box-sizing: border-box;
+  margin: 0 !important;
+  pointer-events: none !important;
+  opacity: 0.75;
+  border: 1px solid var(--accent) !important;
+  border-radius: 8px;
+  background: var(--panel);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
+  will-change: transform;
+}
+
 /* Collapsed state: the sidebar and its resizer are hidden and this strip is the
    only way back in. Full height, so the hit area is the whole edge. */
 .sidebar-expand {
