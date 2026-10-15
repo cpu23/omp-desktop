@@ -149,6 +149,7 @@ function init(): void {
     settings.hidden = !show;
     search.hidden = show;
     settingsOpen.hidden = show;
+    collapse?.toggleAttribute("hidden", show);
     newSession.hidden = show;
     list.hidden = show;
     settingsOpen.setAttribute("aria-expanded", String(show));

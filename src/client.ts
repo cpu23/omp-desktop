@@ -9,9 +9,11 @@ import { CompletionNotifications } from "./notifications";
 import { Terminal } from "@xterm/xterm";
 import { ImageAddon } from "@xterm/addon-image";
 import { WebglAddon } from "@xterm/addon-webgl";
+import { repairWebglCanvasResize } from "./webgl-resize";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { isRecord } from "./guards";
 import { insertFilePaths, wireFileDrop } from "./file-drop";
+import { initializeHotkeys } from "./hotkeys";
 import {
   attachable,
   bindingForRuntime,
@@ -416,36 +418,35 @@ function focusRuntime(runtimeId: string): void {
   pane?.focus();
 }
 
-/** xterm's measured cell dimensions in device pixels. */
+/** xterm's measured cell dimensions in CSS pixels, matching host geometry. */
 type CellMetrics = { cellW: number; cellH: number };
 
 function xtermMetrics(term: Terminal): CellMetrics | null {
-  const device = (
+  const css = (
     term as unknown as {
       _core?: {
         _renderService?: {
-          dimensions?: { device?: { cell?: { width?: number; height?: number } } };
+          dimensions?: { css?: { cell?: { width?: number; height?: number } } };
         };
       };
     }
-  )._core?._renderService?.dimensions?.device;
-  const cellW = device?.cell?.width;
-  const cellH = device?.cell?.height;
+  )._core?._renderService?.dimensions?.css;
+  const cellW = css?.cell?.width;
+  const cellH = css?.cell?.height;
   if (typeof cellW !== "number" || !(cellW > 0)) return null;
   if (typeof cellH !== "number" || !(cellH > 0)) return null;
   return { cellW, cellH };
 }
 
 /** DOM measurement fallback if xterm's internal metrics become unavailable. */
-function drawnMetrics(term: Terminal, dpr: number): CellMetrics | null {
+function drawnMetrics(term: Terminal): CellMetrics | null {
   const screen = term.element?.querySelector<HTMLElement>(".xterm-screen");
   const cols = term.cols;
   const rows = term.rows;
   if (!screen || !cols || !rows) return null;
   const box = screen.getBoundingClientRect();
   if (!(box.width > 0) || !(box.height > 0)) return null;
-  const cellH = Math.max(1, Math.round((box.height / rows) * dpr));
-  return { cellW: (box.width / cols) * dpr, cellH };
+  return { cellW: box.width / cols, cellH: box.height / rows };
 }
 
 class Pane {
@@ -484,7 +485,7 @@ class Pane {
     spacer.className = "pane-spacer";
     const close = document.createElement("button");
     close.textContent = "✕";
-    close.title = "Close pane (Ctrl+Shift+X)";
+    close.title = "Close pane (shortcut editable in Settings)";
     close.addEventListener("click", (event) => {
       event.stopPropagation();
       closePane(this.id);
@@ -540,6 +541,7 @@ class Pane {
         showRendererWarning();
       });
       this.term.loadAddon(webgl);
+      repairWebglCanvasResize(webgl);
       this.el.dataset.renderer = "webgl";
     } catch (error) {
       webgl?.dispose();
@@ -663,7 +665,10 @@ class Pane {
   /** Restore pixels after this terminal's DOM was detached and reattached. */
   refreshAfterAttach(): void {
     if (!this.visible) return;
-    this.fitPane();
+    this.#fitGrid();
+    // Another view of this runtime may have changed the PTY's geometry while
+    // this space was hidden. Reassert it even if our own grid did not change.
+    this.sendResize(true);
     // Resizing only requests a render when the grid changes. A detached
     // renderer can lose its pixels without changing geometry, so repaint the
     // current viewport while preserving xterm's buffer and scroll position.
@@ -677,13 +682,12 @@ class Pane {
     if (!viewport || !host.clientWidth || !host.clientHeight) return;
     if (this.term.options.fontSize !== cellSize) this.term.options.fontSize = cellSize;
     if (this.term.options.lineHeight !== CELL_LINE_HEIGHT) this.term.options.lineHeight = CELL_LINE_HEIGHT;
-    const dpr = window.devicePixelRatio || 1;
-    const metrics = xtermMetrics(this.term) ?? drawnMetrics(this.term, dpr);
+    const metrics = xtermMetrics(this.term) ?? drawnMetrics(this.term);
     if (!metrics) return;
     const frame = host.getBoundingClientRect();
     const reserve = Math.max(0, viewport.getBoundingClientRect().width - viewport.clientWidth);
-    const cols = Math.max(1, Math.floor((frame.width - reserve) * dpr / metrics.cellW));
-    const rows = Math.max(1, Math.floor(frame.height * dpr / metrics.cellH));
+    const cols = Math.max(1, Math.floor((frame.width - reserve) / metrics.cellW));
+    const rows = Math.max(1, Math.floor(frame.height / metrics.cellH));
     if (cols !== this.term.cols || rows !== this.term.rows) this.term.resize(cols, rows);
   }
 
@@ -934,7 +938,6 @@ paneMenu.hidden = true;
 paneMenu.tabIndex = -1;
 const splitMenuItem = document.createElement("button");
 splitMenuItem.setAttribute("role", "menuitem");
-splitMenuItem.setAttribute("aria-keyshortcuts", "Control+Shift+E");
 paneMenu.append(splitMenuItem);
 document.body.append(paneMenu);
 
@@ -1099,6 +1102,8 @@ function renderSpaceTabs(): void {
   spaceTabsEl.replaceChildren();
   let index = 0;
   for (const id of spaces.keys()) {
+    const group = document.createElement("div");
+    group.className = "space-tab-group";
     const tab = document.createElement("button");
     tab.className = "space-tab";
     tab.dataset.space = id;
@@ -1108,8 +1113,44 @@ function renderSpaceTabs(): void {
     tab.setAttribute("aria-selected", String(id === activeSpaceId));
     tab.tabIndex = id === activeSpaceId ? 0 : -1;
     tab.addEventListener("click", () => switchSpace(id));
-    spaceTabsEl.append(tab);
+    const close = document.createElement("button");
+    close.className = "space-close";
+    close.type = "button";
+    close.textContent = "×";
+    close.title = `Close Space ${index} (sessions keep running)`;
+    close.setAttribute("aria-label", `Close Space ${index}`);
+    close.addEventListener("click", () => closeSpace(id));
+    group.append(tab, close);
+    spaceTabsEl.append(group);
   }
+}
+
+function closeSpace(id: string): void {
+  const stored = spaces.get(id);
+  if (!stored) return;
+  const order = [...spaces.keys()];
+  const index = order.indexOf(id);
+  closePaneMenu();
+  for (const paneId of leaves(stored.tree)) {
+    panes.get(paneId)?.destroy();
+    panes.delete(paneId);
+  }
+  spaces.delete(id);
+  if (spaces.size === 0) {
+    createSpace();
+    focusedPane()?.bind({ ...emptyBinding(), keepEmpty: true });
+    return;
+  }
+  if (activeSpaceId === id) {
+    const remaining = [...spaces.keys()];
+    activeSpaceId = remaining[Math.min(index, remaining.length - 1)];
+    layout = spaces.get(activeSpaceId)!;
+    renderLayout();
+    focusedPane()?.term.focus();
+  }
+  renderSpaceTabs();
+  renderSidebar();
+  save();
 }
 
 function switchSpace(id: string): void {
@@ -1241,7 +1282,7 @@ function renderLayout(): void {
     if (!pane) continue;
     pane.renderHeader();
     pane.renderPlaceholder();
-    window.setTimeout(() => pane.refreshAfterAttach(), 0);
+    window.requestAnimationFrame(() => pane.refreshAfterAttach());
   }
 }
 
@@ -2026,8 +2067,7 @@ void fontsReady.then(() => {
   }
 });
 
-// Ctrl/Cmd +/-/0 zooms the cell (browser zoom is suppressed). Persisted so a size
-// dialed in against the real terminal survives reloads.
+// Shared font size is persisted; its Ctrl/Cmd defaults are editable in Settings.
 function setCellSize(size: number): void {
   cellSize = Math.min(CELL_MAX, Math.max(CELL_MIN, size));
   try {
@@ -2043,24 +2083,18 @@ function setCellSize(size: number): void {
   queueStateSave();
 }
 
-window.addEventListener("keydown", (event) => {
-  const key = event.key;
-  if (event.ctrlKey || event.metaKey) {
-    if (key === "=" || key === "+") setCellSize(cellSize + 1);
-    else if (key === "-" || key === "_") setCellSize(cellSize - 1);
-    else if (key === "0") setCellSize(CELL_SIZE);
-    else if (event.shiftKey && (key === "E" || key === "e")) splitLayout();
-    else if (event.shiftKey && (key === "X" || key === "x")) closePane(layout.focused ?? "");
-    else return;
-    event.preventDefault();
-    return;
-  }
-  if (event.altKey && /^[1-4]$/.test(key)) {
-    const id = leaves()[Number(key) - 1];
-    if (id) {
-      panes.get(id)?.focus();
-      event.preventDefault();
-    }
+initializeHotkeys((action) => {
+  if (action === "fontIncrease") setCellSize(cellSize + 1);
+  else if (action === "fontDecrease") setCellSize(cellSize - 1);
+  else if (action === "fontReset") setCellSize(CELL_SIZE);
+  else if (action === "splitLayout") splitLayout();
+  else if (action === "closePane") closePane(layout.focused ?? "");
+  else if (action.startsWith("focusPane")) {
+    const paneId = leaves()[Number(action.slice("focusPane".length)) - 1];
+    if (paneId) panes.get(paneId)?.focus();
+  } else if (action.startsWith("selectSpace")) {
+    const spaceId = [...spaces.keys()][Number(action.slice("selectSpace".length)) - 1];
+    if (spaceId) switchSpace(spaceId);
   }
 });
 

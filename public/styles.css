@@ -130,11 +130,52 @@ select:focus-visible {
 
 #space-tabs {
   display: flex;
-  flex: 1 1 auto;
+  flex: 0 1 auto;
   align-items: stretch;
   gap: 4px;
   min-width: 0;
   overflow-x: auto;
+}
+
+.space-tab-group {
+  position: relative;
+  display: flex;
+  flex: 0 0 auto;
+}
+
+.space-tab-group .space-tab {
+  padding-right: 32px;
+}
+
+.space-close {
+  position: absolute;
+  right: 5px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.space-tab-group:hover .space-close,
+.space-tab-group:focus-within .space-close {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.space-close:hover,
+.space-close:focus-visible {
+  background: var(--panel-raised);
+  color: var(--text);
 }
 
 .space-tab,
@@ -444,6 +485,85 @@ select:focus-visible {
 .motion-control button:focus-visible {
   outline: 1px solid var(--effort-accent);
   outline-offset: 1px;
+}
+
+.shortcut-settings {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 12px;
+}
+
+.shortcut-settings h3 {
+  margin: 0;
+  font: 700 12px var(--mono);
+}
+
+.shortcut-help,
+.shortcut-message {
+  margin: 0;
+  color: var(--muted);
+  font: 10px/1.5 var(--mono);
+}
+
+.shortcut-message[data-kind="warn"] {
+  color: var(--warn);
+}
+
+#shortcut-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.shortcut-row {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.shortcut-row label {
+  color: var(--muted);
+  font: 10px/1.4 var(--mono);
+}
+
+.shortcut-editor,
+.shortcut-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.shortcut-editor input {
+  width: 100%;
+  min-width: 0;
+  padding: 5px 7px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  font: 10px var(--mono);
+}
+
+.shortcut-editor button,
+.shortcut-actions button {
+  flex: 0 0 auto;
+  padding: 5px 7px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-raised);
+  color: var(--muted);
+  font: 10px var(--mono);
+  cursor: pointer;
+}
+
+.shortcut-editor button:hover,
+.shortcut-actions button:hover {
+  border-color: var(--dim);
+  color: var(--text);
+}
+
+.shortcut-actions {
+  flex-wrap: wrap;
 }
 
 /* Sidebar resize handle: the panes' divider pattern, applied to the sidebar

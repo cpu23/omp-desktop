@@ -245,6 +245,10 @@ same 1×1 → 1×2 → 2×2 splits. Drag a pane header onto another tab to move 
 onto a tab to open it there. Space selection, layouts and focused panes persist in browser storage and the
 daemon workspace mirror. Hidden spaces keep their sessions running. The daemon's runtime limit applies
 across all spaces (`OMP_DESKTOP_MAX_RUNTIMES`, default 8), not separately to each tab.
+The **+** sits immediately after the tabs. A tab's **×** appears on hover or keyboard focus.
+Closing a space removes its pane views but leaves sessions running and available in the sidebar.
+Closing the active space selects its next neighbor (or the previous one at the end); closing the last
+space creates a fresh empty one. Closed spaces stay closed after reload.
 Session moves use captured pointer gestures within the page rather than OS HTML drag transport, so native
 WebKitGTK can move chats without interfering with its separate filesystem-drop handler. Releasing outside
 a pane or space tab, or cancelling the gesture, leaves the session in place.
@@ -261,13 +265,30 @@ the original path, only images fall back to the existing image upload endpoint. 
 are not inserted. Paths containing control characters are rejected so a drop cannot submit terminal commands.
 Image fallback retains the paste endpoint's supported formats and 32 MiB limit.
 
-**Panes.** Right-click any pane for the layout-wide split action (`Ctrl+Shift+E`); the first use turns 1×1 into
-1×2, the next splits both columns into 2×2, and at four panes the action is disabled. `Ctrl+Shift+X` closes a
-pane — closing a view never stops its session. In a 2×2 grid, closing one pane keeps the quadrant as an empty
-slot with **new session here** (select or drag a sidebar session into it); closing a second occupied pane
-collapses back to two side-by-side panes. Switch sessions by focusing a pane and clicking a sidebar session, or
-drag a session onto a pane; drag a pane header onto another pane to swap them. Escape or a click outside dismisses
-the menu.
+**Panes.** Right-click any pane for the layout-wide split action; the first use turns 1×1 into 1×2, the next
+splits both columns into 2×2, and at four panes the action is disabled. Closing a pane never stops its session.
+In a 2×2 grid, closing one pane keeps the quadrant as an empty slot with **new session here** (select or drag
+a sidebar session into it); closing a second occupied pane collapses back to two side-by-side panes. Switch
+sessions by focusing a pane and clicking a sidebar session, or drag a session onto a pane; drag a pane header
+onto another pane to swap them. Escape or a click outside dismisses the menu.
+
+**Keyboard shortcuts.** Defaults are shown below; Ctrl and Meta are separate alternatives where both are listed.
+Alt+1 through Alt+9 select spaces in tab order (a shortcut for a space that does not exist does nothing).
+
+| Action | Default |
+| --- | --- |
+| Select space 1–9 | `Alt+1` through `Alt+9` |
+| Increase / decrease / reset font size | `Ctrl+=; Ctrl+Plus; Meta+=; Meta+Plus` / `Ctrl+-; Ctrl+Shift+Minus; Meta+-; Meta+Shift+Minus` / `Ctrl+0; Meta+0` |
+| Split layout | `Ctrl+Shift+E; Meta+Shift+E` |
+| Close focused pane | `Ctrl+Shift+X; Meta+Shift+X` |
+| Focus pane 1–4 | Unassigned |
+
+Open the sidebar gear’s **Settings → Keyboard shortcuts** to edit these app shortcuts. Enter strokes as
+`Ctrl+K, Ctrl+1`; use commas between sequence presses and semicolons between alternative bindings. Clear a field
+to disable that action, then **Save shortcuts**; **Reset defaults** restores the table. Duplicate bindings and
+invalid keys or sequences are reported and are not saved. A sequence waits at most one second for its next
+press. Its first press must include Ctrl, Meta, Alt, or Shift, so ordinary unmodified terminal text is never
+captured. Shortcut preferences are stored locally in the browser/app profile.
 
 **Sessions and the sidebar.** Closing and reopening the app reattaches surviving processes without changing their
 PIDs. The daemon restores every ledger-recorded transcript before serving runtime requests, including sessions
@@ -279,7 +300,7 @@ have grey backgrounds; alive processes also show the CLI's per-session accent. W
 right of the card; a small green corner dot marks a finished turn without taking space from the title.
 The sidebar gear replaces the list with **Settings**, leaving terminal panes untouched; **Back** or Escape
 returns to the list. Settings contains **View: Sessions / Folders**, **Motion: System / On / Off**,
-and **Completions: Off / On**.
+**Completions: Off / On**, and **Keyboard shortcuts**.
 Sessions is the default view. Folders groups chats by their recorded project/working directory (falling back
 to the runtime's launch directory when no transcript summary is available); folders initially start collapsed.
 Expand a folder to see session-title rows with the same selection, drag, pin, stop and status behavior as
@@ -300,8 +321,9 @@ JetBrainsMono Nerd Font Mono restricted to private-use icon planes and bundled D
 so rendering does not depend on host fonts. Panes use xterm.js 6 with the WebGL addon; if WebGL is unavailable or
 its context is lost, a visible **DOM** warning marks the fallback. `Ctrl/Cmd +`/`-`/`0` adjust the shared font
 size. The app chrome reuses omp-mobile's palette and tokens verbatim; update both stylesheets together.
-Reattaching a space explicitly repaints each terminal even when its grid size is unchanged, preserving
-the viewport and buffered output.
+Reattaching a space fits in CSS pixels, reasserts the active view's PTY size, then repaints the terminal.
+A version-pinned adapter keeps addon-webgl's viewport and shader resolution synchronized with backing-canvas
+resizes, including fractional display scaling. Switching spaces preserves the buffered output and viewport.
 
 **Client bundle.** The daemon bundles the client and stylesheet at startup, serves them with
 `cache-control: no-store`, and publishes their content hash at `/api/build`; open tabs reload themselves when the
