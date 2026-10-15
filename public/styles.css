@@ -542,10 +542,11 @@ body.session-dragging * {
 /* Loaded sessions have a grey surface; alive processes also keep their session
    accent edge. Saved rows are outlined on the sidebar colour. */
 .row {
+  position: relative;
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   grid-template-areas:
-    "name actions"
+    "name name"
     "sub sub";
   align-items: center;
   column-gap: 7px;
@@ -586,6 +587,7 @@ body.session-dragging * {
   justify-content: space-between;
   gap: 7px;
   min-width: 0;
+  min-height: 22px;
   overflow: hidden;
   font: 700 12px var(--mono);
 }
@@ -597,17 +599,29 @@ body.session-dragging * {
   white-space: nowrap;
 }
 
-/* Working/Done close out the name line, like mobile's slot badges. Working is
-   OMP's braille spinner plus its shimmer; Done is mobile's green `.slot-done`
-   pill. Both are authored only from the extension's authoritative state, never
-   from PTY byte traffic. */
+/* Status comes from authoritative extension state, never PTY byte traffic.
+   Keep Working on the subtitle line so it does not squeeze the session title. */
 .row-working {
+  position: absolute;
+  right: 9px;
+  bottom: 7px;
   display: inline-flex;
   align-items: center;
   gap: 4px;
   flex: 0 0 auto;
   color: var(--row-accent, #808080);
   font: 500 11px var(--mono);
+}
+
+.row:has(.row-working) {
+  min-height: 49px;
+}
+
+.row:has(.row-working) .sub {
+  margin-right: 90px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .row-working .working-spinner {
@@ -634,18 +648,13 @@ body.session-dragging * {
 }
 
 .row-done {
-  display: inline-flex;
-  align-items: center;
-  flex: 0 0 auto;
-  min-height: 16px;
-  padding: 0 5px;
-  border: 1px solid var(--success);
-  border-radius: 999px;
-  background: rgba(0, 255, 136, 0.1);
-  color: var(--success);
-  font: 700 9px var(--mono);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
+  position: absolute;
+  right: 9px;
+  bottom: 9px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--success);
 }
 
 .row .sub {
@@ -665,14 +674,21 @@ body.session-dragging * {
   white-space: nowrap;
 }
 
-/* Pin and kill share the row's action slot (grid area "actions"). Both stay out
-   of the way until the row is hovered or focused, except a pressed pin, which
-   must read as pinned at rest. */
+/* Overlay actions reserve title space only when visible. Keyboard focus and
+   pinned cards keep the controls visible without clipping the title beneath them. */
 .row-actions {
-  grid-area: actions;
+  position: absolute;
+  top: 7px;
+  right: 9px;
   display: flex;
   align-items: center;
   gap: 3px;
+}
+
+.row:hover .name,
+.row:focus-within .name,
+.row:has(.pin[aria-pressed="true"]) .name {
+  padding-right: 48px;
 }
 
 .row .pin,

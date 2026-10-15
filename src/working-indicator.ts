@@ -103,11 +103,13 @@ export function workingIndicator(): HTMLElement {
   return wrap;
 }
 
-/** Green pill for a finished turn: mobile's `.slot-done`, same treatment. */
+/** Compact completion marker; keep the finished state accessible without a badge. */
 export function doneIndicator(): HTMLElement {
   const done = document.createElement("span");
   done.className = "row-done";
-  done.textContent = "Done";
+  done.setAttribute("role", "img");
+  done.setAttribute("aria-label", "Session finished");
+  done.title = "Session finished";
   return done;
 }
 

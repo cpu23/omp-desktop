@@ -10,7 +10,7 @@ updates.
 - **Daemon + PTY pool** — several `omp` sessions at once, byte-transparent I/O, resize, a bounded replay tail
   (512 KiB) for late attach.
 - **Session sidebar** — pinned, live and recent chats from omp's own store, search, and per-session accent /
-  **Working…** / **Done** indicators supplied by the injected `omp-mobile` extension.
+  **Working…** / finished-turn corner dots supplied by the injected `omp-mobile` extension.
 - **Panes** — 1×1 → 1×2 → 2×2, drag a session onto a pane, drag a pane header to swap two panes, draggable
   dividers, and one terminal WebSocket per pane.
 - **Sessions survive** window close and daemon restarts: the daemon keeps a durable live-session ledger and
@@ -35,7 +35,7 @@ omp-desktop is one half of a pair; the mobile client lives in a sibling checkout
 
 The daemon injects `../omp-mobile/extension.ts` into every spawned `omp` by default. With the sibling missing the
 app still works — panes stream and the sidebar falls back to file-based discovery; only the structured
-accent/Working/Done state and the mobile client's structured actions are unavailable. Set `OMP_DESKTOP_EXTENSION`
+accent/Working/completion state and the mobile client's structured actions are unavailable. Set `OMP_DESKTOP_EXTENSION`
 to another path, or to an empty string to disable it. `bun run release:check` requires both sibling checkouts;
 the desktop-only `bun run smoke` also works without the companion.
 
@@ -158,7 +158,7 @@ window whose webview storage was lost rebuilds its panes, pins and settings from
 
 Click plain-text HTTP(S) URLs or labelled terminal hyperlinks to open them in your default browser; both pass
 their destination directly to the native navigation policy, without xterm's confirmation/blank-popup flow. File
-links remain disabled, and the daemon page receives no native IPC permissions. In the browser client the same
+links remain disabled. The daemon page receives only narrowly scoped notification IPC permissions. In the browser client the same
 links open in a separate tab with no opener access. Clipboard image paste and pane dragging depend on the
 compositor and are not verified on every desktop.
 
@@ -201,8 +201,9 @@ daemon saw a token still authenticates gateway calls.
 - The paste endpoint accepts only `image/png`, `image/jpeg`, `image/webp` and `image/gif` up to 32 MiB and writes
   only inside `OMP_DESKTOP_PASTE_DIR`.
 - Native shell: the window may navigate only between the bundled connection page and the daemon origin;
-  everything else opens in the system browser. The daemon origin is remote content and gets no native IPC
-  permissions — only the local connection page can call the `connect` command, and it re-checks the caller.
+  everything else opens in the system browser. The daemon origin receives only notification-plugin permission
+  checks, requests, delivery and action-listening access. Only the local connection page can call `connect`,
+  which re-checks the caller. No general core or shell commands are granted to daemon-origin content.
 - Extension sockets are owner-only and, when a token is configured, every request must present it
   (`x-omp-mobile-token` header or `Authorization: Bearer`). An ownership record prevents serving a socket that
   was replaced by another process.
@@ -274,9 +275,11 @@ with no pane open; concurrent resume requests for one transcript share one proce
 removed immediately. Pins persist by transcript path, survive stop/resume, and keep older chats reachable beyond
 the recent-session limit. Session ages and ordering use the last user/assistant message timestamp, not file
 modification time or terminal output. Loaded sessions (the daemon pool counted by the bottom **live** status)
-have grey backgrounds; alive processes also show the CLI's per-session accent and working/done indicators.
+have grey backgrounds; alive processes also show the CLI's per-session accent. Working sits at the lower
+right of the card; a small green corner dot marks a finished turn without taking space from the title.
 The sidebar gear replaces the list with **Settings**, leaving terminal panes untouched; **Back** or Escape
-returns to the list. Settings contains **View: Sessions / Folders** and **Motion: System / On / Off**.
+returns to the list. Settings contains **View: Sessions / Folders**, **Motion: System / On / Off**,
+and **Completions: Off / On**.
 Sessions is the default view. Folders groups chats by their recorded project/working directory (falling back
 to the runtime's launch directory when no transcript summary is available); folders initially start collapsed.
 Expand a folder to see session-title rows with the same selection, drag, pin, stop and status behavior as
@@ -284,11 +287,21 @@ session cards, without repeating the folder label. Pins remain first within each
 folders persist in the browser cache and the daemon's durable workspace mirror. Motion only affects animations
 (native defaults to On; browsers to System, which honors `prefers-reduced-motion`).
 
+**Completion notifications.** In sidebar Settings, switch **Completions** to **On** and allow the system
+or browser permission request. The choice is local to this browser/app profile and defaults to Off.
+The native shell sends OS notifications; supported browsers use Web Notifications while the page is open.
+Notifications follow the extension's finished-turn identity, not terminal inactivity. Opening the app does
+not replay old completions. Missing extension state produces no guessed notifications; Settings displays
+permission and delivery errors. OS notification settings and Do Not Disturb can still suppress banners.
+Clicking a notification selects its session when it is already bound to a pane, including another space.
+
 **Rendering.** Terminal and chrome text use bundled fonts under `public/fonts/` (Hack regular/bold, with
 JetBrainsMono Nerd Font Mono restricted to private-use icon planes and bundled DejaVu Sans Mono as the fallback),
 so rendering does not depend on host fonts. Panes use xterm.js 6 with the WebGL addon; if WebGL is unavailable or
 its context is lost, a visible **DOM** warning marks the fallback. `Ctrl/Cmd +`/`-`/`0` adjust the shared font
 size. The app chrome reuses omp-mobile's palette and tokens verbatim; update both stylesheets together.
+Reattaching a space explicitly repaints each terminal even when its grid size is unchanged, preserving
+the viewport and buffered output.
 
 **Client bundle.** The daemon bundles the client and stylesheet at startup, serves them with
 `cache-control: no-store`, and publishes their content hash at `/api/build`; open tabs reload themselves when the
@@ -297,7 +310,7 @@ hash changes. Applying client or style changes therefore requires a daemon resta
 
 **Not yet.** Daemon-owned multi-client pane layout (the mobile gateway drives the same live runtimes and the
 desktop mirrors its workspace to the daemon, but the pane grid is not yet a layout service other clients read),
-idle session unload, desktop notifications, and mirroring the pane grid on the phone.
+idle session unload and mirroring the pane grid on the phone.
 
 ## Advanced: app-private high-refresh WebKitGTK
 

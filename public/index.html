@@ -66,6 +66,20 @@
               Off
             </button>
           </div>
+          <div class="motion-control" role="group" aria-label="Completion notifications">
+            <span class="motion-label">Completions</span>
+            <button
+              id="notifications-toggle"
+              type="button"
+              aria-pressed="false"
+              title="Enable or disable completion notifications"
+            >
+              Off
+            </button>
+          </div>
+          <span id="notifications-status" class="motion-label" role="status" aria-live="polite">
+            Completion notifications are off.
+          </span>
         </section>
         <div class="side-status">
           <span id="status" class="status" data-kind="idle">connecting…</span>

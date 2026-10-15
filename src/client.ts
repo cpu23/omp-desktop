@@ -4,6 +4,8 @@ import {
   toggleSidebarFolder, STORE_KEY as SIDEBAR_KEY,
 } from "./sidebar";
 import { doneIndicator, syncWorkingAnimation, workingIndicator } from "./working-indicator";
+import { CompletionTracker } from "./completion-tracker";
+import { CompletionNotifications } from "./notifications";
 import { Terminal } from "@xterm/xterm";
 import { ImageAddon } from "@xterm/addon-image";
 import { WebglAddon } from "@xterm/addon-webgl";
@@ -117,6 +119,13 @@ let daemonId: string | null = null;
  */
 let adoptPending = false;
 let adoptSeen = 0;
+const completionTracker = new CompletionTracker();
+const completionNotifications = new CompletionNotifications(
+  document.getElementById("notifications-toggle") as HTMLButtonElement,
+  document.getElementById("notifications-status") as HTMLElement,
+  focusRuntime,
+);
+void completionNotifications.initialize();
 
 const PINS_KEY = "omp-desktop.pins.v1";
 function readPins(): SessionSummaryLike[] {
@@ -313,6 +322,9 @@ async function refreshRuntimes(options: { restore?: boolean } = {}): Promise<boo
     adoptSeen = 0;
   }
   runtimes = payload.runtimes;
+  completionTracker.observe(runtimes, (runtime) => {
+    void completionNotifications.notifyCompletion(runtime.id, displayTitle(runtime));
+  });
   renderSidebar();
   // One pass per pane clears vanished bindings (keeping a resume claim only when
   // the daemon restarted) and reattaches runtimes that are still alive.
@@ -397,6 +409,11 @@ function displayTitle(runtime: RuntimeInfo): string {
   if (match) return match.title;
   if (runtime.title && !/^\d{4}-\d{2}-\d{2}T/.test(runtime.title)) return runtime.title;
   return runtime.cwd.replace(/^\/home\/[^/]+/, "~") || runtime.id;
+}
+
+function focusRuntime(runtimeId: string): void {
+  const pane = [...panes.values()].find((candidate) => candidate.binding.runtimeId === runtimeId);
+  pane?.focus();
 }
 
 /** xterm's measured cell dimensions in device pixels. */
@@ -641,6 +658,16 @@ class Pane {
     if (!this.visible) return;
     this.#fitGrid();
     this.sendResize();
+  }
+
+  /** Restore pixels after this terminal's DOM was detached and reattached. */
+  refreshAfterAttach(): void {
+    if (!this.visible) return;
+    this.fitPane();
+    // Resizing only requests a render when the grid changes. A detached
+    // renderer can lose its pixels without changing geometry, so repaint the
+    // current viewport while preserving xterm's buffer and scroll position.
+    this.term.refresh(0, this.term.rows - 1);
   }
 
   /** Fit whole cells without changing text geometry to fill leftover space. */
@@ -1214,7 +1241,7 @@ function renderLayout(): void {
     if (!pane) continue;
     pane.renderHeader();
     pane.renderPlaceholder();
-    window.setTimeout(() => pane.fitPane(), 0);
+    window.setTimeout(() => pane.refreshAfterAttach(), 0);
   }
 }
 

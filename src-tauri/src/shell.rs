@@ -1,9 +1,10 @@
-//! Window policy and the only IPC command the bundled connection page can call.
+//! Window policy and IPC boundaries for the bundled connection page and daemon client.
 //!
 //! The window is either on the bundled connection page (local `tauri://localhost`)
-//! or on the daemon origin (`http://127.0.0.1:<port>`). Tauri only lets the
-//! local origin reach this app's commands, and `connect` re-checks the caller's
-//! URL, so the remote daemon page never gets shell privileges.
+//! or on the daemon origin (`http://127.0.0.1:<port>`). The bundled page receives
+//! core APIs; the loopback daemon page receives only the separately scoped
+//! notification plugin permissions. `connect` re-checks its caller's URL before
+//! using the shell command, so remote content gets no other shell privileges.
 
 use tauri::webview::NewWindowResponse;
 use tauri::{AppHandle, Manager, Runtime, WebviewWindow, WebviewWindowBuilder};

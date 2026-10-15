@@ -96,7 +96,8 @@ spawns a real omp fork and is labeled as such.
   *(Shipped flow differs: the client uploads the image to `POST /api/paste`, the daemon stores it and types the
   path into the pane. The `0x16` chord and side-panel blob previews were not built.)*
 - **Notifications**: extension events → daemon → desktop notification + web-push to the existing PWA (reuse `notifications.ts`).
-  *(Not implemented in this daemon; desktop notifications remain open work, and Web Push lives in the mobile gateway.)*
+  *(Shipped: desktop clients poll authoritative completion identities and send opt-in native/browser notifications;
+  Web Push remains in the mobile gateway. Desktop notification settings are in the sidebar Settings panel.)*
 
 ## 6. PTY/daemon engineering rules (from the research)
 
@@ -130,7 +131,8 @@ read/write client (prompt, abort, model, view panes), matching the "shared live"
 | **P4 polish** | app-side image previews, fork action, layout undo (dockkit-style ops), retire zellij wrappers | zellij unused for a week |
 
 *Shipped status (README is authoritative): P0/P1 done. P2 partial — durable ledger, workspace mirror and restore
-are shipped; the repository does not install a systemd unit, and notifications/idle unload are not. P3 shipped as
+are shipped, along with opt-in desktop completion notifications; the repository does not install a systemd unit,
+and idle unload is not shipped. P3 shipped as
 a single Tauri 2 window (no tray/autostart). P4 not started.*
 
 ## 10. Risks
