@@ -50,3 +50,9 @@ secrets/
 *~
 *.swp
 *.swo
+
+# Local promotional production tooling; published media remains tracked.
+/scripts/render-demo.ts
+/scripts/launch-film/
+/docs/media/
+/docs/images/
