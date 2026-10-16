@@ -794,20 +794,19 @@ body.session-dragging * {
   white-space: nowrap;
 }
 
-/* Overlay actions reserve title space only when visible. Keyboard focus and
-   pinned cards keep the controls visible without clipping the title beneath them. */
+/* Fixed action slots keep pins aligned across live/recent cards and prevent
+   hover or retained keyboard focus from shifting the title. */
 .row-actions {
   position: absolute;
   top: 7px;
   right: 9px;
-  display: flex;
+  display: grid;
+  grid-template-columns: 22px 22px;
   align-items: center;
   gap: 3px;
 }
 
-.row:hover .name,
-.row:focus-within .name,
-.row:has(.pin[aria-pressed="true"]) .name {
+.row .name {
   padding-right: 48px;
 }
 
@@ -826,6 +825,8 @@ body.session-dragging * {
 }
 
 .row .pin {
+  grid-column: 2;
+  grid-row: 1;
   display: inline-grid;
   place-items: center;
   width: 22px;
@@ -848,6 +849,10 @@ body.session-dragging * {
 }
 
 .row .kill {
+  grid-column: 1;
+  grid-row: 1;
+  width: 22px;
+  height: 22px;
   font-size: 12px;
 }
 

@@ -245,6 +245,8 @@ same 1×1 → 1×2 → 2×2 splits. Drag a pane header onto another tab to move 
 onto a tab to open it there. Space selection, layouts and focused panes persist in browser storage and the
 daemon workspace mirror. Hidden spaces keep their sessions running. The daemon's runtime limit applies
 across all spaces (`OMP_DESKTOP_MAX_RUNTIMES`, default 8), not separately to each tab.
+While dragging a sidebar session or pane header, moving over a space tab reveals that space immediately.
+Continue into its visible layout to drop onto a specific pane, or release on the tab for the tab's default placement.
 The **+** sits immediately after the tabs. A tab's **×** appears on hover or keyboard focus.
 Closing a space removes its pane views but leaves sessions running and available in the sidebar.
 Closing the active space selects its next neighbor (or the previous one at the end); closing the last
@@ -262,6 +264,14 @@ On attachment, panes consume the replay at the runtime's reported terminal size 
 current split. This preserves right-edge characters in cursor-positioned TUI output; resize notifications
 wait until xterm has parsed the replay.
 
+**Clipboard paste.** Ctrl/Cmd+V (and Ctrl+Shift+V) is handled by the WebView rather than forwarded
+as a control character to the child process. Image paste events are captured before xterm's text-only
+handler. In the native shell, WebKitGTK may supply an empty event for an image; the client then reads
+the image through the async Clipboard API, uploads it, and inserts its saved path exactly once.
+Ordinary text keeps xterm's bracketed-paste handling. Clipboard permission failures are reported in
+the status area. OS clipboard conversion and omp's subsequent attachment decoding remain separate
+from the local upload, so large images can still take longer.
+
 **File drops.** Drop one or more files onto a terminal pane to insert quoted paths without submitting.
 The native window uses original filesystem paths for any file type, including videos, images and JSON,
 without uploading their contents. Browser file URI lists can also supply paths; when browser security hides
@@ -271,6 +281,8 @@ Image fallback retains the paste endpoint's supported formats and 32 MiB limit.
 
 **Panes.** Right-click any pane for the layout-wide split action; the first use turns 1×1 into 1×2, the next
 splits both columns into 2×2, and at four panes the action is disabled. Closing a pane never stops its session.
+Each newly added pane starts a fresh session; existing panes retain their sessions. New sessions count toward
+the daemon-wide runtime limit; if creation fails, the added pane stays empty and the status reports the error.
 In a 2×2 grid, closing one pane keeps the quadrant as an empty slot with **new session here** (select or drag
 a sidebar session into it); closing a second occupied pane collapses back to two side-by-side panes. Switch
 sessions by focusing a pane and clicking a sidebar session, or drag a session onto a pane; drag a pane header
@@ -302,6 +314,10 @@ the recent-session limit. Session ages and ordering use the last user/assistant 
 modification time or terminal output. Loaded sessions (the daemon pool counted by the bottom **live** status)
 have grey backgrounds; alive processes also show the CLI's per-session accent. Working sits at the lower
 right of the card; a small green corner dot marks a finished turn without taking space from the title.
+Selecting the session or focusing its pane clears that turn's dot in the current window. Polling does not
+restore an acknowledged dot; a newly completed turn shows it again.
+Card actions use fixed slots: the pin is always rightmost, with the live-session stop button immediately
+to its left. Hover and keyboard focus reveal controls without moving pins or changing title space.
 The sidebar gear replaces the list with **Settings**, leaving terminal panes untouched; **Back** or Escape
 returns to the list. Settings contains **View: Sessions / Folders**, **Motion: System / On / Off**,
 **Completions: Off / On**, and **Keyboard shortcuts**.
