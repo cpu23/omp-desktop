@@ -258,6 +258,10 @@ without any attached terminal, and replays its bounded output tail when a view r
 stopping a session in the sidebar terminates it. A daemon restart can resume transcripts, but cannot recover
 an in-flight provider request or unsaved input.
 
+On attachment, panes consume the replay at the runtime's reported terminal size before fitting to the
+current split. This preserves right-edge characters in cursor-positioned TUI output; resize notifications
+wait until xterm has parsed the replay.
+
 **File drops.** Drop one or more files onto a terminal pane to insert quoted paths without submitting.
 The native window uses original filesystem paths for any file type, including videos, images and JSON,
 without uploading their contents. Browser file URI lists can also supply paths; when browser security hides

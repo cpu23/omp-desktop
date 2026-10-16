@@ -464,6 +464,7 @@ class Pane {
   #stateEl: HTMLElement;
   #observer: ResizeObserver;
   #resizeTimer: number | undefined;
+  #replaying = false;
   #selectionEvents = new AbortController();
   #selectionRevision = 0;
   #disposeFileDrop: (() => void) | null = null;
@@ -657,14 +658,14 @@ class Pane {
 
   /** Fit only when laid out: fitting a display:none pane computes garbage sizes. */
   fitPane(): void {
-    if (!this.visible) return;
+    if (!this.visible || this.#replaying) return;
     this.#fitGrid();
     this.sendResize();
   }
 
   /** Restore pixels after this terminal's DOM was detached and reattached. */
   refreshAfterAttach(): void {
-    if (!this.visible) return;
+    if (!this.visible || this.#replaying) return;
     this.#fitGrid();
     // Another view of this runtime may have changed the PTY's geometry while
     // this space was hidden. Reassert it even if our own grid did not change.
@@ -692,7 +693,7 @@ class Pane {
   }
 
   sendResize(force = false): void {
-    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    if (this.#replaying || this.ws?.readyState !== WebSocket.OPEN) return;
     const size = `${this.term.cols}x${this.term.rows}`;
     if (!force && size === this.#lastSent) return;
     this.#lastSent = size;
@@ -715,6 +716,7 @@ class Pane {
     this.retry = Number.POSITIVE_INFINITY;
     const socket = this.ws;
     this.ws = null;
+    this.#replaying = false;
     socket?.close();
   }
 
@@ -734,6 +736,13 @@ class Pane {
     const socket = new WebSocket(`${proto}://${location.host}/ws/term?runtime=${encodeURIComponent(runtimeId)}`);
     socket.binaryType = "arraybuffer";
     this.ws = socket;
+    this.#replaying = true;
+    let replayBytes = 0;
+    const finishReplay = () => {
+      if (this.ws !== socket) return;
+      this.#replaying = false;
+      this.refreshAfterAttach();
+    };
     socket.onopen = () => {
       if (this.ws !== socket) return;
       this.term.reset();
@@ -744,22 +753,32 @@ class Pane {
       // Attached means live under the daemon that answered this open.
       this.binding.autoResume = true;
       this.binding.daemonGeneration = daemonId;
-      // Detached spaces keep their terminal stream but must not resize a live
-      // PTY to stale geometry while the view is hidden.
-      if (this.visible) {
-        this.sendResize(true);
-        this.fitPane();
-      }
       if (layout.focused === this.id && this.visible) this.term.focus();
       save();
     };
     socket.onmessage = (event) => {
       if (this.ws !== socket) return;
       if (typeof event.data === "string") {
+        const message = parseServerMessage(event.data);
+        if (message?.type === "hello") {
+          // TUI replay contains absolute cursor moves and may disable wrapping.
+          // Parse it at the producer's size before fitting the restored pane.
+          this.term.resize(message.runtime.cols, message.runtime.rows);
+          replayBytes = message.replayBytes;
+          if (replayBytes === 0) finishReplay();
+        }
         this.#handleControl(event.data);
         return;
       }
-      if (event.data instanceof ArrayBuffer) this.term.write(new Uint8Array(event.data));
+      if (event.data instanceof ArrayBuffer) {
+        const bytes = new Uint8Array(event.data);
+        if (this.#replaying) {
+          replayBytes -= bytes.byteLength;
+          this.term.write(bytes, replayBytes <= 0 ? finishReplay : undefined);
+        } else {
+          this.term.write(bytes);
+        }
+      }
     };
     socket.onclose = () => {
       if (this.ws !== socket) return;
