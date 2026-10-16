@@ -29,7 +29,6 @@ const SHIMMER_PADDING = 10;
 const SHIMMER_BAND_HALF_WIDTH = 6;
 const TIER_HIGH = 0.65;
 const TIER_MID = 0.22;
-const WORKING_TEXT = "Working…";
 
 /** App-local working-indicator motion choice; see the file header. */
 export const MOTION_KEY = "omp-desktop.motion.v1";
@@ -78,21 +77,20 @@ function shimmerTier(time: number, index: number, length: number): 0 | 1 | 2 {
   return intensity >= TIER_HIGH ? 2 : intensity >= TIER_MID ? 1 : 0;
 }
 
-/** Braille spinner + shimmering "Working…", tinted by the row's --row-accent. */
-export function workingIndicator(): HTMLElement {
+/** Braille spinner + shimmering session title, tinted by the row's --row-accent. */
+export function workingIndicator(title: string): HTMLElement {
   const wrap = document.createElement("span");
   wrap.className = "row-working";
   const spinner = document.createElement("span");
   spinner.className = "working-spinner";
   spinner.setAttribute("aria-hidden", "true");
   spinner.textContent = SPINNER_FRAMES[0];
-  // Characters are wrapped once and only their tier changes per frame,
-  // mirroring OMP's run-coalesced ANSI. The glyphs concatenate to real text, so
-  // a screen reader reads "Working…" without a live region re-announcing it on
-  // every sidebar refresh.
+  wrap.setAttribute("aria-label", `${title} — Working`);
+  // Wrap once; animation updates only intensity tiers, not the sidebar tree.
   const shimmer = document.createElement("span");
-  shimmer.className = "shimmer shimmer-accent";
-  for (const char of WORKING_TEXT) {
+  shimmer.className = "title shimmer shimmer-accent";
+  shimmer.setAttribute("aria-hidden", "true");
+  for (const char of title) {
     const glyph = document.createElement("span");
     glyph.className = "shimmer-char";
     glyph.dataset.tier = "0";

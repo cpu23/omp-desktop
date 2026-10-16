@@ -719,32 +719,19 @@ body.session-dragging * {
   white-space: nowrap;
 }
 
-/* Status comes from authoritative extension state, never PTY byte traffic.
-   Keep Working on the subtitle line so it does not squeeze the session title. */
+/* Status comes from authoritative extension state, never PTY byte traffic. */
 .row-working {
-  position: absolute;
-  right: 9px;
-  bottom: 7px;
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  flex: 0 0 auto;
+  min-width: 0;
+  max-width: 100%;
   color: var(--row-accent, #808080);
-  font: 500 11px var(--mono);
-}
-
-.row:has(.row-working) {
-  min-height: 49px;
-}
-
-.row:has(.row-working) .sub {
-  margin-right: 90px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  font: inherit;
 }
 
 .row-working .working-spinner {
+  flex: 0 0 auto;
   color: var(--row-accent, #808080);
 }
 

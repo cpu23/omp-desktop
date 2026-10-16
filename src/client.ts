@@ -1464,18 +1464,22 @@ function acknowledgeCompletion(runtimeId: string | null): boolean {
  * answering, so a missing presentation shows no indicator at all. Working wins
  * while the next turn runs; selecting a session acknowledges its finished turn.
  */
-function runtimeIndicator(runtime: RuntimeInfo): HTMLElement | null {
+function runtimeIndicator(runtime: RuntimeInfo, title: string): HTMLElement | null {
   const presentation = runtime.presentation;
   if (!daemonUp || !runtime.alive || !presentation) return null;
-  if (presentation.agentActive) return workingIndicator();
+  if (presentation.agentActive) return workingIndicator(title);
   return presentation.completion &&
     acknowledgedCompletions.get(runtime.id) !== presentation.completion.identity ? doneIndicator() : null;
 }
 
-/** Row heading: title plus the authoritative working/done badge, mobile-style. */
+/** Working titles include their spinner; completed titles keep their marker. */
 function rowName(title: string, status: HTMLElement | null): HTMLElement {
   const name = document.createElement("span");
   name.className = "name";
+  if (status?.classList.contains("row-working")) {
+    name.append(status);
+    return name;
+  }
   const label = document.createElement("span");
   label.className = "title";
   label.textContent = title;
@@ -1562,7 +1566,7 @@ function renderSidebar(): void {
     row.style.setProperty("--row-accent", runtimeAccent(runtime));
     row.title = `${cwd}\n${runtime.sessionFile ?? "(session file not known yet)"}\n${runtime.id}`;
     const ownerId = paneForRuntime.get(runtime.id);
-    const name = rowName(title, runtimeIndicator(runtime));
+    const name = rowName(title, runtimeIndicator(runtime, title));
     const sub = document.createElement("span");
     sub.className = "sub";
     sub.textContent = ownerId ? ownerId.replace("p", "pane ") : folderView ? "" : cwd.replace(/^\/home\/[^/]+/, "~");

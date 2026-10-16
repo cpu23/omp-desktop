@@ -102,6 +102,8 @@ The sidebar lists live and saved sessions; it supports search, pins, session/fol
 notifications. Working/completion indicators and per-session accents come from the optional extension, not
 terminal output. Notifications default to off, require OS/browser permission, and are not replayed when reopening
 the app. Browsers deliver web notifications while the page is open; the native shell uses OS notifications.
+Working sessions show a spinner immediately before the shimmering session title, with no separate “Working…” label.
+The Motion setting still controls animation; long titles truncate without squeezing the subtitle.
 
 Default shortcuts:
 
