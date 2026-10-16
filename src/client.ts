@@ -122,6 +122,7 @@ let daemonId: string | null = null;
 let adoptPending = false;
 let adoptSeen = 0;
 const completionTracker = new CompletionTracker();
+const acknowledgedCompletions = new Map<string, string>();
 const completionNotifications = new CompletionNotifications(
   document.getElementById("notifications-toggle") as HTMLButtonElement,
   document.getElementById("notifications-status") as HTMLElement,
@@ -209,13 +210,17 @@ function wireSessionDrag(element: HTMLElement, payload: Record<string, unknown>)
     suppressClick = false;
     dragging = true;
     document.body.classList.add("session-dragging");
-    element.setPointerCapture(event.pointerId);
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", finish);
+    window.addEventListener("pointercancel", finish);
+    document.body.addEventListener("lostpointercapture", finish);
   });
-  element.addEventListener("pointermove", (event) => {
+  const move = (event: PointerEvent): void => {
     if (!origin || event.pointerId !== origin.pointer) return;
     if (!moved && Math.hypot(event.clientX - origin.x, event.clientY - origin.y) < 8) return;
     if (!moved) {
       moved = true;
+      document.body.setPointerCapture(event.pointerId);
       window.getSelection()?.removeAllRanges();
       for (const pane of panes.values()) pane.term.clearSelection();
       const rect = element.getBoundingClientRect();
@@ -234,13 +239,19 @@ function wireSessionDrag(element: HTMLElement, payload: Record<string, unknown>)
     }
     preview!.style.transform = `translate3d(${event.clientX - offsetX}px, ${event.clientY - offsetY}px, 0)`;
     event.preventDefault();
-    const hit = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>(".space-tab, .pane") ?? null;
+    let hit = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>(".space-tab, .pane") ?? null;
+    const spaceId = hit?.dataset.space;
+    if (spaceId && spaceId !== activeSpaceId) {
+      switchSpace(spaceId);
+      // Switching rebuilds tabs: highlight the replacement, not the detached tab.
+      hit = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>(".space-tab, .pane") ?? null;
+    }
     if (hit !== target) {
       target?.classList.remove("drop");
       target = hit;
       target?.classList.add("drop");
     }
-  });
+  };
   const finish = (event: PointerEvent): void => {
     if (!origin || event.pointerId !== origin.pointer) return;
     const destination = target;
@@ -249,11 +260,15 @@ function wireSessionDrag(element: HTMLElement, payload: Record<string, unknown>)
     target?.classList.remove("drop");
     target = null;
     origin = null;
+    window.removeEventListener("pointermove", move);
+    window.removeEventListener("pointerup", finish);
+    window.removeEventListener("pointercancel", finish);
+    document.body.removeEventListener("lostpointercapture", finish);
     preview?.remove();
     preview = null;
     element.classList.remove("session-drag-source");
     document.body.classList.remove("session-dragging");
-    if (element.hasPointerCapture(event.pointerId)) element.releasePointerCapture(event.pointerId);
+    if (document.body.hasPointerCapture(event.pointerId)) document.body.releasePointerCapture(event.pointerId);
     if (shouldDrop && destination) {
       event.preventDefault();
       if (destination.dataset.space) handleSpaceDrop(destination.dataset.space, payload);
@@ -262,9 +277,6 @@ function wireSessionDrag(element: HTMLElement, payload: Record<string, unknown>)
     dragging = false;
     if (renderPending) renderSidebar();
   };
-  element.addEventListener("pointerup", finish);
-  element.addEventListener("pointercancel", finish);
-  element.addEventListener("lostpointercapture", finish);
   element.addEventListener("click", (event) => {
     if (!suppressClick) return;
     suppressClick = false;
@@ -389,7 +401,7 @@ async function refreshSessions(): Promise<void> {
 }
 
 /** Uploads a pasted image; the daemon returns the path it stored it at. */
-async function uploadPaste(file: File): Promise<string | null> {
+async function uploadPaste(file: Blob): Promise<string | null> {
   try {
     const res = await fetch("/api/paste", { method: "POST", headers: { "content-type": file.type }, body: file });
     if (!res.ok) return null;
@@ -518,6 +530,11 @@ class Pane {
         selectionInactiveBackground: "#444444",
       },
     });
+    // Let the WebView deliver clipboard data instead of sending Ctrl+V (0x16)
+    // to omp, which would make the child read the OS clipboard itself.
+    this.term.attachCustomKeyEventHandler((event) =>
+      !((event.key === "v" || event.key === "V") && (event.ctrlKey || event.metaKey) && !event.altKey),
+    );
     // xterm paints OSC 8 file targets with a dashed underline even though its
     // default link handler cannot open them. Consume those links only; preserve
     // HTTP links and explicit SGR underlining in the transcript.
@@ -584,7 +601,9 @@ class Pane {
       onPaths: (paths) => insertFilePaths(this.ws, paths),
       upload: uploadPaste,
     });
-    this.el.addEventListener("paste", (event) => this.#handlePaste(event));
+    // xterm stops paste propagation at its textarea. Capture image files before
+    // that text-only handler can consume the event or emit an empty paste.
+    this.el.addEventListener("paste", (event) => this.#handlePaste(event), { capture: true });
     this.renderPlaceholder();
   }
 
@@ -609,9 +628,36 @@ class Pane {
     const item = Array.from(event.clipboardData?.items ?? []).find(
       (entry) => entry.kind === "file" && entry.type.startsWith("image/"),
     );
-    const file = item?.getAsFile();
-    if (!file) return; // plain text: xterm's own paste path handles it
+    let file: Blob | null = item?.getAsFile() ?? null;
+    // WebKitGTK can deliver an empty image paste event even though its async
+    // Clipboard API has image/png. Ordinary text stays on xterm's paste path.
+    const readNativeClipboard = !file && event.clipboardData?.types.length === 0 &&
+      "__TAURI_INTERNALS__" in window && typeof navigator.clipboard?.read === "function";
+    if (!file && !readNativeClipboard) return;
     event.preventDefault();
+    event.stopPropagation();
+    if (!file) {
+      setStatus("reading clipboard image…", "idle");
+      try {
+        const items = await navigator.clipboard.read();
+        for (const entry of items) {
+          const type = entry.types.find((type) => type.startsWith("image/"));
+          if (type) {
+            file = await entry.getType(type);
+            break;
+          }
+        }
+        if (!file) {
+          const text = items.find((entry) => entry.types.includes("text/plain"));
+          if (text) this.term.paste(await (await text.getType("text/plain")).text());
+          setStatus(text ? "text pasted" : "clipboard has no image or text", text ? "ok" : "warn");
+          return;
+        }
+      } catch {
+        setStatus("clipboard image access failed — try copying the image again", "warn");
+        return;
+      }
+    }
     setStatus("uploading image…", "idle");
     const path = await uploadPaste(file);
     if (!path) {
@@ -643,7 +689,8 @@ class Pane {
   focus(): void {
     const owner = spaceForPane(this.id);
     if (owner && owner.id !== activeSpaceId) switchSpace(owner.id);
-    if (layout.focused !== this.id) {
+    const acknowledged = acknowledgeCompletion(this.binding.runtimeId);
+    if (layout.focused !== this.id || acknowledged) {
       layout.focused = this.id;
       renderSidebar();
       save();
@@ -704,6 +751,7 @@ class Pane {
     const changed = this.binding.runtimeId !== binding.runtimeId;
     if (changed || !binding.runtimeId) this.detach();
     this.binding = binding;
+    acknowledgeCompletion(binding.runtimeId);
     this.renderPlaceholder();
     // Selecting the current session must not replay it or add another stream.
     if (binding.runtimeId && !this.ws) this.attach();
@@ -1045,14 +1093,11 @@ function gridLayout(tree: LayoutNode): LayoutNode {
 function splitLayout(): void {
   const tree = layout.tree;
   if (leaves(tree).length >= MAX_PANES) return;
-  const shown = new Set([...panes.values()].map((pane) => pane.binding.runtimeId).filter((id): id is string => id !== null));
+  const freshPanes: Pane[] = [];
   const split = (node: LayoutNode, dir: "row" | "col"): LayoutNode => {
     if (node.kind !== "leaf") return node;
-    const candidate = runtimes.find((runtime) => !shown.has(runtime.id));
-    if (candidate) shown.add(candidate.id);
-    const fresh = newPane(
-      candidate ? bindingForRuntime(candidate, daemonId, displayTitle(candidate)) : emptyBinding(),
-    );
+    const fresh = newPane(emptyBinding());
+    freshPanes.push(fresh);
     layout.focused = fresh.id;
     return { kind: "split", dir, ratio: 0.5, a: node, b: { kind: "leaf", pane: fresh.id } };
   };
@@ -1061,6 +1106,7 @@ function splitLayout(): void {
     : { ...tree, a: split(tree.a, "col"), b: split(tree.b, "col") };
   renderLayout();
   save();
+  for (const pane of freshPanes) void newSession(pane, false);
 }
 
 function closePane(paneId: string): void {
@@ -1402,18 +1448,28 @@ function runtimeAccent(runtime: RuntimeInfo): string {
   const accent = runtime.presentation?.accent;
   return typeof accent === "string" && ACCENT_HEX.test(accent) ? accent : ACCENT_FALLBACK;
 }
+/** Acknowledge this turn only; a later completion remains unread. */
+function acknowledgeCompletion(runtimeId: string | null): boolean {
+  if (!runtimeId) return false;
+  const identity = runtimes.find((runtime) => runtime.id === runtimeId)?.presentation?.completion?.identity;
+  if (!identity || acknowledgedCompletions.get(runtimeId) === identity) return false;
+  acknowledgedCompletions.set(runtimeId, identity);
+  return true;
+}
+
 
 /**
  * Working/Done come only from the extension's authoritative state
  * (`presentation`): PTY byte traffic says bytes moved, not that omp is
  * answering, so a missing presentation shows no indicator at all. Working wins
- * while the next turn runs; a finished turn keeps its Done badge until then.
+ * while the next turn runs; selecting a session acknowledges its finished turn.
  */
 function runtimeIndicator(runtime: RuntimeInfo): HTMLElement | null {
   const presentation = runtime.presentation;
   if (!daemonUp || !runtime.alive || !presentation) return null;
   if (presentation.agentActive) return workingIndicator();
-  return presentation.completion ? doneIndicator() : null;
+  return presentation.completion &&
+    acknowledgedCompletions.get(runtime.id) !== presentation.completion.identity ? doneIndicator() : null;
 }
 
 /** Row heading: title plus the authoritative working/done badge, mobile-style. */
@@ -1529,7 +1585,7 @@ function renderSidebar(): void {
       : null;
     const actions = document.createElement("div");
     actions.className = "row-actions";
-    actions.append(pinButton(snapshot), kill);
+    actions.append(kill, pinButton(snapshot));
     row.append(name, sub, actions);
     row.addEventListener("click", () => {
       const pane = focusedPane();
@@ -1629,11 +1685,13 @@ async function killRuntime(id: string): Promise<void> {
   await refreshRuntimes();
 }
 
-async function newSession(pane: Pane): Promise<void> {
+async function newSession(pane: Pane, focus = true): Promise<void> {
+  const binding = pane.binding;
   const { runtime } = await requestRuntime({});
-  if (!runtime) return;
+  // A pending creation must not replace a newer selection or revive a closed pane.
+  if (!runtime || panes.get(pane.id) !== pane || pane.binding !== binding) return;
   pane.bind(bindingForRuntime(runtime, daemonId, displayTitle(runtime)));
-  pane.focus();
+  if (focus) pane.focus();
 }
 
 /** Attach a saved session to a pane: reuse an attachable runtime for it if one exists, else resume. */
