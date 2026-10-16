@@ -283,6 +283,8 @@ Image fallback retains the paste endpoint's supported formats and 32 MiB limit.
 splits both columns into 2×2, and at four panes the action is disabled. Closing a pane never stops its session.
 Each newly added pane starts a fresh session; existing panes retain their sessions. New sessions count toward
 the daemon-wide runtime limit; if creation fails, the added pane stays empty and the status reports the error.
+If the pane is closed or assigned another session while creation is pending, the new session stays
+available in the sidebar instead of replacing the newer selection.
 In a 2×2 grid, closing one pane keeps the quadrant as an empty slot with **new session here** (select or drag
 a sidebar session into it); closing a second occupied pane collapses back to two side-by-side panes. Switch
 sessions by focusing a pane and clicking a sidebar session, or drag a session onto a pane; drag a pane header

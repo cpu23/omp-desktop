@@ -1686,8 +1686,10 @@ async function killRuntime(id: string): Promise<void> {
 }
 
 async function newSession(pane: Pane, focus = true): Promise<void> {
+  const binding = pane.binding;
   const { runtime } = await requestRuntime({});
-  if (!runtime) return;
+  // A pending creation must not replace a newer selection or revive a closed pane.
+  if (!runtime || panes.get(pane.id) !== pane || pane.binding !== binding) return;
   pane.bind(bindingForRuntime(runtime, daemonId, displayTitle(runtime)));
   if (focus) pane.focus();
 }
