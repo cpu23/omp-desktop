@@ -351,8 +351,22 @@ describe("daemon runtime settings", () => {
         expect(pending.status).toBe(409);
         expect(await pending.text()).toContain("after restart");
 
+        // Reattaching a transcript that is already live still reuses its
+        // process even though the pending limit is reached.
         const before = await runtimes();
         expect(before.runtimes).toHaveLength(1);
+        const reattached = await fetch(`${BASE}/api/runtimes`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ resume: f.transcripts[1] }),
+        });
+        expect(reattached.status).toBe(200);
+        const reattachedBody: unknown = await reattached.json();
+        expect(
+          isRecord(reattachedBody) && isRecord(reattachedBody.runtime) ? reattachedBody.runtime.id : null,
+        ).toBe(before.runtimes[0].id);
+        expect((await runtimes()).runtimes).toHaveLength(1);
+
         const restart = await fetch(`${BASE}/api/restart`, { method: "POST" });
         expect(restart.status).toBe(202);
         const restarted = await waitForGeneration(before.generation);
@@ -362,6 +376,73 @@ describe("daemon runtime settings", () => {
           effectiveMaxRuntimes: 1,
           restartRequired: false,
         });
+      } finally {
+        await f.cleanup();
+      }
+    },
+    60_000,
+  );
+
+  test(
+    "a pending lower limit caps fresh allocations that have no transcript yet",
+    async () => {
+      const f = fixture();
+      try {
+        await startDaemon({ ...f.env, OMP_DESKTOP_MAX_RUNTIMES: "2" });
+        const lowered = await putSettings({ maxRuntimes: 1 });
+        expect(lowered.status).toBe(200);
+        expect(await lowered.json()).toEqual({
+          maxRuntimes: 1,
+          effectiveMaxRuntimes: 2,
+          restartRequired: true,
+        });
+
+        // A fresh runtime has no transcript until omp announces one, so
+        // liveSessions() would not see it; the pending limit must count the
+        // allocation itself or every POST would pass and a restart would drop
+        // all but one.
+        const first = await fetch(`${BASE}/api/runtimes`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({}),
+        });
+        expect(first.status).toBe(200);
+        const firstBody: unknown = await first.json();
+        if (!isRecord(firstBody) || !isRecord(firstBody.runtime)) {
+          throw new Error(`bad runtime payload: ${JSON.stringify(firstBody)}`);
+        }
+        const created = firstBody.runtime;
+        if (typeof created.id !== "string") throw new Error("runtime id missing");
+        // A fresh runtime has no transcript until omp announces one.
+        expect(created.sessionFile).toBeNull();
+        const firstId = created.id;
+
+        const second = await fetch(`${BASE}/api/runtimes`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({}),
+        });
+        expect(second.status).toBe(409);
+        const message = await second.text();
+        expect(message).toContain("session limit reached");
+        expect(message).toContain("1/1");
+        expect(message).toContain("after restart");
+        expect((await runtimes()).runtimes).toHaveLength(1);
+
+        // Concurrent asks meet the same allocation boundary: exactly one may
+        // reserve the single pending slot, the other is refused.
+        expect((await fetch(`${BASE}/api/runtimes/${firstId}`, { method: "DELETE" })).status).toBe(200);
+        const attempts = await Promise.all(
+          Array.from({ length: 2 }, () =>
+            fetch(`${BASE}/api/runtimes`, {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({}),
+            }),
+          ),
+        );
+        expect(attempts.map((res) => res.status).sort()).toEqual([200, 409]);
+        expect((await runtimes()).runtimes).toHaveLength(1);
       } finally {
         await f.cleanup();
       }

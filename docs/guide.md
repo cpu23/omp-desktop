@@ -57,6 +57,9 @@ answers, it starts an existing `omp-desktopd` systemd user unit, if present; it 
 that unit. Otherwise run `bun run start` yourself. A custom port requires a daemon already running on that port.
 Closing the window leaves sessions running. Browser and native webview storage are separate, but both use the
 same daemon and its workspace mirror.
+A requested restart is delegated to `systemctl --user restart` only when this process is the main program of the
+detected user unit (`MainPID` matches); a daemon merely running inside a terminal that belongs to a service
+restarts itself instead of that service. Set `OMP_DESKTOP_SYSTEMD_UNIT` to force a unit name explicitly.
 
 On Wayland with NVIDIA and a local XWayland socket, the shell prefers `GDK_BACKEND=x11,wayland` (X11 first);
 any explicit non-empty `GDK_BACKEND` value overrides this preference. Close and reopen the app after changing it.
@@ -117,6 +120,9 @@ Set a custom **Session limit** in Settings. The limit is shared by all windows a
 daemon, not just the browser profile. A saved change that differs from the running limit shows **Restart now**;
 restart when current work has finished. Restarting interrupts running work and loses unsaved input, then resumes
 recorded sessions from their transcripts. Reverting the setting to the running value removes the restart prompt.
+While a lowered change awaits that restart, the daemon already refuses new sessions beyond the saved limit —
+session-less allocations included — so the restart cannot silently drop one. Reattaching a session that is
+already live is unaffected.
 When capacity is reached, the error explains the limit: stop an unused session or increase the limit in Settings.
 
 Default shortcuts:
@@ -143,6 +149,7 @@ All variables are optional. Defaults below assume a single-user machine.
 | `OMP_DESKTOP_HOST` | `127.0.0.1` | Daemon listen address; keep it on loopback because the API has no authentication. |
 | `OMP_DESKTOP_PORT` | `4180` | Daemon and native-shell port. |
 | `OMP_DESKTOP_MAX_RUNTIMES` | `16` | Initial process limit across all spaces; a custom limit saved in Settings takes precedence. |
+| `OMP_DESKTOP_SYSTEMD_UNIT` | auto-detected | Unit the daemon delegates its restart to; set explicitly for unusual unit names or non-user services (bypasses the `MainPID` ownership check). |
 | `OMP_DESKTOP_CWD` | `$HOME` | New-session directory and fallback if a resumed transcript's recorded directory is gone. |
 | `OMP_DESKTOP_OMP` | `omp` | OMP executable. |
 | `OMP_DESKTOP_OMP_ARGS` | empty | Extra space-separated executable arguments. |

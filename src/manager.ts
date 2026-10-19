@@ -36,6 +36,31 @@ export type ManagerDefaults = {
 export class RuntimeCapacityError extends Error {}
 
 /**
+ * A create refused because the saved lower limit that awaits restart is already
+ * fully allocated. Distinct from {@link RuntimeCapacityError} so the daemon can
+ * explain that the saved limit, not the running one, is what blocks the call.
+ */
+export class PendingRuntimeCapacityError extends RuntimeCapacityError {
+  /** The saved limit this create was checked against. */
+  readonly limit: number;
+
+  constructor(limit: number) {
+    super(`runtime limit reached after restart (${limit})`);
+    this.limit = limit;
+  }
+}
+
+/** Per-create limits that must be enforced at the allocation point. */
+export type CreateOptions = {
+  /**
+   * A saved runtime limit lower than the one this daemon enforces until it
+   * restarts. Checked at the same post-transcript-read boundary as the pool
+   * limit, so concurrent requests cannot all pass a pre-check and then exceed it.
+   */
+  maxRuntimes?: number;
+};
+
+/**
  * Why the pool changed. The distinction matters to the durable record: a start
  * or a stop is a deliberate, finished statement and is saved at once, while an
  * exit is a process death whose cause the daemon cannot see — during a unit
@@ -98,6 +123,21 @@ export class RuntimeManager {
     return () => this.#changeSubs.delete(sub);
   }
 
+  /**
+   * Every allocation in the pool whose process has not exited: resumed
+   * sessions, fresh sessions whose transcript omp has not announced yet, and
+   * idle runtimes waiting for a pane. Unlike `liveSessions()`, this does not
+   * dedupe by transcript or drop unbound runtimes, so a capacity guard built on
+   * it cannot let two fresh sessions past a lower saved limit.
+   */
+  allocated(): number {
+    let count = 0;
+    for (const runtime of this.#runtimes.values()) {
+      if (runtime.status !== "exited") count += 1;
+    }
+    return count;
+  }
+
   #changed(change: PoolChange): void {
     for (const sub of this.#changeSubs) sub(change);
   }
@@ -113,7 +153,7 @@ export class RuntimeManager {
     runtime.subscribeSessionFile(() => changed("started"));
   }
 
-  async create(request: SpawnRequest = {}): Promise<Runtime> {
+  async create(request: SpawnRequest = {}, options: CreateOptions = {}): Promise<Runtime> {
     const resume = request.resume;
     if (resume) {
       // Idempotent resume: a transcript already running (or being started right
@@ -130,7 +170,7 @@ export class RuntimeManager {
         return existing;
       }
     }
-    const creation = this.#spawn(request);
+    const creation = this.#spawn(request, options.maxRuntimes);
     if (resume) {
       this.#pendingResumes.set(resume, creation);
       // Clear the slot once the attempt settles, failed or not: a later caller
@@ -144,12 +184,19 @@ export class RuntimeManager {
     return creation;
   }
 
-  async #spawn(request: SpawnRequest): Promise<Runtime> {
+  async #spawn(request: SpawnRequest, pendingLimit?: number): Promise<Runtime> {
     const cwd = await this.#workingDirectory(request);
     // Check after the async transcript read: concurrent resume requests must
     // not all reserve the same final slot while that read is in flight.
     if (this.#runtimes.size >= this.defaults.maxRuntimes) {
       throw new RuntimeCapacityError(`runtime limit reached (${this.defaults.maxRuntimes})`);
+    }
+    // A saved lower limit is pending until restart; the check must happen at
+    // this same allocation point, or sequential fresh requests could each pass
+    // a pre-check and then all reserve slots. Fresh runtimes have no transcript
+    // yet, so this counts allocations, not `liveSessions()`.
+    if (pendingLimit !== undefined && this.allocated() >= pendingLimit) {
+      throw new PendingRuntimeCapacityError(pendingLimit);
     }
     // UUIDs, not a counter: the id is the mobile extension's IPC identity and
     // survives a daemon restart. A reused `rt-1` would let a stale phone page

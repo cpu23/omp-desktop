@@ -3,7 +3,7 @@ import { basename, isAbsolute, join, resolve } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { RuntimeManager, RuntimeCapacityError } from "./manager";
+import { RuntimeManager, RuntimeCapacityError, PendingRuntimeCapacityError } from "./manager";
 import { listSessions, readSessionCwd } from "./sessions";
 import { isRecord } from "./guards";
 import { parseClientMessage, type RuntimeInfo, type RuntimesResponse, type ServerMessage } from "./protocol";
@@ -15,6 +15,7 @@ import {
   resolveMaxRuntimes,
   settingsPayload,
 } from "./settings";
+import { activeSystemdUnit } from "./systemd";
 import type { Runtime } from "./runtime";
 
 const HOST = process.env.OMP_DESKTOP_HOST ?? "127.0.0.1";
@@ -231,53 +232,6 @@ const GENERATION = crypto.randomUUID();
 let shuttingDown = false;
 /** Set once POST /api/restart accepts; a second request must not spawn a second daemon. */
 let restartScheduled = false;
-
-/**
- * The systemd user unit this process is the main program of, if any.
- *
- * `INVOCATION_ID` is inherited by every descendant of a unit, so finding it is
- * not enough: a daemon started from a terminal inside a session has it too, and
- * restarting that session's unit would be destructive. Auto-detection therefore
- * requires the cgroup's own `.service` component *and* a matching
- * `InvocationID` from systemd. `OMP_DESKTOP_SYSTEMD_UNIT` is the explicit
- * escape hatch for unusual unit names or non-user services.
- */
-function activeSystemdUnit(): string | null {
-  const explicit = process.env.OMP_DESKTOP_SYSTEMD_UNIT?.trim();
-  if (explicit) return explicit;
-  const invocation = process.env.INVOCATION_ID;
-  if (!invocation) return null;
-  let unit: string | null = null;
-  try {
-    const cgroup = readFileSync("/proc/self/cgroup", "utf8");
-    for (const line of cgroup.split("\n")) {
-      if (line.trim().length === 0) continue;
-      // cgroup v2 is `0::/path`; v1 lines end in `:<controller>:/path`.
-      const path = line.slice(line.lastIndexOf(":") + 1);
-      const candidate = path
-        .split("/")
-        .filter((part) => part.endsWith(".service") && !part.startsWith("user@") && !part.startsWith("systemd-"))
-        .at(-1);
-      if (candidate) {
-        unit = candidate;
-        break;
-      }
-    }
-  } catch {
-    return null;
-  }
-  if (!unit) return null;
-  try {
-    const shown = Bun.spawnSync(["systemctl", "--user", "show", "-p", "InvocationID", "--value", unit], {
-      stdout: "pipe",
-      stderr: "ignore",
-    });
-    if (shown.exitCode !== 0 || shown.stdout.toString().trim() !== invocation) return null;
-  } catch {
-    return null;
-  }
-  return unit;
-}
 
 /**
  * Start a replacement daemon process for `POST /api/restart` when this process
@@ -545,32 +499,32 @@ const server = Bun.serve<WsData>({
           }
         }
         try {
-          // A saved lower limit is pending until restart, but the running daemon
-          // still has the old, larger allocation. Do not let the pool grow past
+          // A saved lower limit is pending until restart, while this process
+          // still enforces the old, larger one. Do not let the pool grow past
           // the pending limit: otherwise a later restart would restore more
           // sessions than the saved limit allows and silently drop the excess.
-          // Resuming a transcript that is already live is still allowed (it
-          // reuses that process, and manager.create dedupes it).
-          if (desiredMaxRuntimes < EFFECTIVE_MAX_RUNTIMES) {
-            const alreadyLive =
-              resume !== undefined &&
-              manager.list().some((info) => info.sessionFile === resume && info.status !== "exited");
-            const live = manager.liveSessions().length;
-            if (!alreadyLive && live >= desiredMaxRuntimes) {
-              return new Response(
-                `session limit reached: ${live}/${desiredMaxRuntimes} sessions are allowed by the saved limit that takes effect after restart. Stop a session or raise the runtime limit in Settings.`,
-                { status: 409 },
-              );
-            }
-          }
-          const runtime = await manager.create({
-            cwd,
-            resume,
-            cols: typeof body.cols === "number" ? body.cols : undefined,
-            rows: typeof body.rows === "number" ? body.rows : undefined,
-          });
+          // The manager checks it at allocation time, after any async transcript
+          // read, so concurrent requests cannot all pass a pre-check. Resuming a
+          // transcript that is already live still reuses that process (and is
+          // therefore allowed even at the limit).
+          const runtime = await manager.create(
+            {
+              cwd,
+              resume,
+              cols: typeof body.cols === "number" ? body.cols : undefined,
+              rows: typeof body.rows === "number" ? body.rows : undefined,
+            },
+            desiredMaxRuntimes < EFFECTIVE_MAX_RUNTIMES ? { maxRuntimes: desiredMaxRuntimes } : {},
+          );
           return Response.json({ runtime: runtime.info() }, { headers: NO_STORE });
         } catch (error) {
+          if (error instanceof PendingRuntimeCapacityError) {
+            const inUse = manager.allocated();
+            return new Response(
+              `session limit reached: ${inUse}/${error.limit} sessions are allowed by the saved limit that takes effect after restart. Stop a session or raise the runtime limit in Settings.`,
+              { status: 409 },
+            );
+          }
           if (error instanceof RuntimeCapacityError) {
             const inUse = manager.list().length;
             return new Response(
