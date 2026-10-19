@@ -15,7 +15,7 @@ import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { RuntimeManager } from "./manager";
+import { RuntimeManager, PendingRuntimeCapacityError } from "./manager";
 
 const dir = mkdtempSync(join(tmpdir(), "omp-manager-test-"));
 const waitingOmp = join(dir, "fake-omp");
@@ -147,7 +147,48 @@ describe("durable pool snapshots", () => {
     exited.write("\n");
     await waitFor(() => exited.status === "exited", "the stand-in omp to exit");
     unsubscribe();
-    // The kinds matter: only "exited" is provisional for the durable record.
+    // kinds matter: only "exited" is provisional for the durable record.
     expect(changes).toEqual(["started", "stopped", "started", "exited"]);
+  });
+
+  test("a pending lower limit counts allocations, including transcript-less runtimes", async () => {
+    const pool = manager();
+    // A fresh runtime is a real allocation (an omp process is coming) even
+    // though nothing knows its transcript yet.
+    await pool.create({});
+    expect(pool.liveSessions()).toEqual([]);
+    expect(pool.allocated()).toBe(1);
+
+    let refused: unknown;
+    try {
+      await pool.create({}, { maxRuntimes: 1 });
+    } catch (error) {
+      refused = error;
+    }
+    expect(refused).toBeInstanceOf(PendingRuntimeCapacityError);
+    expect(pool.list()).toHaveLength(1);
+  });
+
+  test("concurrent creates cannot both pass a pending lower limit", async () => {
+    const pool = manager();
+    const settled = await Promise.allSettled([
+      pool.create({}, { maxRuntimes: 1 }),
+      pool.create({}, { maxRuntimes: 1 }),
+    ]);
+    const fulfilled = settled.filter((result) => result.status === "fulfilled");
+    const rejected = settled.filter((result) => result.status === "rejected");
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect((rejected[0] as PromiseRejectedResult).reason).toBeInstanceOf(PendingRuntimeCapacityError);
+    expect(pool.allocated()).toBe(1);
+  });
+
+  test("an exited runtime no longer counts against a pending lower limit", async () => {
+    const pool = manager();
+    const runtime = await pool.create({ resume: transcript });
+    expect(pool.allocated()).toBe(1);
+    runtime.write("\n");
+    await waitFor(() => runtime.status === "exited", "the stand-in omp to exit");
+    expect(pool.allocated()).toBe(0);
   });
 });

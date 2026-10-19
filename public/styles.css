@@ -487,6 +487,104 @@ select:focus-visible {
   outline-offset: 1px;
 }
 
+/* Session limit control (Settings → Session limit), wired by
+   src/runtime-limit.ts. It borrows the other settings rows' shape: a small
+   heading, one-line help, an input row, and a status line under it. The restart
+   block only appears when the daemon reports the saved limit cannot apply yet,
+   so it is boxed and warn-coloured to stand out from the passive rows. */
+.runtime-limit {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 12px;
+}
+
+.runtime-limit h3 {
+  margin: 0;
+  font: 700 12px var(--mono);
+}
+
+.runtime-limit-help {
+  margin: 0;
+  color: var(--muted);
+  font: 10px/1.5 var(--mono);
+}
+
+.runtime-limit-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.runtime-limit-row input {
+  width: 100%;
+  min-width: 0;
+  padding: 5px 7px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font: 10px var(--mono);
+}
+
+.runtime-limit-row input:focus {
+  border-color: var(--effort-accent);
+  outline: 0;
+}
+
+.runtime-limit-row button,
+.runtime-limit-restart button {
+  flex: 0 0 auto;
+  padding: 5px 7px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-raised);
+  color: var(--muted);
+  font: 10px var(--mono);
+  cursor: pointer;
+  transition:
+    border-color 0.15s ease,
+    color 0.15s ease;
+}
+
+.runtime-limit-row button:hover:enabled,
+.runtime-limit-restart button:hover:enabled {
+  border-color: var(--dim);
+  color: var(--text);
+}
+
+.runtime-limit-row button:disabled,
+.runtime-limit-restart button:disabled,
+.runtime-limit-row input:disabled {
+  color: var(--dim);
+  cursor: default;
+}
+
+.runtime-limit-restart {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--warn);
+  border-radius: 8px;
+}
+
+.runtime-limit-restart[hidden] {
+  display: none;
+}
+
+.runtime-limit-restart button {
+  align-self: flex-start;
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+.runtime-limit-warn {
+  margin: 0;
+  color: var(--warn);
+  font: 10px/1.5 var(--mono);
+}
+
 .shortcut-settings {
   display: flex;
   flex-direction: column;
@@ -1028,10 +1126,36 @@ body.session-dragging * {
 }
 
 .pane-body {
+  position: relative;
   flex: 1 1 auto;
   min-height: 0;
   overflow: hidden;
   background: var(--bg);
+}
+
+.pane-jump-latest {
+  position: absolute;
+  right: 18px;
+  bottom: 18px;
+  z-index: 5;
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--panel-raised);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.pane-jump-latest[hidden] { display: none; }
+
+.pane-jump-latest:hover,
+.pane-jump-latest:focus-visible {
+  border-color: var(--effort-accent);
+  color: var(--effort-accent);
 }
 
 /* The xterm element is height:100% of its parent, so the parent (this host) needs
@@ -1087,6 +1211,14 @@ body.session-dragging * {
   color: var(--muted);
   font: 12px var(--mono);
   text-align: center;
+}
+
+/* Why a start/resume was refused (a full pool, a transcript the daemon will not
+   reopen): the daemon's own sentence, warn-coloured, above the retry buttons. */
+.pane-notice {
+  max-width: 60ch;
+  color: var(--warn);
+  font: 12px/1.5 var(--mono);
 }
 
 .pane-placeholder button {

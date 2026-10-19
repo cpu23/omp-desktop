@@ -14,6 +14,7 @@
  * overwrite the stored intent; a shrinking window just clamps the display.
  */
 import { syncWorkingAnimation } from "./working-indicator";
+import { syncRuntimeLimit } from "./runtime-limit";
 
 export const STORE_KEY = "omp-desktop.sidebar.v1";
 /** Default width and the fallback in #sidebar's flex-basis; keep the two in sync. */
@@ -155,6 +156,9 @@ function init(): void {
     settingsOpen.setAttribute("aria-expanded", String(show));
     (show ? settingsBack : settingsOpen).focus();
     syncWorkingAnimation();
+    // The panel shows daemon-owned values (the session limit), so opening it
+    // re-reads them instead of trusting what was true when the page loaded.
+    if (show) void syncRuntimeLimit();
   }
 
   settingsOpen.addEventListener("click", () => showSettings(true));
