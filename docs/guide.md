@@ -80,9 +80,17 @@ finish their current work before the restart.
 
 Spaces, focus and pane layouts are stored in the browser profile and mirrored in the daemon's workspace state.
 Browser and native profiles do not share local settings, but the daemon workspace mirror can restore layout,
-pins and settings if webview storage is lost. The live-process limit is shared across spaces (default eight).
+pins and settings if webview storage is lost. The live-process limit is shared across spaces (default 16).
 The client bundle and stylesheet are built at daemon startup; restart the daemon to apply changes, which also
 ends its PTY children. Recorded sessions resume on its next start.
+When scrolled at least one screen above the latest output, a double-down-chevron button appears in the pane.
+Click **Jump to latest** to return to the bottom and focus the terminal.
+
+History browsing stays above OMP's mutable live screen so streaming redraws cannot overwrite the lower half
+of a scrolled viewport. Scrolling up from live output moves back at least one screen; scrolling down into the
+live region returns to latest. Until a full screen of committed history exists, the pane stays live.
+Output continues to be parsed while reading history; it is not paused or discarded.
+The terminal uses Unicode 15 grapheme widths so emoji and joined emoji occupy the same table columns as OMP.
 
 ### Clipboard and file drops
 
@@ -104,6 +112,12 @@ terminal output. Notifications default to off, require OS/browser permission, an
 the app. Browsers deliver web notifications while the page is open; the native shell uses OS notifications.
 Working sessions show a spinner immediately before the shimmering session title, with no separate “Working…” label.
 The Motion setting still controls animation; long titles truncate without squeezing the subtitle.
+
+Set a custom **Session limit** in Settings. The limit is shared by all windows and spaces and is saved by the
+daemon, not just the browser profile. A saved change that differs from the running limit shows **Restart now**;
+restart when current work has finished. Restarting interrupts running work and loses unsaved input, then resumes
+recorded sessions from their transcripts. Reverting the setting to the running value removes the restart prompt.
+When capacity is reached, the error explains the limit: stop an unused session or increase the limit in Settings.
 
 Default shortcuts:
 
@@ -128,7 +142,7 @@ All variables are optional. Defaults below assume a single-user machine.
 | --- | --- | --- |
 | `OMP_DESKTOP_HOST` | `127.0.0.1` | Daemon listen address; keep it on loopback because the API has no authentication. |
 | `OMP_DESKTOP_PORT` | `4180` | Daemon and native-shell port. |
-| `OMP_DESKTOP_MAX_RUNTIMES` | `8` | Maximum live OMP processes across all spaces. |
+| `OMP_DESKTOP_MAX_RUNTIMES` | `16` | Initial process limit across all spaces; a custom limit saved in Settings takes precedence. |
 | `OMP_DESKTOP_CWD` | `$HOME` | New-session directory and fallback if a resumed transcript's recorded directory is gone. |
 | `OMP_DESKTOP_OMP` | `omp` | OMP executable. |
 | `OMP_DESKTOP_OMP_ARGS` | empty | Extra space-separated executable arguments. |
@@ -138,6 +152,7 @@ All variables are optional. Defaults below assume a single-user machine.
 | `OMP_DESKTOP_STATE_DIR` | `$XDG_STATE_HOME/omp-desktop` or `~/.local/state/omp-desktop` | Directory for durable workspace state and session ledger. |
 | `OMP_DESKTOP_STATE_FILE` | `<state dir>/state.json` | Explicit workspace-state path; overrides the directory for this file. |
 | `OMP_DESKTOP_LEDGER_FILE` | `<state dir>/sessions.json` | Explicit durable live-session ledger path. |
+| `OMP_DESKTOP_SETTINGS_FILE` | `<state dir>/settings.json` | Daemon-owned custom session limit, shared by browser and native windows. |
 | `OMP_DESKTOP_EXTENSION` | `../omp-mobile/extension.ts` | Optional OMP extension path; empty or missing disables structured mobile state. |
 | `OMP_MOBILE_IPC_DIR` | `~/.local/state/omp-mobile` | Per-runtime extension socket directory. |
 | `OMP_MOBILE_IPC_TOKEN` / `OMP_MOBILE_TOKEN` | unset | Shared socket token; if unset, the token file is used. |

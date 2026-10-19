@@ -1,4 +1,5 @@
 import { trimSelectionHighlight } from "./selection";
+import { protectScrollback } from "./scrollback";
 import {
   applySidebarState, onSidebarStateChange, sidebarFolderView, sidebarFolderExpanded,
   toggleSidebarFolder, STORE_KEY as SIDEBAR_KEY,
@@ -7,6 +8,7 @@ import { doneIndicator, syncWorkingAnimation, workingIndicator } from "./working
 import { CompletionTracker } from "./completion-tracker";
 import { CompletionNotifications } from "./notifications";
 import { Terminal } from "@xterm/xterm";
+import { UnicodeGraphemesAddon } from "@xterm/addon-unicode-graphemes";
 import { ImageAddon } from "@xterm/addon-image";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { repairWebglCanvasResize } from "./webgl-resize";
@@ -14,6 +16,7 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { isRecord } from "./guards";
 import { insertFilePaths, wireFileDrop } from "./file-drop";
 import { initializeHotkeys } from "./hotkeys";
+import { syncRuntimeLimit } from "./runtime-limit";
 import {
   attachable,
   bindingForRuntime,
@@ -335,6 +338,9 @@ async function refreshRuntimes(options: { restore?: boolean } = {}): Promise<boo
     adoptPending = true;
     adoptSeen = 0;
   }
+  // A new generation (or the first answer) also means a limit saved before a
+  // restart is in effect now, so the Settings panel re-reads it here.
+  if (previousGeneration === null || daemonId !== previousGeneration) void syncRuntimeLimit();
   runtimes = payload.runtimes;
   completionTracker.observe(runtimes, (runtime) => {
     void completionNotifications.notifyCompletion(runtime.id, displayTitle(runtime));
@@ -363,12 +369,14 @@ async function refreshRuntimes(options: { restore?: boolean } = {}): Promise<boo
 /**
  * POST /api/runtimes with its HTTP status kept: a 400 is the daemon refusing a
  * transcript (gone or not under the session store) and must end a pane's resume
- * claim, while a transport or capacity failure is retried later.
+ * claim, while a transport or capacity failure is retried later. A refusal also
+ * carries the daemon's own explanation (a full pool names the limit and what to
+ * change), which callers show instead of an opaque status code.
  */
 async function requestRuntime(
   request: { cwd?: string; resume?: string },
   notify = true,
-): Promise<{ runtime: RuntimeInfo | null; status: number | null }> {
+): Promise<{ runtime: RuntimeInfo | null; status: number | null; error: string | null }> {
   let res: Response;
   try {
     res = await fetch("/api/runtimes", {
@@ -377,17 +385,19 @@ async function requestRuntime(
       body: JSON.stringify(request),
     });
   } catch {
-    return { runtime: null, status: null };
+    return { runtime: null, status: null, error: null };
   }
   if (!res.ok) {
-    if (notify) setStatus(`/api/runtimes → ${res.status}`, "warn");
-    return { runtime: null, status: res.status };
+    const body = (await res.text().catch(() => "")).trim();
+    const error = body || `the daemon refused the request (HTTP ${res.status})`;
+    if (notify) setStatus(error, "warn");
+    return { runtime: null, status: res.status, error };
   }
   const runtime = parseRuntimeOne(await res.json().catch(() => null));
-  if (!runtime) return { runtime: null, status: res.status };
+  if (!runtime) return { runtime: null, status: res.status, error: null };
   runtimes = [...runtimes.filter((candidate) => candidate.id !== runtime.id), runtime];
   renderSidebar();
-  return { runtime, status: res.status };
+  return { runtime, status: res.status, error: null };
 }
 
 async function refreshSessions(): Promise<void> {
@@ -472,13 +482,17 @@ class Pane {
   #body: HTMLElement;
   #host: HTMLElement;
   #placeholder: HTMLElement;
+  #jumpLatest: HTMLButtonElement;
   #titleEl: HTMLElement;
   #stateEl: HTMLElement;
   #observer: ResizeObserver;
   #resizeTimer: number | undefined;
   #replaying = false;
+  /** Start/resume refusal (e.g. a full pool) shown until the pane binds again. */
+  #notice: string | null = null;
   #selectionEvents = new AbortController();
   #selectionRevision = 0;
+  #disposeScrollback: (() => void) | null = null;
   #disposeFileDrop: (() => void) | null = null;
 
   constructor(id: string, binding: PaneBinding) {
@@ -512,6 +526,18 @@ class Pane {
     this.#placeholder = document.createElement("div");
     this.#placeholder.className = "pane-placeholder";
     this.#body.append(this.#placeholder, this.#host);
+    this.#jumpLatest = document.createElement("button");
+    this.#jumpLatest.className = "pane-jump-latest";
+    this.#jumpLatest.innerHTML = '<svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="m6 6 6 6 6-6M6 12l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+    this.#jumpLatest.title = "Jump to latest";
+    this.#jumpLatest.setAttribute("aria-label", "Jump to latest");
+    this.#jumpLatest.hidden = true;
+    this.#jumpLatest.addEventListener("click", () => {
+      this.term.scrollToBottom();
+      this.#syncJumpLatest();
+      this.focus();
+    });
+    this.#body.append(this.#jumpLatest);
 
     this.term = new Terminal({
       allowProposedApi: true,
@@ -544,7 +570,9 @@ class Pane {
     });
     this.term.open(this.#host);
     trimSelectionHighlight(this.term);
+    this.term.loadAddon(new UnicodeGraphemesAddon());
     const rendererWarning = document.createElement("span");
+    this.#disposeScrollback = protectScrollback(this.term);
     rendererWarning.textContent = "DOM";
     rendererWarning.title = "GPU renderer unavailable: box and block glyphs may have seams";
     const showRendererWarning = () => {
@@ -572,6 +600,10 @@ class Pane {
       if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: "input", data }));
     });
     this.term.onSelectionChange(() => { this.#selectionRevision++; });
+    this.term.onScroll(() => this.#syncJumpLatest());
+    this.term.onWriteParsed(() => this.#syncJumpLatest());
+    this.term.onResize(() => this.#syncJumpLatest());
+    this.term.buffer.onBufferChange(() => this.#syncJumpLatest());
 
     // Copy the completed selection, not every intermediate mousemove. Listening
     // on window also handles a drag released outside the terminal.
@@ -605,6 +637,12 @@ class Pane {
     // that text-only handler can consume the event or emit an empty paste.
     this.el.addEventListener("paste", (event) => this.#handlePaste(event), { capture: true });
     this.renderPlaceholder();
+  }
+
+  #syncJumpLatest(): void {
+    const buffer = this.term.buffer.active;
+    this.#jumpLatest.hidden = !this.binding.runtimeId ||
+      buffer.type !== "normal" || buffer.baseY - buffer.viewportY < this.term.rows;
   }
 
   get visible(): boolean {
@@ -751,6 +789,7 @@ class Pane {
     const changed = this.binding.runtimeId !== binding.runtimeId;
     if (changed || !binding.runtimeId) this.detach();
     this.binding = binding;
+    this.#notice = null;
     acknowledgeCompletion(binding.runtimeId);
     this.renderPlaceholder();
     // Selecting the current session must not replay it or add another stream.
@@ -949,6 +988,7 @@ class Pane {
 
   renderPlaceholder(): void {
     this.#placeholder.replaceChildren();
+    this.#syncJumpLatest();
     if (this.binding.runtimeId) {
       this.#placeholder.style.display = "none";
       this.#host.style.display = "";
@@ -960,6 +1000,15 @@ class Pane {
     text.textContent = this.binding.title
       ? `${this.binding.title} — not running`
       : "empty pane — choose a session from the sidebar or start one";
+    this.#placeholder.append(text);
+    if (this.#notice) {
+      // The daemon's own words (e.g. the pool is full and where to change the
+      // limit), kept next to the buttons that can retry it.
+      const notice = document.createElement("div");
+      notice.className = "pane-notice";
+      notice.textContent = this.#notice;
+      this.#placeholder.append(notice);
+    }
     const row = document.createElement("div");
     row.style.display = "flex";
     row.style.gap = "8px";
@@ -983,11 +1032,23 @@ class Pane {
     start.textContent = "new session here";
     start.addEventListener("click", () => void newSession(this));
     row.append(start);
-    this.#placeholder.append(text, row);
+    this.#placeholder.append(row);
+  }
+
+  /**
+   * Record why starting or resuming a session in this pane failed, so the reason
+   * (e.g. the pool is full) survives the next status-chip refresh. Only the
+   * placeholder can show it; a bound pane reports through the status chip.
+   */
+  showStartFailure(text: string): void {
+    if (this.binding.runtimeId) return;
+    this.#notice = text;
+    this.renderPlaceholder();
   }
 
   destroy(): void {
     this.#selectionEvents.abort();
+    this.#disposeScrollback?.();
     this.#observer.disconnect();
     this.#disposeFileDrop?.();
     this.#disposeFileDrop = null;
@@ -1691,9 +1752,15 @@ async function killRuntime(id: string): Promise<void> {
 
 async function newSession(pane: Pane, focus = true): Promise<void> {
   const binding = pane.binding;
-  const { runtime } = await requestRuntime({});
+  const { runtime, error } = await requestRuntime({});
   // A pending creation must not replace a newer selection or revive a closed pane.
-  if (!runtime || panes.get(pane.id) !== pane || pane.binding !== binding) return;
+  if (panes.get(pane.id) !== pane || pane.binding !== binding) return;
+  if (!runtime) {
+    // Starting is where a full pool is felt, so leave the daemon's reason in the
+    // pane that asked, not only in the truncated status chip.
+    if (error) pane.showStartFailure(error);
+    return;
+  }
   pane.bind(bindingForRuntime(runtime, daemonId, displayTitle(runtime)));
   if (focus) pane.focus();
 }
@@ -1707,8 +1774,12 @@ async function openSession(pane: Pane, session: { path: string; cwd: string; tit
     return;
   }
   setStatus("resuming…", "idle");
-  const { runtime } = await requestRuntime({ resume: session.path, cwd: session.cwd });
-  if (!runtime) return;
+  const binding = pane.binding;
+  const { runtime, error } = await requestRuntime({ resume: session.path, cwd: session.cwd });
+  if (!runtime) {
+    if (error && panes.get(pane.id) === pane && pane.binding === binding) pane.showStartFailure(error);
+    return;
+  }
   // Keep the requested transcript as the runtime's identity until omp sniffs
   // its own: a second click must adopt this runtime, not spawn a sibling.
   if (!runtime.sessionFile) runtime.sessionFile = session.path;
@@ -1758,7 +1829,7 @@ async function restoreWantedSessions(): Promise<void> {
       resumeAttempts.set(sessionFile, Date.now());
       const summary = sessionSummary(sessionFile);
       setStatus(`resuming ${summary?.title ?? sessionFile}…`, "idle");
-      const { runtime, status } = await requestRuntime({ resume: sessionFile, cwd: summary?.cwd ?? "" }, false);
+      const { runtime, status, error } = await requestRuntime({ resume: sessionFile, cwd: summary?.cwd ?? "" }, false);
       if (runtime) {
         resumeAttempts.delete(sessionFile);
         if (!runtime.sessionFile) runtime.sessionFile = sessionFile;
@@ -1771,6 +1842,10 @@ async function restoreWantedSessions(): Promise<void> {
         // manual resume in case the file comes back.
         resumeAttempts.delete(sessionFile);
         for (const pane of group()) pane.clearLiveIntent();
+      } else if (error) {
+        // Capacity (or another daemon refusal): the pane keeps its claim and the
+        // retry below runs again, but the user sees why nothing started here.
+        for (const pane of group()) pane.showStartFailure(error);
       }
     }
   } finally {
@@ -2120,10 +2195,15 @@ function setStatus(text: string, kind: "ok" | "warn" | "idle"): void {
   if (stateSaveError) {
     statusEl.textContent = stateSaveError;
     statusEl.dataset.kind = "warn";
+    statusEl.title = stateSaveError;
     return;
   }
   statusEl.textContent = text;
   statusEl.dataset.kind = kind;
+  // The chip is one sidebar line and truncates. Warnings carry the daemon's own
+  // explanation (a full pool, a refused session), so keep the whole text as the
+  // tooltip instead of losing the part that says what to do.
+  statusEl.title = kind === "warn" ? text : "";
 }
 
 // Never fit against fallback metrics: a pre-font fit leaves the bottom rows

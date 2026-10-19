@@ -9,10 +9,23 @@ import { isRecord } from "./guards";
 import { parseClientMessage, type RuntimeInfo, type RuntimesResponse, type ServerMessage } from "./protocol";
 import { PresentationReader } from "./presentation";
 import { STATE_LIMIT_BYTES, WorkspaceStateStore, RuntimeLedgerStore } from "./state";
+import {
+  DaemonSettingsStore,
+  isPositiveInteger,
+  resolveMaxRuntimes,
+  settingsPayload,
+} from "./settings";
 import type { Runtime } from "./runtime";
 
 const HOST = process.env.OMP_DESKTOP_HOST ?? "127.0.0.1";
 const PORT = Number(process.env.OMP_DESKTOP_PORT ?? 4180);
+/**
+ * Set when POST /api/restart started this process. Consume it before the
+ * manager snapshots `process.env` for its children, and wait for the previous
+ * daemon to release the port before serving (see waitForPreviousDaemon).
+ */
+const RESTART_PARENT = process.env.OMP_DESKTOP_RESTART_PARENT;
+delete process.env.OMP_DESKTOP_RESTART_PARENT;
 const ROOT = join(import.meta.dir, "..");
 const OMP_BIN = process.env.OMP_DESKTOP_OMP ?? "omp";
 const OMP_ARGS = (process.env.OMP_DESKTOP_OMP_ARGS ?? "").split(" ").filter((part) => part.length > 0);
@@ -23,7 +36,6 @@ const CWD = process.env.OMP_DESKTOP_CWD ?? process.env.HOME ?? process.cwd();
 // to force `symbolPreset: nerd`, which rewrote the status line with PUA icons the
 // user never chose.
 const OMP_OVERLAY = process.env.OMP_DESKTOP_OVERLAY ?? "";
-const MAX_RUNTIMES = Number(process.env.OMP_DESKTOP_MAX_RUNTIMES ?? 8);
 const SESSIONS_DIR =
   process.env.OMP_DESKTOP_SESSIONS_DIR ?? join(process.env.HOME ?? "", ".omp/agent/sessions");
 const SESSIONS_ROOT = resolve(SESSIONS_DIR);
@@ -51,6 +63,28 @@ const stateStore = new WorkspaceStateStore(STATE_FILE);
 // restart restores every session that was live — including ones no pane holds.
 const LEDGER_FILE = process.env.OMP_DESKTOP_LEDGER_FILE ?? join(STATE_DIR, "sessions.json");
 const ledger = new RuntimeLedgerStore(LEDGER_FILE);
+// The runtime limit is daemon-owned so it survives a browser-profile wipe, and
+// so the pool (including ledger restore) is bounded before any client connects.
+// A saved limit takes precedence over the deployment fallback; both must be
+// positive integers. This process enforces EFFECTIVE_MAX_RUNTIMES for its whole
+// life: a change through PUT /api/settings is persisted immediately but only
+// takes effect after POST /api/restart, which is what `restartRequired` reports.
+const SETTINGS_FILE = process.env.OMP_DESKTOP_SETTINGS_FILE ?? join(STATE_DIR, "settings.json");
+const settingsStore = new DaemonSettingsStore(SETTINGS_FILE);
+// A settings file that cannot be read must not keep the daemon (and the
+// sessions it restores) down; fall back to the environment/default limit.
+const savedSettings = await settingsStore.read().catch((error: unknown) => {
+  console.warn(
+    `omp-desktopd: could not read settings ${SETTINGS_FILE}: ${error instanceof Error ? error.message : String(error)}`,
+  );
+  return { maxRuntimes: null, malformed: false };
+});
+if (savedSettings.malformed) {
+  console.warn(`omp-desktopd: ignoring malformed settings file ${SETTINGS_FILE}`);
+}
+const initialLimit = resolveMaxRuntimes(savedSettings.maxRuntimes, process.env.OMP_DESKTOP_MAX_RUNTIMES);
+const EFFECTIVE_MAX_RUNTIMES = initialLimit.maxRuntimes;
+let desiredMaxRuntimes = initialLimit.maxRuntimes;
 // Empty OMP_DESKTOP_OVERLAY disables the overlay: non-omp binaries (smoke test's
 // bash) reject unknown flags.
 const OVERLAY_ARGS = OMP_OVERLAY ? ["--config", OMP_OVERLAY] : [];
@@ -105,7 +139,7 @@ const manager = new RuntimeManager({
   cwd: CWD,
   cols: 120,
   rows: 32,
-  maxRuntimes: Number.isFinite(MAX_RUNTIMES) && MAX_RUNTIMES > 0 ? MAX_RUNTIMES : 8,
+  maxRuntimes: EFFECTIVE_MAX_RUNTIMES,
   // Resume works in the directory recorded in the transcript, never the daemon's
   // launch dir (see RuntimeManager.#workingDirectory).
   readResumeCwd: readSessionCwd,
@@ -195,13 +229,167 @@ function validResume(path: string | undefined): string | null {
 const GENERATION = crypto.randomUUID();
 
 let shuttingDown = false;
+/** Set once POST /api/restart accepts; a second request must not spawn a second daemon. */
+let restartScheduled = false;
+
+/**
+ * The systemd user unit this process is the main program of, if any.
+ *
+ * `INVOCATION_ID` is inherited by every descendant of a unit, so finding it is
+ * not enough: a daemon started from a terminal inside a session has it too, and
+ * restarting that session's unit would be destructive. Auto-detection therefore
+ * requires the cgroup's own `.service` component *and* a matching
+ * `InvocationID` from systemd. `OMP_DESKTOP_SYSTEMD_UNIT` is the explicit
+ * escape hatch for unusual unit names or non-user services.
+ */
+function activeSystemdUnit(): string | null {
+  const explicit = process.env.OMP_DESKTOP_SYSTEMD_UNIT?.trim();
+  if (explicit) return explicit;
+  const invocation = process.env.INVOCATION_ID;
+  if (!invocation) return null;
+  let unit: string | null = null;
+  try {
+    const cgroup = readFileSync("/proc/self/cgroup", "utf8");
+    for (const line of cgroup.split("\n")) {
+      if (line.trim().length === 0) continue;
+      // cgroup v2 is `0::/path`; v1 lines end in `:<controller>:/path`.
+      const path = line.slice(line.lastIndexOf(":") + 1);
+      const candidate = path
+        .split("/")
+        .filter((part) => part.endsWith(".service") && !part.startsWith("user@") && !part.startsWith("systemd-"))
+        .at(-1);
+      if (candidate) {
+        unit = candidate;
+        break;
+      }
+    }
+  } catch {
+    return null;
+  }
+  if (!unit) return null;
+  try {
+    const shown = Bun.spawnSync(["systemctl", "--user", "show", "-p", "InvocationID", "--value", unit], {
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    if (shown.exitCode !== 0 || shown.stdout.toString().trim() !== invocation) return null;
+  } catch {
+    return null;
+  }
+  return unit;
+}
+
+/**
+ * Start a replacement daemon process for `POST /api/restart` when this process
+ * was not started by systemd. The child waits for this PID to disappear before
+ * binding the port (see {@link waitForPreviousDaemon}), so it can be spawned
+ * while the request is still being served.
+ */
+function spawnReplacement(): void {
+  const script = process.argv.slice(1);
+  if (script.length === 0) throw new Error("cannot determine the daemon entrypoint from process.argv");
+  const child = Bun.spawn({
+    cmd: [process.execPath, ...script],
+    cwd: process.cwd(),
+    env: { ...process.env, OMP_DESKTOP_RESTART_PARENT: String(process.pid) },
+    stdin: "ignore",
+    stdout: "inherit",
+    // Keep startup failures and logs visible in the terminal that ran the old
+    // daemon; the replacement otherwise runs independently.
+    stderr: "inherit",
+  });
+  child.unref();
+}
+
+/**
+ * A replacement daemon must not race the old one for the listening port. Wait
+ * (bounded) for the recorded parent to exit; the ledger is already on disk, so
+ * this delay never affects which sessions come back.
+ */
+async function waitForPreviousDaemon(): Promise<void> {
+  if (!RESTART_PARENT) return;
+  const pid = Number(RESTART_PARENT);
+  if (!Number.isInteger(pid) || pid <= 0) return;
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      // ESRCH is the expected answer once the previous daemon has exited;
+      // EPERM means it still exists (and we may not signal it).
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+    }
+    await Bun.sleep(25);
+  }
+  console.warn(`omp-desktopd: previous daemon ${pid} still appears to be running; starting anyway`);
+}
+
+/**
+ * Accept a restart. The response is returned first; shutdown (standalone) or
+ * `systemctl restart --no-block` (systemd) follows shortly after, so the
+ * caller sees the accepted result before the daemon disappears.
+ */
+function beginRestart(): Response {
+  console.log("omp-desktopd: restart requested");
+  const unit = activeSystemdUnit();
+  if (unit) {
+    restartScheduled = true;
+    setTimeout(() => {
+      try {
+        Bun.spawn({
+          cmd: ["systemctl", "--user", "--no-block", "restart", unit],
+          stdin: "ignore",
+          stdout: "ignore",
+          stderr: "ignore",
+        }).unref();
+        console.log(`omp-desktopd: restart delegated to systemctl --user restart ${unit}`);
+      } catch (error) {
+        restartScheduled = false;
+        console.warn(
+          `omp-desktopd: could not delegate restart to ${unit}: ${error instanceof Error ? error.message : String(error)}; this daemon keeps running`,
+        );
+      }
+    }, 200);
+    // A failed systemd job leaves this process alive but does not report back;
+    // let the user try again rather than claim "restart in progress" forever.
+    setTimeout(() => {
+      if (shuttingDown) return;
+      restartScheduled = false;
+      console.warn(`omp-desktopd: ${unit} did not restart this daemon; a new restart can be requested`);
+    }, 10_000);
+    return new Response(
+      `restarting omp-desktopd (${unit}); live sessions resume from the durable ledger`,
+      { status: 202 },
+    );
+  }
+  try {
+    spawnReplacement();
+  } catch (error) {
+    return new Response(
+      `restart failed: ${error instanceof Error ? error.message : String(error)}. The daemon is still running.`,
+      { status: 500 },
+    );
+  }
+  restartScheduled = true;
+  setTimeout(() => shutdown(0), 200);
+  return new Response("restarting omp-desktopd; live sessions resume from the durable ledger", {
+    status: 202,
+  });
+}
+
+await waitForPreviousDaemon();
 
 const server = Bun.serve<WsData>({
   hostname: HOST,
   port: PORT,
   async fetch(req, srv) {
     const url = new URL(req.url);
-    if (url.pathname === "/api/runtimes" || url.pathname === "/ws/term") {
+    if (
+      url.pathname === "/api/runtimes" ||
+      url.pathname === "/api/settings" ||
+      url.pathname === "/api/restart" ||
+      url.pathname === "/ws/term"
+    ) {
       await poolReady;
       if (shuttingDown) return new Response("daemon shutting down", { status: 503 });
     }
@@ -216,6 +404,57 @@ const server = Bun.serve<WsData>({
       return new Response(asset.body, { headers: { "content-type": asset.type, ...NO_STORE } });
     }
     switch (`${req.method} ${url.pathname}`) {
+      case "GET /api/settings":
+        return Response.json(settingsPayload(desiredMaxRuntimes, EFFECTIVE_MAX_RUNTIMES), {
+          headers: NO_STORE,
+        });
+      case "PUT /api/settings": {
+        const body: unknown = await req.json().catch(() => null);
+        if (!isRecord(body) || !isPositiveInteger(body.maxRuntimes)) {
+          return new Response(
+            "maxRuntimes must be a positive integer (for example 16); the current limit was not changed",
+            { status: 400 },
+          );
+        }
+        const maxRuntimes = body.maxRuntimes;
+        // Restore is bounded by the limit, so accepting a lower limit than the
+        // sessions that would come back would silently drop them on restart.
+        // Reject the save instead of letting a restart lose work.
+        const live = manager.liveSessions().length;
+        if (maxRuntimes < live) {
+          return new Response(
+            `cannot set the runtime limit to ${maxRuntimes}: ${live} live session(s) would not fit after a restart. Stop sessions first or choose at least ${live}.`,
+            { status: 400 },
+          );
+        }
+        try {
+          await settingsStore.save(maxRuntimes);
+        } catch (error) {
+          return new Response(
+            `settings save failed: ${error instanceof Error ? error.message : String(error)}`,
+            { status: 500 },
+          );
+        }
+        desiredMaxRuntimes = maxRuntimes;
+        return Response.json(settingsPayload(desiredMaxRuntimes, EFFECTIVE_MAX_RUNTIMES), {
+          headers: NO_STORE,
+        });
+      }
+      case "POST /api/restart": {
+        if (restartScheduled) {
+          return new Response("restart already in progress", { status: 409 });
+        }
+        // Defense in depth: a restart restores at most the saved limit. Never
+        // accept one that would leave live sessions behind.
+        const live = manager.liveSessions().length;
+        if (desiredMaxRuntimes < live) {
+          return new Response(
+            `cannot restart with a runtime limit of ${desiredMaxRuntimes}: ${live} live session(s) would not fit. Stop sessions first or raise the runtime limit in Settings.`,
+            { status: 409 },
+          );
+        }
+        return beginRestart();
+      }
       case "GET /api/build":
         return Response.json({ build: BUILD }, { headers: NO_STORE });
       case "GET /api/state": {
@@ -306,6 +545,24 @@ const server = Bun.serve<WsData>({
           }
         }
         try {
+          // A saved lower limit is pending until restart, but the running daemon
+          // still has the old, larger allocation. Do not let the pool grow past
+          // the pending limit: otherwise a later restart would restore more
+          // sessions than the saved limit allows and silently drop the excess.
+          // Resuming a transcript that is already live is still allowed (it
+          // reuses that process, and manager.create dedupes it).
+          if (desiredMaxRuntimes < EFFECTIVE_MAX_RUNTIMES) {
+            const alreadyLive =
+              resume !== undefined &&
+              manager.list().some((info) => info.sessionFile === resume && info.status !== "exited");
+            const live = manager.liveSessions().length;
+            if (!alreadyLive && live >= desiredMaxRuntimes) {
+              return new Response(
+                `session limit reached: ${live}/${desiredMaxRuntimes} sessions are allowed by the saved limit that takes effect after restart. Stop a session or raise the runtime limit in Settings.`,
+                { status: 409 },
+              );
+            }
+          }
           const runtime = await manager.create({
             cwd,
             resume,
@@ -314,7 +571,13 @@ const server = Bun.serve<WsData>({
           });
           return Response.json({ runtime: runtime.info() }, { headers: NO_STORE });
         } catch (error) {
-          if (error instanceof RuntimeCapacityError) return new Response(error.message, { status: 409 });
+          if (error instanceof RuntimeCapacityError) {
+            const inUse = manager.list().length;
+            return new Response(
+              `session limit reached: ${inUse}/${manager.defaults.maxRuntimes} runtime slots are in use. Stop a session or raise the runtime limit in Settings, then apply it with Restart now.`,
+              { status: 409 },
+            );
+          }
           throw error;
         }
       }
@@ -377,6 +640,16 @@ const server = Bun.serve<WsData>({
 console.log(`omp-desktopd listening on http://${HOST}:${server.port}`);
 console.log(`omp-desktopd workspace state: ${STATE_FILE}`);
 console.log(`omp-desktopd runtime ledger: ${LEDGER_FILE}`);
+console.log(`omp-desktopd settings: ${SETTINGS_FILE}`);
+console.log(
+  `omp-desktopd runtime limit: ${EFFECTIVE_MAX_RUNTIMES} (${
+    initialLimit.source === "saved"
+      ? "saved settings"
+      : initialLimit.source === "env"
+        ? "OMP_DESKTOP_MAX_RUNTIMES fallback"
+        : "default"
+  })`,
+);
 
 /**
  * Every pool change is a durable statement of what is running. The ledger is

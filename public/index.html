@@ -12,7 +12,8 @@
          so connection failures stay visible, and #build stays in the DOM (hidden)
          for the client's bundle-reload check. The resizer and collapsed-state
          expand control are wired by src/sidebar.ts; motion settings are wired
-         by src/working-indicator.ts. -->
+         by src/working-indicator.ts; the session limit is wired by
+         src/runtime-limit.ts. -->
     <div id="app">
       <aside id="sidebar">
         <div class="side-block side-search">
@@ -80,6 +81,42 @@
           <span id="notifications-status" class="motion-label" role="status" aria-live="polite">
             Completion notifications are off.
           </span>
+          <div class="runtime-limit" role="group" aria-label="Session limit">
+            <h3>Session limit</h3>
+            <p id="runtime-limit-help" class="runtime-limit-help">
+              How many omp sessions the daemon may run at once (16 by default). The daemon owns this
+              limit; a change that cannot apply to the running daemon needs a restart.
+            </p>
+            <div class="runtime-limit-row">
+              <label class="motion-label" for="runtime-limit-input">Max sessions</label>
+              <input
+                id="runtime-limit-input"
+                type="number"
+                inputmode="numeric"
+                min="1"
+                step="1"
+                value="16"
+                autocomplete="off"
+                aria-describedby="runtime-limit-help"
+              />
+              <button id="runtime-limit-save" type="button">Save</button>
+            </div>
+            <span id="runtime-limit-status" class="shortcut-message" role="status" aria-live="polite"></span>
+            <div id="runtime-limit-restart" class="runtime-limit-restart" hidden>
+              <p id="runtime-limit-restart-warning" class="runtime-limit-warn">
+                Restart to apply the saved limit. Restarting stops every running session: in-progress work and
+                unsaved input are lost. Sessions with a saved transcript resume automatically afterwards; their
+                running processes are not preserved.
+              </p>
+              <button
+                id="runtime-limit-restart-button"
+                type="button"
+                aria-describedby="runtime-limit-restart-warning"
+              >
+                Restart now
+              </button>
+            </div>
+          </div>
           <div class="shortcut-settings">
             <h3>Keyboard shortcuts</h3>
             <p class="shortcut-help">
