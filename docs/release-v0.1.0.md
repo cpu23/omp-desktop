@@ -14,6 +14,8 @@ setup, and security boundaries.
 - Snapshot/live-output handoff shares a parser boundary so output is neither skipped nor duplicated.
 - Removed forced scrollback snapping; scrolling now moves continuously, including near the live screen and with
   less than a screen of history.
+- Session titles use the full card width; stop/pin actions sit on the metadata line instead of reserving a
+  permanent gap beside the title.
 
 Apply these daemon and client changes only after active work finishes: restarting the daemon ends its PTY
 children. Existing transcript sessions resume on the next start; an already-discarded raw tail cannot be recovered
