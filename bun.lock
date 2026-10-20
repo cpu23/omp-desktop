@@ -23,6 +23,9 @@
       },
     },
   },
+  "patchedDependencies": {
+    "bun-pty@0.4.11": "patches/bun-pty@0.4.11.patch",
+  },
   "packages": {
     "@tauri-apps/api": ["@tauri-apps/api@2.12.4", "", {}, "sha512-pVmfis+4zT8H0Qhp3xPZx9Ju7kpzvA6rr/PSJPyuwfvucTQ8sVt61NYU9KMkK703UFlYadFmjKA4HhybOtN0gg=="],
 

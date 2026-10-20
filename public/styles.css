@@ -830,6 +830,8 @@ body.session-dragging * {
 
 .row-working .working-spinner {
   flex: 0 0 auto;
+  width: 1ch;
+  text-align: center;
   color: var(--row-accent, #808080);
 }
 
@@ -838,9 +840,11 @@ body.session-dragging * {
   --shimmer-high: var(--row-accent, #808080);
 }
 
-/* OMP's shimmer tiers: dim → muted → accent, with the hot tier bolded. */
+/* Keep terminal-like fixed geometry: the row already uses bold monospace.
+   Only colour changes between tiers; never invalidate text widths per tick. */
 .shimmer-char {
   color: var(--shimmer-low, var(--dim));
+  font-weight: 700;
 }
 
 .shimmer-char[data-tier="1"] {
@@ -849,7 +853,6 @@ body.session-dragging * {
 
 .shimmer-char[data-tier="2"] {
   color: var(--shimmer-high, var(--accent));
-  font-weight: 700;
 }
 
 .row-done {

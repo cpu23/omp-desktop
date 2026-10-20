@@ -7,12 +7,12 @@
  * snapshot follows the real lifecycle — a stop or an exit leaves the pool,
  * while a sniffed transcript joins it.
  *
- * `Runtime` spawns through a real PTY, so the tests use tiny stand-in binaries
- * that ignore omp's flags: one waits for a line and exits, one announces an
- * OSC 1337 session file like omp does.
+ * `Runtime` spawns through a real PTY. Most tests use tiny stand-in binaries
+ * that ignore omp's flags; the termination regression uses real interactive
+ * Bash children so cleanup is observable at the process level.
  */
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { RuntimeManager, PendingRuntimeCapacityError } from "./manager";
@@ -32,14 +32,14 @@ chmodSync(sniffingOmp, 0o755);
 
 const managers: RuntimeManager[] = [];
 
-function manager(file = waitingOmp): RuntimeManager {
+function manager(file = waitingOmp, args: string[] = []): RuntimeManager {
   const created = new RuntimeManager({
     file,
-    args: [],
+    args,
     cwd: dir,
     cols: 80,
     rows: 24,
-    env: { PATH: process.env.PATH ?? "/usr/bin:/bin", TERM: "xterm-256color" },
+    env: { HOME: dir, PATH: process.env.PATH ?? "/usr/bin:/bin", TERM: "xterm-256color" },
     maxRuntimes: 8,
   });
   managers.push(created);
@@ -57,8 +57,25 @@ async function waitFor(predicate: () => boolean, label: string): Promise<void> {
   throw new Error(`timed out waiting for ${label}`);
 }
 
-afterEach(() => {
-  for (const created of managers.splice(0)) created.killAll();
+function processExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+    throw error;
+  }
+}
+
+function linuxResourceCounts() {
+  return {
+    fds: readdirSync("/proc/self/fd").length,
+    threads: readdirSync("/proc/self/task").length,
+  };
+}
+
+afterEach(async () => {
+  await Promise.all(managers.splice(0).map((created) => created.killAll("SIGKILL")));
 });
 
 afterAll(() => {
@@ -105,6 +122,60 @@ describe("durable pool snapshots", () => {
     // A stopped transcript is started again only by a new explicit resume.
     const replacement = await pool.create({ resume: transcript });
     expect(replacement.id).not.toBe(runtime.id);
+  });
+
+  test.skipIf(process.platform === "win32")("interactive Bash children ignoring SIGTERM are reaped on stop and shutdown", async () => {
+    const pool = manager("/bin/bash", ["-i", "-c", "trap '' TERM; : > bash-ready-$$; read -r"]);
+    const stopped = await pool.create({});
+    const remaining = await pool.create({});
+    stopped.start();
+    remaining.start();
+    const stoppedPid = stopped.pid;
+    const remainingPid = remaining.pid;
+    if (stoppedPid === null || remainingPid === null) throw new Error("interactive Bash did not start");
+    await waitFor(
+      () =>
+        processExists(stoppedPid) &&
+        processExists(remainingPid) &&
+        existsSync(join(dir, `bash-ready-${stoppedPid}`)) &&
+        existsSync(join(dir, `bash-ready-${remainingPid}`)),
+      "interactive Bash children to install their SIGTERM traps",
+    );
+
+    expect(pool.kill(stopped.id)).toBe(true);
+    expect(pool.get(stopped.id)).toBeUndefined();
+    const shutdown = pool.killAll();
+    expect(pool.list()).toEqual([]);
+    await shutdown;
+
+    expect(stopped.status).toBe("exited");
+    expect(remaining.status).toBe("exited");
+    expect(processExists(stoppedPid)).toBe(false);
+    expect(processExists(remainingPid)).toBe(false);
+  });
+
+  test.skipIf(process.platform !== "linux")("PTY exit releases native handles and writer threads", async () => {
+    const pool = manager("/bin/sh", ["-c", "exit 0"]);
+    const warmup = await pool.create({});
+    warmup.start();
+    await waitFor(() => warmup.status === "exited", "warmup PTY child exit");
+    pool.kill(warmup.id);
+    const baseline = linuxResourceCounts();
+
+    for (let index = 0; index < 12; index += 1) {
+      const runtime = await pool.create({});
+      runtime.start();
+      await waitFor(() => runtime.status === "exited", `PTY child ${index + 1} exit`);
+      expect(pool.kill(runtime.id)).toBe(true);
+    }
+
+    await waitFor(() => {
+      const current = linuxResourceCounts();
+      return current.fds <= baseline.fds + 2 && current.threads <= baseline.threads + 2;
+    }, "native PTY resources to return to baseline");
+    const after = linuxResourceCounts();
+    expect(after.fds).toBeLessThanOrEqual(baseline.fds + 2);
+    expect(after.threads).toBeLessThanOrEqual(baseline.threads + 2);
   });
 
   test("an exited process leaves the pool; a later resume starts a replacement", async () => {

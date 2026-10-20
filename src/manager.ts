@@ -77,6 +77,8 @@ export type PoolChange = "started" | "stopped" | "exited";
  */
 export class RuntimeManager {
   #runtimes = new Map<string, Runtime>();
+  /** Keep removed runtimes reachable until their child and PTY cleanup settles. */
+  #stopping = new Set<Runtime>();
   /** Transcripts with a create in flight, so concurrent resumes share one process. */
   #pendingResumes = new Map<string, Promise<Runtime>>();
   /** Notified after any change to the set `liveSessions()` returns. */
@@ -272,20 +274,29 @@ export class RuntimeManager {
     const runtime = this.#runtimes.get(id);
     if (!runtime) return false;
     this.#runtimes.delete(id);
-    runtime.kill();
+    this.#stop(runtime, "SIGTERM");
     this.#changed("stopped");
     return true;
   }
 
+  #stop(runtime: Runtime, signal: NodeJS.Signals): Promise<void> {
+    this.#stopping.add(runtime);
+    const termination = runtime.kill(signal);
+    void termination.then(
+      () => this.#stopping.delete(runtime),
+      () => this.#stopping.delete(runtime),
+    );
+    return termination;
+  }
+
   /**
-   * Kill every process. Only a daemon shutdown calls this, and a shutdown is
-   * not the sessions ending: this method deliberately emits no change event, so
-   * the durable record keeps describing the pool the next daemon start must
-   * restore (the daemon freezes that record before calling this).
+   * Kill every live or still-stopping runtime. Daemon shutdown awaits this
+   * bounded cleanup, while explicit stops continue to leave the pool immediately.
    */
-  killAll(): void {
-    for (const runtime of this.#runtimes.values()) runtime.kill();
+  async killAll(signal: NodeJS.Signals = "SIGTERM"): Promise<void> {
+    const runtimes = [...this.#runtimes.values(), ...this.#stopping];
     this.#runtimes.clear();
+    await Promise.all(runtimes.map((runtime) => this.#stop(runtime, signal)));
   }
 }
 

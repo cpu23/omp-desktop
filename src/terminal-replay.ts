@@ -70,6 +70,8 @@ export class TerminalReplay {
   readonly #terminal: Terminal;
   readonly #serializer: SerializeAddon;
   readonly #images: ReplayImages;
+  // Reuse expensive scrollback serialization until parsed output or geometry changes.
+  #snapshotCache: Snapshot | undefined;
   #tasks: ReplayTask[] = [];
   #taskIndex = 0;
   #running = false;
@@ -118,6 +120,7 @@ export class TerminalReplay {
     this.#tasks = [];
     this.#taskIndex = 0;
     this.#running = false;
+    this.#snapshotCache = undefined;
     this.#images.dispose();
     this.#terminal.dispose();
   }
@@ -140,7 +143,10 @@ export class TerminalReplay {
       }
 
       if (task.type === "resize") {
-        this.#terminal.resize(task.cols, task.rows);
+        if (task.cols !== this.#terminal.cols || task.rows !== this.#terminal.rows) {
+          this.#snapshotCache = undefined;
+          this.#terminal.resize(task.cols, task.rows);
+        }
         continue;
       }
       if (task.type === "snapshot") {
@@ -148,6 +154,7 @@ export class TerminalReplay {
         return;
       }
 
+      this.#snapshotCache = undefined;
       const data = this.#images.prepare(task.data);
       this.#running = true;
       this.#terminal.write(data, () => {
@@ -180,6 +187,8 @@ export class TerminalReplay {
   }
 
   #takeSnapshot(): Snapshot {
+    if (this.#snapshotCache) return { ...this.#snapshotCache };
+
     const terminal = this.#terminal;
     const internal = (terminal as unknown as TerminalInternals)._core;
     const serialized = this.#serializer.serialize({ scrollback: SCROLLBACK_ROWS });
@@ -196,7 +205,9 @@ export class TerminalReplay {
       this.#cursorPositionSequence() +
       this.#cursorVisibilitySequence() +
       this.#images.pendingSequence();
-    return { data, cols: terminal.cols, rows: terminal.rows };
+    const snapshot = { data, cols: terminal.cols, rows: terminal.rows };
+    this.#snapshotCache = snapshot;
+    return { ...snapshot };
   }
 
   /** Restore DECSTBM before origin-mode cursor positioning. */

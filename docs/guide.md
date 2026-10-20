@@ -84,6 +84,12 @@ in-flight work or unsaved input cannot be restored. Each transcript has one live
 existing session reuses its process. On first upgrading from a daemon that predates the ledger, checkpoint its
 live pool with `bun run scripts/checkpoint-sessions.ts` before restarting. The command does not stop processes;
 finish their current work before the restart.
+Stopping a session allows 500 ms for graceful termination before forcing a still-owned child to exit.
+On Linux, process-group signals require a verified original PTY leader identity; if it cannot be verified,
+only the PTY child is targeted. Descendants that outlive their original leader cannot safely be force-killed
+by a potentially reused group ID. Daemon shutdown waits for bounded child cleanup as well as ledger writes.
+Bun's frozen-lockfile install applies the checked-in `bun-pty@0.4.11` patch automatically. It releases native
+PTY handles after genuine exits, preserving final output without synthesizing a second exit event.
 
 Spaces, focus and pane layouts are stored in the browser profile and mirrored in the daemon's workspace state.
 Browser and native profiles do not share local settings, but the daemon workspace mirror can restore layout,
@@ -98,6 +104,12 @@ of a scrolled viewport. Scrolling up from live output moves back at least one sc
 live region returns to latest. Until a full screen of committed history exists, the pane stays live.
 Output continues to be parsed while reading history; it is not paused or discarded.
 The terminal uses Unicode 15 grapheme widths so emoji and joined emoji occupy the same table columns as OMP.
+
+Terminal panes use WebGL on hardware and unknown renderers. Recognized software rasterizers (including
+SwiftShader and llvmpipe) use the existing DOM renderer instead; its **DOM** indicator warns that box/block
+glyphs may have seams. Masked or unavailable renderer information does not disable WebGL.
+Unchanged terminal snapshots are reused for subsequent attaches; new output or changed geometry invalidates
+the cache. This retains at most one serialized snapshot per runtime without reducing scrollback or image state.
 
 ### Clipboard and file drops
 
@@ -122,6 +134,13 @@ terminal output. Notifications default to off, require OS/browser permission, an
 the app. Browsers deliver web notifications while the page is open; the native shell uses OS notifications.
 Working sessions show a spinner immediately before the shimmering session title, with no separate “Working…” label.
 The Motion setting still controls animation; long titles truncate without squeezing the subtitle.
+The shimmer follows OMP's 30 Hz animation cadence and the spinner's 80 ms phase, with fixed bold monospace
+geometry. Hidden documents, collapsed rows and the settings view suspend animation; Motion **Off** freezes
+the shimmer. Cached glyph references avoid querying or measuring the DOM on every animation tick.
+
+Saved-session header, activity and cost caches each have an approximate 8 MiB budget. Listings still scan
+file metadata to detect new, changed, replaced and deleted transcripts; unchanged cached files do not need
+their contents reread. Activity ordering and search cover the complete store, not just the visible rows.
 
 Set a custom **Session limit** in Settings. The limit is shared by all windows and spaces and is saved by the
 daemon, not just the browser profile. A saved change that differs from the running limit shows **Restart now**;

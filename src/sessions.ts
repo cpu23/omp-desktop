@@ -18,10 +18,11 @@
  * each file's activity (with its header prefix), sort by activity, filter, apply
  * the limit, and only then read the survivors' full-file cost sums. Transcripts
  * reach far beyond 8 KiB and this is polled per sidebar refresh, so per-file
- * activity/cost results are memoized by (mtime, size) in bounded caches. Every
- * file is considered because mtime cannot bound activity: imported files and
- * clock skew can write messages newer than the file's last touch, and pruning by
- * mtime would hide such (or merely old-mtime matching) sessions.
+ * metadata/cost results are memoized by file identity, timestamps, and size in
+ * byte-bounded caches. Every file is considered because mtime cannot bound
+ * activity: imported files and clock skew can write messages newer than the
+ * file's last touch, and pruning by mtime would hide such (or merely old-mtime
+ * matching) sessions.
  *
  * Robustness: a missing/nonexistent root, unreadable file or directory, or a
  * truncated/malformed JSONL line must never abort the listing. The header is
@@ -36,7 +37,7 @@ import { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { isRecord } from "./guards";
 
 export type SessionSummary = {
@@ -75,17 +76,61 @@ const CONVERSATION_ROLES: Record<string, true> = { user: true, assistant: true }
 /** Bound directory, stat, summary, and cost work to avoid a poll-sized I/O burst. */
 const MAX_CONCURRENT_IO = 8;
 
-/** Per-file memoization cap: hot sessions survive, long-abandoned paths are evicted. */
-const CACHE_MAX_ENTRIES = 1024;
+/** Memory budget for each metadata/cost memo table; oversized entries are skipped. */
+const CACHE_MAX_BYTES = 8 * 1024 * 1024;
 
-/** Insertion-ordered cache: a write refreshes the key, the oldest entry is evicted beyond the cap. */
+type CacheState = { bytes: number; weights: Map<unknown, number> };
+const cacheStates = new WeakMap<object, CacheState>();
+
+/** Approximate retained bytes; these cache values contain only small metadata objects. */
+function approximateCacheBytes(value: unknown): number {
+  if (typeof value === "string") return value.length * 2;
+  if (typeof value !== "object" || value === null) return 8;
+  if (Array.isArray(value)) {
+    return 24 + value.reduce((total, item) => total + approximateCacheBytes(item), 0);
+  }
+  return 64 + Object.values(value).reduce((total, item) => total + approximateCacheBytes(item), 0);
+}
+
+function cacheDelete<K, V>(cache: Map<K, V>, key: K): void {
+  const state = cacheStates.get(cache);
+  const weight = state?.weights.get(key);
+  if (state && weight !== undefined) {
+    state.bytes -= weight;
+    state.weights.delete(key);
+  }
+  cache.delete(key);
+}
+
+/** Insertion-ordered LRU cache with a per-table byte budget. */
 function cacheSet<K, V>(cache: Map<K, V>, key: K, value: V): void {
+  let state = cacheStates.get(cache);
+  if (!state) {
+    state = { bytes: 0, weights: new Map() };
+    cacheStates.set(cache, state);
+  }
+  cacheDelete(cache, key);
+  const weight = 64 + approximateCacheBytes(key) + approximateCacheBytes(value);
+  if (weight > CACHE_MAX_BYTES) return;
+  while (state.bytes + weight > CACHE_MAX_BYTES) {
+    const oldest = cache.keys().next().value;
+    if (oldest === undefined) break;
+    cacheDelete(cache, oldest);
+  }
+  cache.set(key, value);
+  state.weights.set(key, weight);
+  state.bytes += weight;
+}
+
+/** Refresh an LRU hit without walking its small value to recalculate its weight. */
+function cacheTouch<K, V>(cache: Map<K, V>, key: K, value: V): void {
+  const state = cacheStates.get(cache);
+  if (!state?.weights.has(key)) {
+    cacheSet(cache, key, value);
+    return;
+  }
   cache.delete(key);
   cache.set(key, value);
-  if (cache.size > CACHE_MAX_ENTRIES) {
-    const oldest = cache.keys().next().value;
-    if (oldest !== undefined) cache.delete(oldest);
-  }
 }
 
 /** Run a collection of I/O tasks with fixed concurrency, preserving input order. */
@@ -103,22 +148,34 @@ async function mapConcurrent<T, R>(items: readonly T[], worker: (item: T) => Pro
   return results;
 }
 
+type FileVersion = { mtimeMs: number; bytes: number; ctimeMs: number; ino: number };
+type SessionFile = FileVersion & { path: string; dir: string; birthtimeMs: number };
+
+function hasSameVersion(cached: FileVersion, file: SessionFile): boolean {
+  return (
+    cached.mtimeMs === file.mtimeMs &&
+    cached.bytes === file.bytes &&
+    cached.ctimeMs === file.ctimeMs &&
+    cached.ino === file.ino
+  );
+}
+
 /**
  * Cost lives in per-message usage records spread across the whole transcript
  * (session cost is their sum, same accounting as omp's `get_session_stats`), so
  * unlike the 8 KiB header this has to read the file. This listing is polled per
- * sidebar refresh, so each transcript is summed once per (mtime, size) and the
+ * sidebar refresh, so each transcript is summed once per file version and the
  * result cached; unreadable files contribute 0.
  */
-const costCache = new Map<string, { mtimeMs: number; bytes: number; costUsd: number }>();
+const costCache = new Map<string, FileVersion & { costUsd: number }>();
 
 /** Matches a whole usage cost object, so a chunk boundary can never yield a partial number. */
 const COST_PATTERN = /"cost":\s*\{[^}]*?"total":\s*([0-9.eE+-]+)\s*\}/g;
 
 async function readCost(file: SessionFile): Promise<number> {
   const cached = costCache.get(file.path);
-  if (cached && cached.mtimeMs === file.mtimeMs && cached.bytes === file.bytes) {
-    cacheSet(costCache, file.path, cached);
+  if (cached && hasSameVersion(cached, file)) {
+    cacheTouch(costCache, file.path, cached);
     return cached.costUsd;
   }
   let costUsd = 0;
@@ -143,32 +200,42 @@ async function readCost(file: SessionFile): Promise<number> {
   } catch {
     costUsd = 0;
   }
-  cacheSet(costCache, file.path, { mtimeMs: file.mtimeMs, bytes: file.bytes, costUsd });
+  cacheSet(costCache, file.path, {
+    mtimeMs: file.mtimeMs,
+    bytes: file.bytes,
+    ctimeMs: file.ctimeMs,
+    ino: file.ino,
+    costUsd,
+  });
   return costUsd;
 }
-
-type SessionFile = { path: string; dir: string; mtimeMs: number; bytes: number; birthtimeMs: number };
 
 /** Everything but cost; costs are summed only for the rows that survive the limit. */
 type SessionBase = Omit<SessionSummary, "costUsd">;
 
 /**
- * Last conversation timestamp per transcript, memoized by (mtime, size) like
- * `costCache`. `null` means the backwards scan found no conversation, which
- * callers turn into the stable creation-time fallback.
+ * Last conversation timestamp per transcript, memoized by the same full file
+ * version used by the cost cache. `null` means the backwards scan found no
+ * conversation, which callers turn into the stable creation-time fallback.
  */
-const activityCache = new Map<string, { mtimeMs: number; bytes: number; activityMs: number | null }>();
+const activityCache = new Map<string, FileVersion & { activityMs: number | null }>();
 
 async function readActivity(file: SessionFile): Promise<number | null> {
   const cached = activityCache.get(file.path);
-  if (cached && cached.mtimeMs === file.mtimeMs && cached.bytes === file.bytes) {
-    cacheSet(activityCache, file.path, cached);
+  if (cached && hasSameVersion(cached, file)) {
+    cacheTouch(activityCache, file.path, cached);
     return cached.activityMs;
   }
   // A read failure propagates (never memoized) so callers fall back for this
   // listing only and the next poll retries; `null` means "no conversation".
   const activityMs = await scanActivity(file);
-  cacheSet(activityCache, file.path, { mtimeMs: file.mtimeMs, bytes: file.bytes, activityMs });
+  cacheSet(activityCache, file.path, {
+    mtimeMs: file.mtimeMs,
+    bytes: file.bytes,
+    ctimeMs: file.ctimeMs,
+    ino: file.ino,
+    activityMs,
+  });
   return activityMs;
 }
 
@@ -259,13 +326,28 @@ type HeadInfo = {
   startedAtMs: number | null;
 };
 
-const headerCache = new Map<string, { mtimeMs: number; bytes: number; info: HeadInfo }>();
+const headerCache = new Map<string, FileVersion & { info: HeadInfo }>();
+
+/** Drop deleted paths from this root so removed/imported stores release cache entries. */
+function pruneCacheForRoot<V>(cache: Map<string, V>, root: string, livePaths: Set<string>): void {
+  const absoluteRoot = resolve(root);
+  const rootPrefix = absoluteRoot.endsWith(sep) ? absoluteRoot : `${absoluteRoot}${sep}`;
+  for (const path of cache.keys()) {
+    const absolutePath = isAbsolute(root) && isAbsolute(path) ? path : resolve(path);
+    if (
+      (absolutePath === absoluteRoot || absolutePath.startsWith(rootPrefix)) &&
+      !livePaths.has(path)
+    ) {
+      cacheDelete(cache, path);
+    }
+  }
+}
 
 /** Read and parse one header, retrying failures on the next listing. */
 async function readParsedHeader(file: SessionFile): Promise<HeadInfo | null> {
   const cached = headerCache.get(file.path);
-  if (cached && cached.mtimeMs === file.mtimeMs && cached.bytes === file.bytes) {
-    cacheSet(headerCache, file.path, cached);
+  if (cached && hasSameVersion(cached, file)) {
+    cacheTouch(headerCache, file.path, cached);
     return cached.info;
   }
   let head: string;
@@ -275,7 +357,13 @@ async function readParsedHeader(file: SessionFile): Promise<HeadInfo | null> {
     return null;
   }
   const info = parseHead(head);
-  cacheSet(headerCache, file.path, { mtimeMs: file.mtimeMs, bytes: file.bytes, info });
+  cacheSet(headerCache, file.path, {
+    mtimeMs: file.mtimeMs,
+    bytes: file.bytes,
+    ctimeMs: file.ctimeMs,
+    ino: file.ino,
+    info,
+  });
   return info;
 }
 
@@ -293,6 +381,10 @@ export async function listSessions(
   const search = options.search?.toLowerCase() ?? "";
 
   const files = await collectSessionFiles(root);
+  const livePaths = new Set(files.map((file) => file.path));
+  pruneCacheForRoot(costCache, root, livePaths);
+  pruneCacheForRoot(activityCache, root, livePaths);
+  pruneCacheForRoot(headerCache, root, livePaths);
   const historyTitles = readHistoryTitles(join(dirname(root), "history.db"));
   // Read every transcript: mtime cannot bound activity (imported files and clock
   // skew can write messages newer than the file's last touch), so filtering by
@@ -358,6 +450,8 @@ async function collectSessionFiles(root: string): Promise<SessionFile[]> {
           ...candidate,
           mtimeMs: info.mtimeMs,
           bytes: info.size,
+          ctimeMs: info.ctimeMs,
+          ino: info.ino,
           birthtimeMs: info.birthtimeMs,
         }
       : null;

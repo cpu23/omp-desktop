@@ -716,15 +716,17 @@ function shutdown(code = 0): void {
     clearTimeout(exitSaveTimer);
     exitSaveTimer = null;
   }
-  manager.killAll();
+  const childrenStopped = manager.killAll();
   server.stop(true);
-  // Exit only once a write already in flight has landed; the ceiling keeps a
-  // wedged filesystem from hanging the shutdown, and the timer also gives the
-  // SIGTERMed children a moment to go.
-  void Promise.race([ledgerWrite, Bun.sleep(1000)]).then(() => setTimeout(() => process.exit(code), 100));
+  // Wait for the ledger and PTY exit/reaping (including bounded escalation).
+  // A wedged filesystem or child must not hang daemon shutdown indefinitely.
+  void Promise.race([
+    Promise.all([ledgerWrite, childrenStopped]),
+    Bun.sleep(1000),
+  ]).then(() => setTimeout(() => process.exit(code), 100));
 }
 process.on("SIGINT", () => shutdown(0));
 process.on("SIGTERM", () => shutdown(0));
-process.on("exit", () => manager.killAll());
+process.on("exit", () => { void manager.killAll("SIGKILL"); });
 
 const poolReady = restorePool();

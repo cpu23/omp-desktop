@@ -7,7 +7,7 @@
  */
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, renameSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { listSessions, readSessionCwd } from "./sessions";
@@ -119,6 +119,38 @@ describe("message-derived activity", () => {
     const sessions = await listSessions({ sessionsRoot: root });
     expect(sessions.map((entry) => entry.id)).toEqual(["old-3", "fresh-3"]);
     expect(sessions[0].updatedAt).toBe("2026-09-25T08:00:00.000Z");
+  });
+  test("same-size rewrites with a preserved mtime refresh conversation order", async () => {
+    const root = makeRoot();
+    const old = writeSession(root, "2026-08-01T00-00-00-000Z_rewritten.jsonl", [
+      session("rewritten", "2026-08-01T00:00:00.000Z"),
+      user("2026-08-01T00:00:01.000Z", "same prompt"),
+      assistant("2026-08-01T00:02:00.000Z"),
+    ]);
+    const fresh = writeSession(root, "2026-09-20T09-00-00-000Z_fresh-rewrite.jsonl", [
+      session("fresh-rewrite", "2026-09-20T09:00:00.000Z"),
+      user("2026-09-20T09:00:01.000Z", "recent question"),
+      assistant("2026-09-20T09:03:00.000Z"),
+    ]);
+    const oldMtime = "2026-08-01T00:02:00.000Z";
+    setMtime(old, oldMtime);
+    setMtime(fresh, "2026-09-20T09:03:00.000Z");
+    expect((await listSessions({ sessionsRoot: root })).map((entry) => entry.id)).toEqual([
+      "fresh-rewrite",
+      "rewritten",
+    ]);
+
+    const replacement = writeSession(root, "staged-rewrite.jsonl", [
+      session("rewritten", "2026-08-01T00:00:00.000Z"),
+      user("2026-08-01T00:00:01.000Z", "same prompt"),
+      assistant("2026-09-25T08:00:00.000Z"),
+    ]);
+    renameSync(replacement, old);
+    setMtime(old, oldMtime);
+
+    const sessions = await listSessions({ sessionsRoot: root });
+    expect(sessions.map((entry) => entry.id)).toEqual(["rewritten", "fresh-rewrite"]);
+    expect(sessions[0]?.updatedAt).toBe("2026-09-25T08:00:00.000Z");
   });
 
   test("a session with no conversation falls back to creation time, not its exit event", async () => {
@@ -305,6 +337,27 @@ describe("message-derived activity", () => {
     expect(sessions[0].costUsd).toBe(1);
   });
 
+  test("refreshes cached cost after a same-size replacement with preserved mtime", async () => {
+    const root = makeRoot();
+    const path = writeSession(root, "2026-09-12T00-00-00-000Z_cost-rewrite.jsonl", [
+      session("cost-rewrite", "2026-09-12T00:00:00.000Z"),
+      user("2026-09-12T00:00:01.000Z", "hi"),
+      assistant("2026-09-12T00:00:05.000Z", 0.25),
+    ]);
+    const mtime = "2026-09-12T00:00:00.000Z";
+    setMtime(path, mtime);
+    expect((await listSessions({ sessionsRoot: root }))[0]?.costUsd).toBe(0.25);
+
+    const replacement = writeSession(root, "staged-cost-rewrite.jsonl", [
+      session("cost-rewrite", "2026-09-12T00:00:00.000Z"),
+      user("2026-09-12T00:00:01.000Z", "hi"),
+      assistant("2026-09-12T00:00:05.000Z", 0.75),
+    ]);
+    renameSync(replacement, path);
+    setMtime(path, mtime);
+    expect((await listSessions({ sessionsRoot: root }))[0]?.costUsd).toBe(0.75);
+  });
+
   test("search still filters the activity-ordered rows", async () => {
     const root = makeRoot();
     writeSession(root, "2026-09-01T00-00-00-000Z_search-old.jsonl", [
@@ -325,7 +378,7 @@ describe("message-derived activity", () => {
 });
 
 describe("parsed header cache", () => {
-  test("reuses warm headers and invalidates on mtime or size changes", async () => {
+  test("reuses warm headers and invalidates on mtime, replacement, or size changes", async () => {
     const root = makeRoot();
     const path = writeSession(root, "2026-09-01T00-00-00-000Z_cached.jsonl", [
       session("cached", "2026-09-01T00:00:00.000Z"),
@@ -352,6 +405,16 @@ describe("parsed header cache", () => {
       setMtime(path, "2026-09-02T00:00:00.000Z");
       expect((await listSessions({ sessionsRoot: root }))[0]?.title).toBe("New title");
 
+      const replacement = writeSession(root, "staged-cached.jsonl", [
+        session("cached", "2026-09-01T00:00:00.000Z"),
+        { type: "title_change", id: "t1", parentId: null, timestamp: "2026-09-01T00:00:01.000Z", title: "Old title" },
+        user("2026-09-01T00:00:02.000Z", "prompt"),
+        assistant("2026-09-01T00:00:03.000Z"),
+      ]);
+      renameSync(replacement, path);
+      setMtime(path, "2026-09-02T00:00:00.000Z");
+      expect((await listSessions({ sessionsRoot: root }))[0]?.title).toBe("Old title");
+
       writeSession(root, "2026-09-01T00-00-00-000Z_cached.jsonl", [
         session("cached", "2026-09-01T00:00:00.000Z"),
         { type: "title_change", id: "t1", parentId: null, timestamp: "2026-09-01T00:00:01.000Z", title: "Longer title" },
@@ -360,6 +423,55 @@ describe("parsed header cache", () => {
       ]);
       setMtime(path, "2026-09-02T00:00:00.000Z");
       expect((await listSessions({ sessionsRoot: root }))[0]?.title).toBe("Longer title");
+    } finally {
+      fileSpy.mockRestore();
+    }
+  });
+
+  test("keeps a large cache warm while preserving search, order, imports, and deletions", async () => {
+    const root = makeRoot();
+    const dir = join(root, "-home-user-demo");
+    mkdirSync(dir, { recursive: true });
+    const startMs = Date.parse("2026-01-01T00:00:00.000Z");
+    for (let index = 0; index < 1100; index++) {
+      const id = `bulk-${String(index).padStart(4, "0")}`;
+      const timestamp = new Date(startMs + index * 2_000).toISOString();
+      const replyTime = new Date(startMs + index * 2_000 + 1_000).toISOString();
+      const prompt = index === 0 ? "boundary-search-token" : `question ${index}`;
+      writeFileSync(
+        join(dir, `${id}.jsonl`),
+        `${[session(id, timestamp), user(timestamp, prompt), assistant(replyTime)]
+          .map((event) => JSON.stringify(event))
+          .join("\n")}\n`,
+      );
+    }
+
+    const fileSpy = spyOn(Bun, "file");
+    try {
+      const recent = await listSessions({ sessionsRoot: root, limit: 60 });
+      expect(recent).toHaveLength(60);
+      expect(recent[0]?.id).toBe("bulk-1099");
+      const warmReadCount = fileSpy.mock.calls.length;
+      expect((await listSessions({ sessionsRoot: root, limit: 60 })).map((entry) => entry.id)).toEqual(
+        recent.map((entry) => entry.id),
+      );
+      expect(fileSpy.mock.calls.length).toBe(warmReadCount);
+
+      expect(
+        (await listSessions({ sessionsRoot: root, search: "boundary-search-token", limit: 1 })).map(
+          (entry) => entry.id,
+        ),
+      ).toEqual(["bulk-0000"]);
+
+      rmSync(join(dir, "bulk-0000.jsonl"));
+      const imported = writeSession(root, "000-imported.jsonl", [
+        session("imported", "2026-01-01T00:00:00.000Z"),
+        user("2026-12-01T00:00:01.000Z", "imported marker"),
+        assistant("2026-12-01T00:00:02.000Z"),
+      ]);
+      setMtime(imported, "2026-01-01T00:00:00.000Z");
+      expect((await listSessions({ sessionsRoot: root, limit: 1 }))[0]?.id).toBe("imported");
+      expect(await listSessions({ sessionsRoot: root, search: "boundary-search-token" })).toEqual([]);
     } finally {
       fileSpy.mockRestore();
     }
