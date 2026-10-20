@@ -853,9 +853,7 @@ body.session-dragging * {
 }
 
 .row-done {
-  position: absolute;
-  right: 9px;
-  bottom: 9px;
+  flex: 0 0 6px;
   width: 6px;
   height: 6px;
   border-radius: 50%;

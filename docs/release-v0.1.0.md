@@ -15,7 +15,7 @@ setup, and security boundaries.
 - Removed forced scrollback snapping; scrolling now moves continuously, including near the live screen and with
   less than a screen of history.
 - Session titles use the full card width; stop/pin actions sit on the metadata line instead of reserving a
-  permanent gap beside the title.
+  permanent gap beside the title. The completion dot stays on the title line, clear of those actions.
 
 Apply these daemon and client changes only after active work finishes: restarting the daemon ends its PTY
 children. Existing transcript sessions resume on the next start; an already-discarded raw tail cannot be recovered
