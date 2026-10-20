@@ -2,6 +2,7 @@ import { spawn, type IPty } from "bun-pty";
 import { basename } from "node:path";
 import type { RuntimeInfo } from "./protocol";
 import { sniffSessionFile } from "./sniff";
+import { TerminalReplay } from "./terminal-replay";
 
 export type RuntimeSpec = {
   id: string;
@@ -15,13 +16,12 @@ export type RuntimeSpec = {
 
 export type RuntimeExit = { exitCode: number | null; signal?: number | string };
 
-const DEFAULT_REPLAY_LIMIT = 512 * 1024;
 /** Output within this window counts as "streaming" in the sidebar. */
 const STREAMING_WINDOW_MS = 1500;
 
 /**
- * One omp TUI process on a PTY. Keeps the tail of raw output so a client that
- * attaches later can reconstruct the screen; live clients get bytes as they come.
+ * One omp TUI process on a PTY. Mirrors terminal state for complete snapshots;
+ * live clients get the original bytes after the mirror has parsed them.
  */
 export class Runtime {
   readonly id: string;
@@ -34,8 +34,7 @@ export class Runtime {
 
   #pty: IPty | null = null;
   #exit: RuntimeExit | null = null;
-  #chunks: string[] = [];
-  #chunkBytes = 0;
+  #replay: TerminalReplay;
   #dataSubs = new Set<(data: string) => void>();
   #exitSubs = new Set<(exit: RuntimeExit) => void>();
   #fileSubs = new Set<(sessionFile: string) => void>();
@@ -45,6 +44,7 @@ export class Runtime {
   constructor(spec: RuntimeSpec) {
     this.id = spec.id;
     this.spec = spec;
+    this.#replay = new TerminalReplay(spec.cols, spec.rows);
   }
 
   get alive(): boolean {
@@ -109,8 +109,8 @@ export class Runtime {
     this.#exit = null;
     this.startedAt = new Date();
     this.bytesOut = 0;
-    this.#chunks = [];
-    this.#chunkBytes = 0;
+    this.#replay.dispose();
+    this.#replay = new TerminalReplay(this.spec.cols, this.spec.rows);
     pty.onData((data) => {
       const bytes = Buffer.byteLength(data);
       this.bytesOut += bytes;
@@ -121,23 +121,36 @@ export class Runtime {
         this.sessionFile = sniffed.sessionFile;
         for (const sub of this.#fileSubs) sub(this.sessionFile);
       }
-      this.#pushReplay(data, bytes);
-      for (const sub of this.#dataSubs) sub(data);
+      this.#replay.append(data, () => {
+        for (const sub of this.#dataSubs) sub(data);
+      });
     });
     pty.onExit((event) => {
-      this.#pty = null;
-      this.#exit = { exitCode: event.exitCode, signal: event.signal };
-      for (const sub of this.#exitSubs) sub(this.#exit);
+      const exit = { exitCode: event.exitCode, signal: event.signal };
+      this.#replay.append("", () => {
+        this.#pty = null;
+        this.#exit = exit;
+        for (const sub of this.#exitSubs) sub(exit);
+      });
     });
   }
 
-  replay(): string {
-    return this.#chunks.join("");
-  }
-
-  subscribeData(sub: (data: string) => void): () => void {
-    this.#dataSubs.add(sub);
-    return () => this.#dataSubs.delete(sub);
+  /** Snapshot and subscribe at the same parser boundary; no bytes can fall
+   * between the captured screen and the live subscription. */
+  subscribeOutput(
+    replay: (data: string, info: RuntimeInfo) => void,
+    data: (data: string) => void,
+  ): () => void {
+    let cancelled = false;
+    this.#replay.snapshot((snapshot) => {
+      if (cancelled) return;
+      replay(snapshot.data, { ...this.info(), cols: snapshot.cols, rows: snapshot.rows });
+      if (!cancelled) this.#dataSubs.add(data);
+    });
+    return () => {
+      cancelled = true;
+      this.#dataSubs.delete(data);
+    };
   }
 
   subscribeExit(sub: (exit: RuntimeExit) => void): () => void {
@@ -157,6 +170,7 @@ export class Runtime {
 
   /** Remember the size even when not running, so the next spawn uses it. */
   resize(cols: number, rows: number): void {
+    this.#replay.resize(cols, rows);
     if (!this.#pty) {
       this.spec.cols = cols;
       this.spec.rows = rows;
@@ -185,11 +199,4 @@ export class Runtime {
     }
   }
 
-  #pushReplay(data: string, bytes: number): void {
-    this.#chunks.push(data);
-    this.#chunkBytes += bytes;
-    while (this.#chunkBytes > DEFAULT_REPLAY_LIMIT && this.#chunks.length > 1) {
-      this.#chunkBytes -= Buffer.byteLength(this.#chunks.shift() as string);
-    }
-  }
 }

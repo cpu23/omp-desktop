@@ -24,6 +24,8 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { isRecord } from "../src/guards";
+import { Terminal } from "@xterm/headless";
+import { parseServerMessage } from "../src/protocol";
 
 const ROOT = join(import.meta.dir, "..");
 // Refuse an occupied explicit port; otherwise choose an unused ephemeral port.
@@ -186,18 +188,26 @@ async function sessions(limit: number, search?: string): Promise<SessionInfo[]> 
   return body.sessions.map(sessionFrom);
 }
 
-type Pane = { text: () => string; send: (data: string) => void; close: () => void };
+type Pane = { text: () => string; screen: () => string[]; send: (data: string) => void; close: () => void };
 
 /** One pane: a websocket bound to a runtime, mirroring what the client does. */
 async function attach(runtimeId: string): Promise<Pane> {
   const ws = new WebSocket(`${WS_URL}?runtime=${encodeURIComponent(runtimeId)}`);
   ws.binaryType = "arraybuffer";
   let out = "";
+  const terminal = new Terminal({ allowProposedApi: true });
   // One decoder per pane keeps a multi-byte character split across two frames
   // from being mangled: the PTY can cut anywhere, not just at character ends.
   const decoder = new TextDecoder();
   ws.onmessage = (event) => {
-    if (event.data instanceof ArrayBuffer) out += decoder.decode(new Uint8Array(event.data), { stream: true });
+    if (event.data instanceof ArrayBuffer) {
+      const bytes = new Uint8Array(event.data);
+      out += decoder.decode(bytes, { stream: true });
+      terminal.write(bytes);
+    } else if (typeof event.data === "string") {
+      const message = parseServerMessage(event.data);
+      if (message?.type === "hello") terminal.resize(message.runtime.cols, message.runtime.rows);
+    }
   };
   await new Promise<void>((resolve, reject) => {
     ws.onopen = () => resolve();
@@ -205,8 +215,15 @@ async function attach(runtimeId: string): Promise<Pane> {
   });
   return {
     text: () => out,
+    screen: () => {
+      const buffer = terminal.buffer.active;
+      return Array.from({ length: buffer.length }, (_, row) => buffer.getLine(row)!.translateToString(true));
+    },
     send: (data: string) => ws.send(JSON.stringify({ type: "input", data })),
-    close: () => ws.close(),
+    close: () => {
+      ws.close();
+      terminal.dispose();
+    },
   };
 }
 
@@ -520,7 +537,7 @@ async function phaseH(fixture: CwdFixture): Promise<void> {
   const resumed = await createRuntime({ resume: fixture.sessionPath });
   assert(resumed.cwd === fixture.project, `resume without cwd uses the recorded cwd (${resumed.cwd})`);
   const resumedPane = await attach(resumed.id);
-  await waitFor(() => resumedPane.text().includes(`${fixture.project}\r\n`), 5_000, "resumed process reports its actual project cwd");
+  await waitFor(() => resumedPane.screen().includes(fixture.project), 5_000, "resumed process reports its actual project cwd");
   resumedPane.close();
   const conflicting = await createRuntime({ resume: fixture.sessionPath, cwd: fixture.launch });
   assert(conflicting.cwd === fixture.project, `resume ignores a conflicting explicit cwd (${conflicting.cwd})`);

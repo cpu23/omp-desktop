@@ -562,15 +562,15 @@ const server = Bun.serve<WsData>({
         return;
       }
       runtime.start();
-      const replay = runtime.replay();
-      const hello: ServerMessage = {
-        type: "hello",
-        runtime: runtime.info(),
-        replayBytes: Buffer.byteLength(replay),
-      };
-      ws.send(JSON.stringify(hello));
-      if (replay.length > 0) ws.send(Buffer.from(replay, "utf8"));
-      ws.data.unsubData = runtime.subscribeData((data) => ws.send(Buffer.from(data, "utf8")));
+      ws.data.unsubData = runtime.subscribeOutput((replay, info) => {
+        const hello: ServerMessage = {
+          type: "hello",
+          runtime: info,
+          replayBytes: Buffer.byteLength(replay),
+        };
+        ws.send(JSON.stringify(hello));
+        if (replay.length > 0) ws.send(Buffer.from(replay, "utf8"));
+      }, (data) => ws.send(Buffer.from(data, "utf8")));
       ws.data.unsubExit = runtime.subscribeExit((exit) => {
         const message: ServerMessage = { type: "exit", exitCode: exit.exitCode, daemonShutdown: shuttingDown };
         ws.send(JSON.stringify(message));

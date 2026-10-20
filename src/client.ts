@@ -9,7 +9,7 @@ import { CompletionTracker } from "./completion-tracker";
 import { CompletionNotifications } from "./notifications";
 import { Terminal } from "@xterm/xterm";
 import { UnicodeGraphemesAddon } from "@xterm/addon-unicode-graphemes";
-import { ImageAddon } from "@xterm/addon-image";
+import { loadImageAddon } from "./image-addon";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { repairWebglCanvasResize } from "./webgl-resize";
 import { WebLinksAddon } from "@xterm/addon-web-links";
@@ -594,7 +594,7 @@ class Pane {
       showRendererWarning();
       console.warn("omp-desktop: GPU renderer unavailable", error);
     }
-    this.term.loadAddon(new ImageAddon());
+    loadImageAddon(this.term);
     this.term.loadAddon(new WebLinksAddon(openTerminalLink));
     this.term.onData((data) => {
       if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: "input", data }));

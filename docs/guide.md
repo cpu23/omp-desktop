@@ -73,8 +73,11 @@ a sidebar session onto another space's tab to move/open it there. Right-click a 
 slot; closing another occupied pane collapses the grid. A new pane starts a new session; clicking a sidebar
 session attaches it to the focused pane.
 
-Closing a pane or space only detaches its view. The daemon keeps reading output and replays up to 512 KiB when a
-pane reconnects. Use the sidebar stop action to terminate a session. Live sessions are recorded in a durable
+Closing a pane or space only detaches its view. The daemon keeps a terminal-state mirror and restores its screen,
+up to 20,000 history rows, and retained inline images when a pane reconnects. Replay follows the producer's
+resize history instead of parsing a truncated raw-output tail at the latest size. Encoded image sidecars are
+capped at 128 MiB per runtime; the oldest images may be evicted while their reserved rows remain.
+Use the sidebar stop action to terminate a session. Live sessions are recorded in a durable
 ledger and resumed from their OMP transcripts after a daemon restart; the old processes are not preserved, and
 in-flight work or unsaved input cannot be restored. Each transcript has one live process at a time; attaching an
 existing session reuses its process. On first upgrading from a daemon that predates the ledger, checkpoint its
@@ -102,6 +105,9 @@ image paste uploads to the daemon, which stores the image and types its path int
 Supported types are PNG, JPEG, WebP and GIF, up to 32 MiB. The daemon forces the iTerm2 image protocol for
 inline rendering. Clipboard permission errors appear in the status area; large images can take longer for OMP
 to decode.
+
+OMP's iTerm2 images omit the optional file-size field. The desktop supplies the exact decoded size before
+passing these images to the image addon, so their reserved rows display the image instead of an empty black band.
 
 Drop files onto a pane to insert quoted paths without submitting them. The native window uses original paths for
 all file types and does not upload file contents. In browsers, if security hides a file's path, only images can
