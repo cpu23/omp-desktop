@@ -1,4 +1,5 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import { SerializeAddon } from "@xterm/addon-serialize";
 import { Terminal } from "@xterm/headless";
 import { TerminalReplay } from "./terminal-replay";
 
@@ -46,6 +47,54 @@ describe("terminal replay snapshots", () => {
     } finally {
       replay.dispose();
       restored.dispose();
+    }
+  });
+
+  test("reuses snapshots until parsed output or actual geometry changes", async () => {
+    const replay = new TerminalReplay(40, 8);
+    const serializeSpy = spyOn(SerializeAddon.prototype, "serialize");
+    try {
+      await append(replay, "before");
+      const first = await snapshot(replay);
+      first.data = "caller mutation";
+      const cached = await snapshot(replay);
+      expect(cached.data).not.toBe("caller mutation");
+      expect(cached).not.toBe(first);
+      expect(serializeSpy).toHaveBeenCalledTimes(1);
+
+      replay.resize(40, 8);
+      const unchangedGeometry = await snapshot(replay);
+      expect({ cols: unchangedGeometry.cols, rows: unchangedGeometry.rows }).toEqual({ cols: 40, rows: 8 });
+      expect(serializeSpy).toHaveBeenCalledTimes(1);
+
+      await append(replay, " after");
+      const updated = await snapshot(replay);
+      expect(updated.data).toContain("before after");
+      expect(serializeSpy).toHaveBeenCalledTimes(2);
+
+      replay.resize(80, 24);
+      const resized = await snapshot(replay);
+      expect({ cols: resized.cols, rows: resized.rows }).toEqual({ cols: 80, rows: 24 });
+      expect(serializeSpy).toHaveBeenCalledTimes(3);
+    } finally {
+      serializeSpy.mockRestore();
+      replay.dispose();
+    }
+  });
+
+  test("keeps cached inline-image replay data until its marker is overwritten", async () => {
+    const replay = new TerminalReplay(40, 8);
+    try {
+      await append(replay, "\x1b]1337;File=inline=1;width=1:YWJj\x07");
+      const withImage = await snapshot(replay);
+      expect(withImage.data).toContain("YWJj");
+      expect((await snapshot(replay)).data).toBe(withImage.data);
+
+      await append(replay, "x");
+      const afterOverwrite = await snapshot(replay);
+      expect(afterOverwrite.data).not.toContain("YWJj");
+    } finally {
+      replay.dispose();
     }
   });
 

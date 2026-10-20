@@ -11,6 +11,7 @@ import { UnicodeGraphemesAddon } from "@xterm/addon-unicode-graphemes";
 import { loadImageAddon } from "./image-addon";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { repairWebglCanvasResize } from "./webgl-resize";
+import { shouldUseDomFallbackForSoftwareWebgl } from "./webgl-renderer";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { isRecord } from "./guards";
 import { insertFilePaths, wireFileDrop } from "./file-drop";
@@ -576,20 +577,24 @@ class Pane {
       this.el.dataset.renderer = "dom";
       if (!rendererWarning.isConnected) header.insertBefore(rendererWarning, spacer);
     };
-    let webgl: WebglAddon | undefined;
-    try {
-      webgl = new WebglAddon();
-      webgl.onContextLoss(() => {
+    if (shouldUseDomFallbackForSoftwareWebgl()) {
+      showRendererWarning();
+    } else {
+      let webgl: WebglAddon | undefined;
+      try {
+        webgl = new WebglAddon();
+        webgl.onContextLoss(() => {
+          webgl?.dispose();
+          showRendererWarning();
+        });
+        this.term.loadAddon(webgl);
+        repairWebglCanvasResize(webgl);
+        this.el.dataset.renderer = "webgl";
+      } catch (error) {
         webgl?.dispose();
         showRendererWarning();
-      });
-      this.term.loadAddon(webgl);
-      repairWebglCanvasResize(webgl);
-      this.el.dataset.renderer = "webgl";
-    } catch (error) {
-      webgl?.dispose();
-      showRendererWarning();
-      console.warn("omp-desktop: GPU renderer unavailable", error);
+        console.warn("omp-desktop: GPU renderer unavailable", error);
+      }
     }
     loadImageAddon(this.term);
     this.term.loadAddon(new WebLinksAddon(openTerminalLink));

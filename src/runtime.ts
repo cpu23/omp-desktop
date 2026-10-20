@@ -1,4 +1,5 @@
 import { spawn, type IPty } from "bun-pty";
+import { readFileSync, readdirSync } from "node:fs";
 import { basename } from "node:path";
 import type { RuntimeInfo } from "./protocol";
 import { sniffSessionFile } from "./sniff";
@@ -16,8 +17,11 @@ export type RuntimeSpec = {
 
 export type RuntimeExit = { exitCode: number | null; signal?: number | string };
 
-/** Output within this window counts as "streaming" in the sidebar. */
+type ProcessGroupIdentity = { pid: number; startTime: string };
+
 const STREAMING_WINDOW_MS = 1500;
+/** Give interactive shells a short chance to handle a stop before forcing the PTY group down. */
+const TERMINATION_GRACE_MS = 500;
 
 /**
  * One omp TUI process on a PTY. Mirrors terminal state for complete snapshots;
@@ -38,6 +42,13 @@ export class Runtime {
   #dataSubs = new Set<(data: string) => void>();
   #exitSubs = new Set<(exit: RuntimeExit) => void>();
   #fileSubs = new Set<(sessionFile: string) => void>();
+  #terminationTimer: Timer | null = null;
+  #terminating = false;
+  #processGroupIdentity: ProcessGroupIdentity | null = null;
+  #terminationPromise: Promise<void> | null = null;
+  #resolveTermination: (() => void) | null = null;
+  #terminationExitObserved = false;
+  #terminationEscalationComplete = false;
   /** Tail of the last chunk: an OSC sequence can split across PTY reads. */
   #sniffCarry = "";
 
@@ -97,7 +108,7 @@ export class Runtime {
 
   /** Idempotent: a second call while alive is a no-op. */
   start(): void {
-    if (this.#pty) return;
+    if (this.#pty || this.#terminating) return;
     const pty = spawn(this.spec.file, this.spec.args, {
       name: "xterm-256color",
       cols: this.spec.cols,
@@ -105,6 +116,7 @@ export class Runtime {
       cwd: this.spec.cwd,
       env: this.spec.env,
     });
+    this.#processGroupIdentity = readProcessGroupIdentity(pty.pid);
     this.#pty = pty;
     this.#exit = null;
     this.startedAt = new Date();
@@ -130,6 +142,10 @@ export class Runtime {
       this.#replay.append("", () => {
         this.#pty = null;
         this.#exit = exit;
+        if (this.#terminationPromise) {
+          this.#terminationExitObserved = true;
+          this.#finishTermination();
+        }
         for (const sub of this.#exitSubs) sub(exit);
       });
     });
@@ -178,25 +194,148 @@ export class Runtime {
     }
     this.#pty.resize(cols, rows);
   }
-
   /**
-   * Kill the child's whole process group: portable-pty puts the child in its own
-   * session, so `-pid` reaps omp's own children (LSP servers, subagents) too.
+   * Stop the PTY's dedicated process group. Keep the PTY reader open so its
+   * onExit event can reap the direct child; bun-pty's kill() closes that reader
+   * and synthesizes an exit event before the OS process is necessarily gone.
    */
-  kill(signal: NodeJS.Signals = "SIGTERM"): void {
-    const pty = this.#pty;
-    if (!pty) return;
-    const pid = pty.pid;
-    try {
-      process.kill(-pid, signal);
-    } catch {
-      // not a process group leader; the direct kill below still works
+  kill(signal: NodeJS.Signals = "SIGTERM"): Promise<void> {
+    if (this.#terminationPromise) {
+      if (signal === "SIGKILL" && !this.#terminationEscalationComplete) this.#escalateTermination();
+      return this.#terminationPromise;
     }
+    const pty = this.#pty;
+    if (!pty) {
+      this.#terminating = true;
+      return Promise.resolve();
+    }
+    this.#terminating = true;
+    const pid = pty.pid;
+    this.#terminationEscalationComplete = signal === "SIGKILL";
+    const termination = new Promise<void>((resolve) => {
+      this.#resolveTermination = resolve;
+    });
+    this.#terminationPromise = termination;
+
+    // bun-pty starts the command in its own session, making its PID the
+    // process-group ID. Signalling that group cleans up shell descendants
+    // without searching for or signalling unrelated processes.
+    // Verify the saved Linux PID identity before using its numeric PGID. If
+    // /proc cannot prove it, terminate only through the PTY's bound child handle.
+    const identity = this.#processGroupIdentity;
+    if (identity === null || !processGroupIdentityMatches(identity) || !signalProcessGroup(pid, signal)) {
+      this.#terminationEscalationComplete = true;
+      this.#killPty(pty, signal);
+      return termination;
+    }
+    if (signal !== "SIGKILL") {
+      // Interactive Bash can ignore SIGTERM. Escalate while /proc still proves
+      // the original process-group leader identity.
+      this.#terminationTimer = setTimeout(() => this.#escalateTermination(), TERMINATION_GRACE_MS);
+    }
+    return termination;
+  }
+
+  #escalateTermination(): void {
+    if (this.#terminationEscalationComplete) return;
+    if (this.#terminationTimer !== null) {
+      clearTimeout(this.#terminationTimer);
+      this.#terminationTimer = null;
+    }
+    const identity = this.#processGroupIdentity;
+    const pty = this.#pty;
+    // The direct child may exit on SIGTERM while same-session descendants
+    // survive it. A remaining group member preserves the original PGID; if the
+    // leader PID already exists with a different identity, it has been reused.
+    const groupSignalled =
+      identity !== null && processGroupIdentityStillExists(identity) && signalProcessGroup(identity.pid, "SIGKILL");
+    if (!groupSignalled && pty) this.#killPty(pty, "SIGKILL");
+    this.#terminationEscalationComplete = true;
+    this.#finishTermination();
+  }
+
+  #finishTermination(): void {
+    if (!this.#terminationExitObserved || !this.#terminationEscalationComplete) return;
+    const resolve = this.#resolveTermination;
+    this.#resolveTermination = null;
+    resolve?.();
+  }
+
+  #killPty(pty: IPty, signal: NodeJS.Signals): void {
     try {
       pty.kill(signal);
     } catch {
-      this.#pty = null;
+      if (this.#pty === pty) this.#pty = null;
+      this.#terminationExitObserved = true;
+      this.#finishTermination();
     }
   }
 
+}
+
+type LinuxProcessStat = { processGroup: number; session: number; startTime: string };
+
+function readLinuxProcessStat(pid: number): LinuxProcessStat | null {
+  if (process.platform !== "linux" || !Number.isSafeInteger(pid) || pid <= 1) return null;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const commandEnd = stat.lastIndexOf(")");
+    if (commandEnd < 0) return null;
+    const fields = stat.slice(commandEnd + 1).trim().split(/\s+/);
+    // After comm: state is field 3, pgrp is 5, session is 6, starttime is 22.
+    const processGroup = Number(fields[2]);
+    const session = Number(fields[3]);
+    const startTime = fields[19];
+    if (!Number.isSafeInteger(processGroup) || !Number.isSafeInteger(session) || !startTime) return null;
+    return { processGroup, session, startTime };
+  } catch {
+    return null;
+  }
+}
+
+function readProcessGroupIdentity(pid: number): ProcessGroupIdentity | null {
+  const stat = readLinuxProcessStat(pid);
+  if (stat === null || stat.processGroup !== pid || stat.session !== pid) return null;
+  return { pid, startTime: stat.startTime };
+}
+
+function processGroupIdentityMatches(identity: ProcessGroupIdentity): boolean {
+  const current = readLinuxProcessStat(identity.pid);
+  return (
+    current !== null &&
+    current.processGroup === identity.pid &&
+    current.session === identity.pid &&
+    current.startTime === identity.startTime
+  );
+}
+
+function processGroupIdentityStillExists(identity: ProcessGroupIdentity): boolean {
+  const leader = readLinuxProcessStat(identity.pid);
+  if (leader !== null) {
+    return (
+      leader.processGroup === identity.pid &&
+      leader.session === identity.pid &&
+      leader.startTime === identity.startTime
+    );
+  }
+  try {
+    for (const entry of readdirSync("/proc")) {
+      if (!/^\d+$/.test(entry)) continue;
+      const member = readLinuxProcessStat(Number(entry));
+      if (member?.processGroup === identity.pid && member.session === identity.pid) return true;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+function signalProcessGroup(pid: number, signal: NodeJS.Signals): boolean {
+  if (process.platform === "win32" || !Number.isSafeInteger(pid) || pid <= 1) return false;
+  try {
+    process.kill(-pid, signal);
+    return true;
+  } catch {
+    return false;
+  }
 }
