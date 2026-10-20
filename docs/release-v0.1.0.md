@@ -10,7 +10,8 @@ setup, and security boundaries.
 
 - Inline iTerm2 images without an optional `size` field now render instead of leaving their reserved rows black.
 - Reconnecting panes restore terminal-state snapshots rather than a 512 KiB raw tail that could begin inside a
-  repaint or image sequence. Snapshots retain bounded scrollback and inline images across producer resizes.
+  repaint or image sequence. Snapshots retain bounded scrollback, inline images, scrolling margins and cursor
+  visibility across producer resizes.
 - Snapshot/live-output handoff shares a parser boundary so output is neither skipped nor duplicated.
 - Removed forced scrollback snapping; scrolling now moves continuously, including near the live screen and with
   less than a screen of history.

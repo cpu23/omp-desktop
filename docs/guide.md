@@ -74,9 +74,10 @@ slot; closing another occupied pane collapses the grid. A new pane starts a new 
 session attaches it to the focused pane.
 
 Closing a pane or space only detaches its view. The daemon keeps a terminal-state mirror and restores its screen,
-up to 20,000 history rows, and retained inline images when a pane reconnects. Replay follows the producer's
-resize history instead of parsing a truncated raw-output tail at the latest size. Encoded image sidecars are
-capped at 128 MiB per runtime; the oldest images may be evicted while their reserved rows remain.
+scrolling margins (DECSTBM) and cursor visibility when a pane reconnects, along with up to 20,000 history rows and
+retained inline images. Replay follows the producer's resize history instead of parsing a truncated raw-output tail
+at the latest size. Encoded image sidecars are capped at 128 MiB per runtime; the oldest images may be evicted
+while their reserved rows remain.
 Use the sidebar stop action to terminate a session. Live sessions are recorded in a durable
 ledger and resumed from their OMP transcripts after a daemon restart; the old processes are not preserved, and
 in-flight work or unsaved input cannot be restored. Each transcript has one live process at a time; attaching an

@@ -39,6 +39,7 @@ type TerminalInternals = {
   _core?: {
     buffer?: {
       scrollTop?: number;
+      scrollBottom?: number;
       tabs?: Record<string, boolean | undefined>;
       ybase?: number;
       savedX?: number;
@@ -49,6 +50,7 @@ type TerminalInternals = {
       normal?: { tabs?: Record<string, boolean | undefined> };
     };
     coreService?: {
+      isCursorHidden?: boolean;
       decPrivateModes?: {
         cursorBlink?: boolean;
         cursorStyle?: "block" | "underline" | "bar";
@@ -187,12 +189,26 @@ export class TerminalReplay {
       this.#images.restore(serialized) +
       this.#images.pendingImageData() +
       this.#mouseEncodingSequence() +
+      this.#scrollRegionSequence() +
       this.#tabStopsSequence(internal?.buffer?.tabs, terminal.modes.originMode) +
       this.#cursorStyleSequence() +
       this.#savedCursorSequence() +
       this.#cursorPositionSequence() +
+      this.#cursorVisibilitySequence() +
       this.#images.pendingSequence();
     return { data, cols: terminal.cols, rows: terminal.rows };
+  }
+
+  /** Restore DECSTBM before origin-mode cursor positioning. */
+  #scrollRegionSequence(): string {
+    const terminal = this.#terminal;
+    const buffer = (terminal as unknown as TerminalInternals)._core?.buffer;
+    const top = buffer?.scrollTop ?? 0;
+    const bottom = buffer?.scrollBottom ?? terminal.rows - 1;
+    let sequence = terminal.modes.originMode ? "\x1b[?6l" : "";
+    sequence += `\x1b[${top + 1};${bottom + 1}r`;
+    if (terminal.modes.originMode) sequence += "\x1b[?6h";
+    return sequence;
   }
 
   /** Serialize DECSCUSR, which addon-serialize does not currently include. */
@@ -304,6 +320,12 @@ export class TerminalReplay {
     sequence += "\x1b[H";
     if (restoreOrigin) sequence += "\x1b[?6h";
     return sequence;
+  }
+
+  /** addon-serialize does not preserve DECTCEM cursor visibility. */
+  #cursorVisibilitySequence(): string {
+    const hidden = (this.#terminal as unknown as TerminalInternals)._core?.coreService?.isCursorHidden;
+    return hidden ? "\x1b[?25l" : "\x1b[?25h";
   }
 
   /** Restore the cursor after mode/scroll-region sequences, which may home it. */
