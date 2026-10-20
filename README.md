@@ -35,8 +35,8 @@ menu; the daemon above must remain running.
 
 ## Releases and links
 
-Source releases only—no prebuilt installers: [v0.1.1](https://github.com/cpu23/omp-desktop/releases/tag/v0.1.1)
-([notes](docs/release-v0.1.1.md)) · [v0.1.0](https://github.com/cpu23/omp-desktop/releases/tag/v0.1.0).
+Source releases only—no prebuilt installers: [v0.1.2](https://github.com/cpu23/omp-desktop/releases/tag/v0.1.2)
+([notes](docs/release-v0.1.2.md)) · [v0.1.1](https://github.com/cpu23/omp-desktop/releases/tag/v0.1.1) · [v0.1.0](https://github.com/cpu23/omp-desktop/releases/tag/v0.1.0).
 
 [OMP Mobile companion](https://github.com/cpu23/omp-mobile) · [Mobile setup](https://github.com/cpu23/omp-mobile#quick-setup) · [MIT license](LICENSE)
 [Initial release notes](docs/release-v0.1.0.md) · [Desktop guide](docs/guide.md)
