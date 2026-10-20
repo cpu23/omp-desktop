@@ -12,6 +12,8 @@ setup, and security boundaries.
 - Reconnecting panes restore terminal-state snapshots rather than a 512 KiB raw tail that could begin inside a
   repaint or image sequence. Snapshots retain bounded scrollback and inline images across producer resizes.
 - Snapshot/live-output handoff shares a parser boundary so output is neither skipped nor duplicated.
+- Removed forced scrollback snapping; scrolling now moves continuously, including near the live screen and with
+  less than a screen of history.
 
 Apply these daemon and client changes only after active work finishes: restarting the daemon ends its PTY
 children. Existing transcript sessions resume on the next start; an already-discarded raw tail cannot be recovered

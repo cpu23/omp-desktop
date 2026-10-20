@@ -1,5 +1,4 @@
 import { trimSelectionHighlight } from "./selection";
-import { protectScrollback } from "./scrollback";
 import {
   applySidebarState, onSidebarStateChange, sidebarFolderView, sidebarFolderExpanded,
   toggleSidebarFolder, STORE_KEY as SIDEBAR_KEY,
@@ -492,7 +491,6 @@ class Pane {
   #notice: string | null = null;
   #selectionEvents = new AbortController();
   #selectionRevision = 0;
-  #disposeScrollback: (() => void) | null = null;
   #disposeFileDrop: (() => void) | null = null;
 
   constructor(id: string, binding: PaneBinding) {
@@ -572,7 +570,6 @@ class Pane {
     trimSelectionHighlight(this.term);
     this.term.loadAddon(new UnicodeGraphemesAddon());
     const rendererWarning = document.createElement("span");
-    this.#disposeScrollback = protectScrollback(this.term);
     rendererWarning.textContent = "DOM";
     rendererWarning.title = "GPU renderer unavailable: box and block glyphs may have seams";
     const showRendererWarning = () => {
@@ -1048,7 +1045,6 @@ class Pane {
 
   destroy(): void {
     this.#selectionEvents.abort();
-    this.#disposeScrollback?.();
     this.#observer.disconnect();
     this.#disposeFileDrop?.();
     this.#disposeFileDrop = null;
