@@ -85,9 +85,11 @@ existing session reuses its process. On first upgrading from a daemon that preda
 live pool with `bun run scripts/checkpoint-sessions.ts` before restarting. The command does not stop processes;
 finish their current work before the restart.
 Stopping a session allows 500 ms for graceful termination before forcing a still-owned child to exit.
-On Linux, process-group signals require a verified original PTY leader identity; if it cannot be verified,
-only the PTY child is targeted. Descendants that outlive their original leader cannot safely be force-killed
-by a potentially reused group ID. Daemon shutdown waits for bounded child cleanup as well as ledger writes.
+On Linux, initial process-group signals require a verified original PTY leader identity; if it cannot be verified,
+only the PTY child is targeted. If the leader exits during graceful termination, escalation checks for remaining
+members of its original process group and session before signaling them. A reused leader PID is rejected;
+descendants that leave the original group are not targeted. Daemon shutdown waits for bounded child cleanup
+as well as ledger writes.
 Bun's frozen-lockfile install applies the checked-in `bun-pty@0.4.11` patch automatically. It releases native
 PTY handles after genuine exits, preserving final output without synthesizing a second exit event.
 

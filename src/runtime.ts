@@ -1,5 +1,5 @@
 import { spawn, type IPty } from "bun-pty";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { basename } from "node:path";
 import type { RuntimeInfo } from "./protocol";
 import { sniffSessionFile } from "./sniff";
@@ -244,10 +244,11 @@ export class Runtime {
     }
     const identity = this.#processGroupIdentity;
     const pty = this.#pty;
-    // Never signal by a retained numeric PGID after its original leader exited:
-    // a new, unrelated process group may have reused that number.
+    // The direct child may exit on SIGTERM while same-session descendants
+    // survive it. A remaining group member preserves the original PGID; if the
+    // leader PID already exists with a different identity, it has been reused.
     const groupSignalled =
-      identity !== null && processGroupIdentityMatches(identity) && signalProcessGroup(identity.pid, "SIGKILL");
+      identity !== null && processGroupIdentityStillExists(identity) && signalProcessGroup(identity.pid, "SIGKILL");
     if (!groupSignalled && pty) this.#killPty(pty, "SIGKILL");
     this.#terminationEscalationComplete = true;
     this.#finishTermination();
@@ -272,7 +273,9 @@ export class Runtime {
 
 }
 
-function readProcessGroupIdentity(pid: number): ProcessGroupIdentity | null {
+type LinuxProcessStat = { processGroup: number; session: number; startTime: string };
+
+function readLinuxProcessStat(pid: number): LinuxProcessStat | null {
   if (process.platform !== "linux" || !Number.isSafeInteger(pid) || pid <= 1) return null;
   try {
     const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
@@ -280,16 +283,51 @@ function readProcessGroupIdentity(pid: number): ProcessGroupIdentity | null {
     if (commandEnd < 0) return null;
     const fields = stat.slice(commandEnd + 1).trim().split(/\s+/);
     // After comm: state is field 3, pgrp is 5, session is 6, starttime is 22.
-    if (Number(fields[2]) !== pid || Number(fields[3]) !== pid || !fields[19]) return null;
-    return { pid, startTime: fields[19] };
+    const processGroup = Number(fields[2]);
+    const session = Number(fields[3]);
+    const startTime = fields[19];
+    if (!Number.isSafeInteger(processGroup) || !Number.isSafeInteger(session) || !startTime) return null;
+    return { processGroup, session, startTime };
   } catch {
     return null;
   }
 }
 
+function readProcessGroupIdentity(pid: number): ProcessGroupIdentity | null {
+  const stat = readLinuxProcessStat(pid);
+  if (stat === null || stat.processGroup !== pid || stat.session !== pid) return null;
+  return { pid, startTime: stat.startTime };
+}
+
 function processGroupIdentityMatches(identity: ProcessGroupIdentity): boolean {
-  const current = readProcessGroupIdentity(identity.pid);
-  return current !== null && current.startTime === identity.startTime;
+  const current = readLinuxProcessStat(identity.pid);
+  return (
+    current !== null &&
+    current.processGroup === identity.pid &&
+    current.session === identity.pid &&
+    current.startTime === identity.startTime
+  );
+}
+
+function processGroupIdentityStillExists(identity: ProcessGroupIdentity): boolean {
+  const leader = readLinuxProcessStat(identity.pid);
+  if (leader !== null) {
+    return (
+      leader.processGroup === identity.pid &&
+      leader.session === identity.pid &&
+      leader.startTime === identity.startTime
+    );
+  }
+  try {
+    for (const entry of readdirSync("/proc")) {
+      if (!/^\d+$/.test(entry)) continue;
+      const member = readLinuxProcessStat(Number(entry));
+      if (member?.processGroup === identity.pid && member.session === identity.pid) return true;
+    }
+  } catch {
+    return false;
+  }
+  return false;
 }
 
 function signalProcessGroup(pid: number, signal: NodeJS.Signals): boolean {

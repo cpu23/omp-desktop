@@ -12,7 +12,7 @@
  * Bash children so cleanup is observable at the process level.
  */
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { RuntimeManager, PendingRuntimeCapacityError } from "./manager";
@@ -63,6 +63,19 @@ function processExists(pid: number): boolean {
     return true;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+    throw error;
+  }
+}
+
+function processIsRunning(pid: number): boolean {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const commandEnd = stat.lastIndexOf(")");
+    if (commandEnd < 0) return false;
+    const state = stat.slice(commandEnd + 1).trim().split(/\s+/)[0];
+    return state !== "Z" && state !== "X";
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
     throw error;
   }
 }
@@ -152,6 +165,41 @@ describe("durable pool snapshots", () => {
     expect(remaining.status).toBe("exited");
     expect(processExists(stoppedPid)).toBe(false);
     expect(processExists(remainingPid)).toBe(false);
+  });
+  test.skipIf(process.platform !== "linux")("SIGTERM-exiting PTY leaders do not orphan descendants ignoring SIGTERM", async () => {
+    const childPidFile = join(dir, "term-ignoring-descendant.pid");
+    const leaderExitOmp = join(dir, "leader-exits-on-term");
+    writeFileSync(
+      leaderExitOmp,
+      `#!/bin/bash\ntrap 'exit 0' TERM\n/bin/bash -c 'trap "" TERM HUP; printf "%s\\n" "$$" > "${childPidFile}"; while :; do sleep 1; done' &\nwait\n`,
+    );
+    chmodSync(leaderExitOmp, 0o755);
+
+    const pool = manager(leaderExitOmp);
+    const runtime = await pool.create({});
+    runtime.start();
+    const leaderPid = runtime.pid;
+    if (leaderPid === null) throw new Error("Bash leader did not start");
+    await waitFor(() => existsSync(childPidFile), "the TERM-ignoring descendant to start");
+    const childPid = Number(readFileSync(childPidFile, "utf8").trim());
+    if (!Number.isSafeInteger(childPid) || childPid <= 1) throw new Error("invalid descendant PID");
+    await waitFor(() => processExists(childPid), "the TERM-ignoring descendant to remain alive");
+
+    try {
+      expect(pool.kill(runtime.id)).toBe(true);
+      await pool.killAll();
+      expect(runtime.status).toBe("exited");
+      await waitFor(() => !processIsRunning(childPid), "the SIGKILLed descendant to exit");
+    } finally {
+      if (processExists(childPid)) {
+        try {
+          process.kill(-leaderPid, "SIGKILL");
+        } catch {
+          // The descendant may exit between the liveness check and group signal.
+        }
+      }
+      await pool.killAll("SIGKILL");
+    }
   });
 
   test.skipIf(process.platform !== "linux")("PTY exit releases native handles and writer threads", async () => {
