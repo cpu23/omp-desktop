@@ -765,7 +765,7 @@ body.session-dragging * {
   grid-template-columns: minmax(0, 1fr) auto;
   grid-template-areas:
     "name name"
-    "sub sub";
+    "sub actions";
   align-items: center;
   column-gap: 7px;
   row-gap: 3px;
@@ -853,9 +853,7 @@ body.session-dragging * {
 }
 
 .row-done {
-  position: absolute;
-  right: 9px;
-  bottom: 9px;
+  flex: 0 0 6px;
   width: 6px;
   height: 6px;
   border-radius: 50%;
@@ -879,20 +877,17 @@ body.session-dragging * {
   white-space: nowrap;
 }
 
-/* Fixed action slots keep pins aligned across live/recent cards and prevent
-   hover or retained keyboard focus from shifting the title. */
+/* Actions share the metadata line, leaving the full title width available. */
 .row-actions {
-  position: absolute;
-  top: 7px;
-  right: 9px;
+  grid-area: actions;
   display: grid;
   grid-template-columns: 22px 22px;
   align-items: center;
   gap: 3px;
 }
 
-.row .name {
-  padding-right: 48px;
+.row .sub {
+  overflow: hidden;
 }
 
 .row .pin,

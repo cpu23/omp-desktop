@@ -1,5 +1,4 @@
 import { trimSelectionHighlight } from "./selection";
-import { protectScrollback } from "./scrollback";
 import {
   applySidebarState, onSidebarStateChange, sidebarFolderView, sidebarFolderExpanded,
   toggleSidebarFolder, STORE_KEY as SIDEBAR_KEY,
@@ -9,7 +8,7 @@ import { CompletionTracker } from "./completion-tracker";
 import { CompletionNotifications } from "./notifications";
 import { Terminal } from "@xterm/xterm";
 import { UnicodeGraphemesAddon } from "@xterm/addon-unicode-graphemes";
-import { ImageAddon } from "@xterm/addon-image";
+import { loadImageAddon } from "./image-addon";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { repairWebglCanvasResize } from "./webgl-resize";
 import { WebLinksAddon } from "@xterm/addon-web-links";
@@ -492,7 +491,6 @@ class Pane {
   #notice: string | null = null;
   #selectionEvents = new AbortController();
   #selectionRevision = 0;
-  #disposeScrollback: (() => void) | null = null;
   #disposeFileDrop: (() => void) | null = null;
 
   constructor(id: string, binding: PaneBinding) {
@@ -572,7 +570,6 @@ class Pane {
     trimSelectionHighlight(this.term);
     this.term.loadAddon(new UnicodeGraphemesAddon());
     const rendererWarning = document.createElement("span");
-    this.#disposeScrollback = protectScrollback(this.term);
     rendererWarning.textContent = "DOM";
     rendererWarning.title = "GPU renderer unavailable: box and block glyphs may have seams";
     const showRendererWarning = () => {
@@ -594,7 +591,7 @@ class Pane {
       showRendererWarning();
       console.warn("omp-desktop: GPU renderer unavailable", error);
     }
-    this.term.loadAddon(new ImageAddon());
+    loadImageAddon(this.term);
     this.term.loadAddon(new WebLinksAddon(openTerminalLink));
     this.term.onData((data) => {
       if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: "input", data }));
@@ -1048,7 +1045,6 @@ class Pane {
 
   destroy(): void {
     this.#selectionEvents.abort();
-    this.#disposeScrollback?.();
     this.#observer.disconnect();
     this.#disposeFileDrop?.();
     this.#disposeFileDrop = null;
