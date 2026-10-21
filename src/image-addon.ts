@@ -1,5 +1,5 @@
 import { ImageAddon } from "@xterm/addon-image";
-import type { Terminal } from "@xterm/xterm";
+import type { IMarker, Terminal } from "@xterm/xterm";
 
 type ImageHandler = {
   start(): void;
@@ -15,6 +15,7 @@ type ImageHandler = {
 export function loadImageAddon(term: Terminal): ImageAddon {
   const addon = new ImageAddon();
   term.loadAddon(addon);
+  retainPartiallyDeletedImages(term, addon);
   const internals = addon as unknown as {
     _opts: { iipSizeLimit: number };
     _handlers: Map<string, ImageHandler>;
@@ -123,4 +124,97 @@ export function loadImageAddon(term: Terminal): ImageAddon {
     }
   };
   return addon;
+}
+
+/** addon-image 0.9 anchors ownership to the last image row. Deleting that row
+ * must not discard pixels still referenced by earlier rows. Check after parsing,
+ * when buffer splices have finished; explicit cache eviction remains immediate.
+ * These private hooks are pinned to addon-image 0.9 / xterm 6. */
+function retainPartiallyDeletedImages(term: Terminal, addon: ImageAddon): void {
+  type Spec = { marker?: IMarker; tileCount: number; bufferType: string };
+  // The dependency does not expose its storage lifecycle through its public API.
+  const imageInternals = addon as unknown as {
+    _storage: {
+      _images: Map<number, Spec>;
+      _delImg(id: number): void;
+      _evictOldest(room: number): number;
+      reset(): void;
+    };
+  };
+  const storage = imageInternals._storage;
+  const pending = new Set<number>();
+  const remove = storage._delImg.bind(storage);
+  const evict = storage._evictOldest.bind(storage);
+  const reset = storage.reset.bind(storage);
+  let forceRemoval = false;
+  storage._delImg = (id) => {
+    const spec = storage._images.get(id);
+    if (!forceRemoval && spec?.marker?.isDisposed && spec.tileCount > 0 && spec.bufferType === "normal") {
+      pending.add(id);
+      return;
+    }
+    pending.delete(id);
+    remove(id);
+  };
+  storage._evictOldest = (room) => {
+    forceRemoval = true;
+    try { return evict(room); } finally { forceRemoval = false; }
+  };
+  storage.reset = () => {
+    forceRemoval = true;
+    try {
+      // Disposed markers do not fire again during reset. Release deferred
+      // bitmaps before upstream reset clears the image map that owns them.
+      for (const id of pending) remove(id);
+      reset();
+    } finally { pending.clear(); forceRemoval = false; }
+  };
+  const parsed = term.onWriteParsed(() => {
+    if (!pending.size) return;
+    // xterm's public buffer API omits image-tile extended attributes.
+    const terminalInternals = term as unknown as {
+      _core: { buffers: { normal: {
+        ybase: number; y: number;
+        lines: { length: number; get(row: number): {
+          getBg(col: number): number;
+          _extendedAttrs: Record<number, { imageId?: number }>;
+        } };
+      } } };
+    };
+    const buffer = terminalInternals._core.buffers.normal;
+    for (const id of pending) {
+      if (term.buffer.active.type !== "normal") continue;
+      pending.delete(id);
+      const spec = storage._images.get(id);
+      if (!spec) continue;
+      let lastRow = -1;
+      for (let row = buffer.lines.length - 1; row >= 0 && lastRow < 0; row--) {
+        const line = buffer.lines.get(row);
+        for (const col in line._extendedAttrs) {
+          // xterm BgFlags.HAS_EXTENDED: stale attribute entries can outlive cells.
+          if ((line.getBg(Number(col)) & 0x10000000) && line._extendedAttrs[col].imageId === id) {
+            lastRow = row;
+            break;
+          }
+        }
+      }
+      if (lastRow < 0) {
+        remove(id);
+        continue;
+      }
+      const marker = term.registerMarker(lastRow - buffer.ybase - buffer.y);
+      if (!marker) {
+        remove(id);
+        continue;
+      }
+      spec.marker = marker;
+      marker.onDispose(() => storage._delImg(id));
+    }
+  });
+  const dispose = addon.dispose.bind(addon);
+  addon.dispose = () => {
+    parsed.dispose();
+    storage.reset();
+    dispose();
+  };
 }

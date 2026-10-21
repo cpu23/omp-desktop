@@ -78,6 +78,9 @@ scrolling margins (DECSTBM) and cursor visibility when a pane reconnects, along 
 retained inline images. Replay follows the producer's resize history instead of parsing a truncated raw-output tail
 at the latest size. Encoded image sidecars are capped at 128 MiB per runtime; the oldest images may be evicted
 while their reserved rows remain.
+The client separately caps decoded image pixels at 128 MB per pane. Cache eviction can leave a checkerboard
+placeholder. Partial image-row deletion preserves surviving tiles through scrolling redraws; images are released
+when their remaining rows leave history or the cache limit requires eviction.
 Use the sidebar stop action to terminate a session. Live sessions are recorded in a durable
 ledger and resumed from their OMP transcripts after a daemon restart; the old processes are not preserved, and
 in-flight work or unsaved input cannot be restored. Each transcript has one live process at a time; attaching an
