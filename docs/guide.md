@@ -125,7 +125,12 @@ inline rendering. Clipboard permission errors appear in the status area; large i
 to decode.
 
 OMP's iTerm2 images omit the optional file-size field. The desktop supplies the exact decoded size before
-passing these images to the image addon, so their reserved rows display the image instead of an empty black band.
+passing these images to the image addon. A pinned `@xterm/addon-image@0.9.0` patch also recognizes WebP
+(lossy, lossless and extended headers), which OMP can emit for screenshots. Upstream recognizes only PNG,
+JPEG and GIF; without the patch, WebP payloads are silently discarded and leave empty image-sized bands.
+Both live output and replay use the same decoder, resizing rules and pixel limits. Frozen-lockfile installs
+apply this patch automatically. Restart the daemon after updating dependencies and reload the client to use
+the rebuilt bundle; wait for active work to finish first, since restarting ends its PTY children.
 
 Drop files onto a pane to insert quoted paths without submitting them. The native window uses original paths for
 all file types and does not upload file contents. In browsers, if security hides a file's path, only images can
