@@ -162,7 +162,12 @@ function retainPartiallyDeletedImages(term: Terminal, addon: ImageAddon): void {
   };
   storage.reset = () => {
     forceRemoval = true;
-    try { reset(); } finally { pending.clear(); forceRemoval = false; }
+    try {
+      // Disposed markers do not fire again during reset. Release deferred
+      // bitmaps before upstream reset clears the image map that owns them.
+      for (const id of pending) remove(id);
+      reset();
+    } finally { pending.clear(); forceRemoval = false; }
   };
   const parsed = term.onWriteParsed(() => {
     if (!pending.size) return;
