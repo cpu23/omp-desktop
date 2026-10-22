@@ -132,6 +132,17 @@ Both live output and replay use the same decoder, resizing rules and pixel limit
 apply this patch automatically. Restart the daemon after updating dependencies and reload the client to use
 the rebuilt bundle; wait for active work to finish first, since restarting ends its PTY children.
 
+The replay mirror preserves the producer's saved cursor during image repaint. When an upward image move
+clamps at the viewport or scroll margin, it records the actual parsed image origin rather than assuming
+that moving down reverses the move. This prevents repeated redraws from inserting blank history rows.
+Rows already inserted by an older daemon remain in that daemon's history; a client reload does not repair them.
+
+For a systemd installation, check `systemctl --user cat omp-desktopd` before deploying: `WorkingDirectory`
+and `ExecStart` must point to the updated checkout, not an older branch or worktree.
+Run `bun install --frozen-lockfile` there before restarting. Updating a different worktree, or reloading the app alone, does
+not replace the JavaScript bundle held in the running daemon. Restart only after active work has finished:
+saved chats resume, but in-flight tools and unsent input do not.
+
 Drop files onto a pane to insert quoted paths without submitting them. The native window uses original paths for
 all file types and does not upload file contents. In browsers, if security hides a file's path, only images can
 fall back to upload; other pathless files are ignored. Paths containing control characters are rejected.
