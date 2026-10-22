@@ -36,6 +36,7 @@
     "bun-pty": "^0.4.11"
   },
   "patchedDependencies": {
-    "bun-pty@0.4.11": "patches/bun-pty@0.4.11.patch"
+    "bun-pty@0.4.11": "patches/bun-pty@0.4.11.patch",
+    "@xterm/addon-image@0.9.0": "patches/@xterm%2Faddon-image@0.9.0.patch"
   }
 }

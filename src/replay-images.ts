@@ -237,7 +237,25 @@ export class ReplayImages {
   private savedRowOffset = 0;
   private deferredRestore: DeferredImage | undefined;
 
-  constructor(private readonly terminal?: Terminal) {}
+  private readonly geometryHandler;
+
+  constructor(private readonly terminal?: Terminal) {
+    // Read the actual parsed cursor, not the requested CUU distance: upward
+    // movement can clamp at the viewport or scrolling margin during repaint.
+    this.geometryHandler = terminal?.parser.registerOscHandler(1337, (data) => {
+      if (!data.startsWith("DesktopImage=")) return false;
+      const image = this.images.get(data.slice("DesktopImage=".length));
+      if (!image || image.reservedRows === 0) return true;
+      // xterm 6 exposes the saved cursor only through its internal buffer.
+      const internals = terminal as unknown as {
+        _core: { buffer: { savedY: number; ybase: number } };
+      };
+      const buffer = internals._core.buffer;
+      const savedRow = Math.max(0, Math.min(terminal.rows - 1, buffer.savedY - buffer.ybase));
+      image.reservedRows = Math.max(0, savedRow - terminal.buffer.active.cursorY);
+      return true;
+    });
+  }
 
   /** Replaces OSC 1337 inline images and Sixel DCS images with cell markers. */
   prepare(data: string): string {
@@ -319,6 +337,7 @@ export class ReplayImages {
 
   /** Releases all retained marker state when the mirror is disposed. */
   dispose(): void {
+    this.geometryHandler?.dispose();
     this.reset();
     this.allocatedMarkers.clear();
     this.recycledMarkers = [];
@@ -328,7 +347,7 @@ export class ReplayImages {
   /** Image replay bytes for insertion before the engine restores final modes/cursor. */
   pendingImageData(): string {
     const image = this.deferredRestore && this.images.get(this.deferredRestore.marker);
-    return image ? this.rebuildSavedCursor() + image.payload : "";
+    return image ? image.payload : "";
   }
   /** The exact unfinished parser bytes; append these after terminal state restoration. */
   pendingSequence(): string {
@@ -340,7 +359,7 @@ export class ReplayImages {
     if (this.deferredRestore) {
       if (kind === "escape" && sequence === `${ESC}8`) {
         if (this.images.has(this.deferredRestore.marker)) {
-          output.push(sequence, ESC, "7", this.deferredRestore.marker, ESC, "8");
+          output.push(sequence, this.deferredRestore.marker, CURSOR_LEFT);
         } else {
           output.push(sequence);
         }
@@ -361,9 +380,11 @@ export class ReplayImages {
       }
 
       if (reservedRows > 0) {
-        // Keep the mirror cursor at the image origin and reconstruct its saved
-        // row after writing a blank underlay in place of the omitted image.
-        output.push(ESC, "7", " ", ESC, "8", `${CSI}${reservedRows}B`, ESC, "7", `${CSI}${reservedRows}A`);
+        // The producer owns DECSC. Never reconstruct it by moving back down:
+        // CUU may have clamped, so that would save a different row and scroll
+        // following output early on every repaint.
+        if (this.terminal) output.push(`${ESC}]1337;DesktopImage=${marker}${BEL}`);
+        output.push(" ", CURSOR_LEFT);
         this.deferredRestore = { marker };
       } else {
         output.push(marker, CURSOR_LEFT);
@@ -404,15 +425,6 @@ export class ReplayImages {
       output.push(this.deferredRestore.marker, CURSOR_LEFT);
     }
     this.deferredRestore = undefined;
-  }
-
-  private rebuildSavedCursor(): string {
-    if (!this.savedCursorActive || this.savedRowOffset === 0) return `${ESC}7`;
-    if (this.savedRowOffset > 0) {
-      return `${ESC}7${CSI}${this.savedRowOffset}B${ESC}7${CSI}${this.savedRowOffset}A`;
-    }
-    const rows = -this.savedRowOffset;
-    return `${ESC}7${CSI}${rows}A${ESC}7${CSI}${rows}B`;
   }
 
   private rememberImage(payload: string, reservedRows: number): string | undefined {

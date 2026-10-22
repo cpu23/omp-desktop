@@ -171,6 +171,38 @@ describe("terminal replay snapshots", () => {
     }
   });
 
+  for (const row of [1, 17, 34]) {
+    for (const pendingRestore of [false, true]) {
+      test(`image repaint preserves saved row ${row}, including a ${pendingRestore ? "pending" : "completed"} restore`, async () => {
+        const replay = new TerminalReplay(40, 34);
+        const original = new Terminal({ cols: 40, rows: 34, allowProposedApi: true });
+        const restored = new Terminal({ cols: 40, rows: 34, allowProposedApi: true });
+        try {
+          // Native transcript repaint can request an image origin above the
+          // viewport. CUU clamps; it is not the inverse of a later CUD.
+          const image = `\x1b[${row};1H\x1b7\x1b[19A\x1b]1337;File=inline=1;width=5:YWJj\x07`;
+          const before = image + (pendingRestore ? "" : "\x1b8");
+          await append(replay, before);
+          await write(original, before);
+          await write(restored, (await snapshot(replay)).data);
+          const continuation = (pendingRestore ? "\x1b8" : "") +
+            Array.from({ length: 40 }, (_, i) => `\r\nline ${i}`).join("");
+          await append(replay, continuation);
+          await write(original, continuation);
+          await write(restored, continuation);
+          expect(lines(restored).map((line) => line.trimEnd())).toEqual(lines(original).map((line) => line.trimEnd()));
+          expect(restored.buffer.active.cursorY).toBe(original.buffer.active.cursorY);
+          await write(restored, (await snapshot(replay)).data);
+          expect(lines(restored).map((line) => line.trimEnd())).toEqual(lines(original).map((line) => line.trimEnd()));
+        } finally {
+          replay.dispose();
+          original.dispose();
+          restored.dispose();
+        }
+      });
+    }
+  }
+
   test("preserves a hidden cursor in a restored snapshot", async () => {
     const replay = new TerminalReplay(40, 8);
     const restored = new Terminal({ cols: 40, rows: 8, allowProposedApi: true });
