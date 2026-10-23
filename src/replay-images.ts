@@ -1,4 +1,5 @@
 import type { Terminal } from "@xterm/headless";
+import type { RuntimeResourceLease } from "./resource-budget";
 
 type SequenceKind = "escape" | "csi" | "osc" | "dcs" | "string";
 type ScannerState = "ground" | "escape" | "escape-intermediate" | "csi" | "string" | "string-escape";
@@ -8,6 +9,11 @@ const BEL = "\x07";
 const CSI = `${ESC}[`;
 const CURSOR_LEFT = `${CSI}1D`;
 const MAX_SIDECAR_BYTES = 128 * 1024 * 1024;
+const OSC_INLINE_FILE_PREFIXES = [`${ESC}]1337;File=`, "\x9d1337;File="];
+const SIXEL_IMAGE_PREFIXES = [`${ESC}Pq`, "\x90q"];
+const MAX_IMAGE_PREFIX_LENGTH = 12;
+const MAX_IMAGE_HEADER_LENGTH = 1024;
+const CONTROL_START = /[\x1b\x9b\x9d\x90\x98\x9e\x9f]/;
 const MARKER_RANGES: readonly [number, number][] = [
   [0xe000, 0xf8ff],
   [0xf0000, 0xffffd],
@@ -21,9 +27,25 @@ class VtSequenceScanner {
   private stringIsOsc = false;
   private parts: string[] = [];
   private pendingLength = 0;
+  private reservedBytes = 0;
+  private imagePrefix = "";
+  private imagePrefixEligible = false;
+  private imageHeaderPending = false;
+  private imageHeader = "";
+  private imageCandidate = false;
   private overflow = false;
 
+  constructor(
+    private readonly maxPendingBytes: number,
+    private readonly reserve: ((bytes: number) => boolean) | undefined,
+    private readonly release: ((bytes: number) => void) | undefined,
+  ) {}
+
   feed(data: string, onText: (text: string) => void, onSequence: (kind: SequenceKind, sequence: string) => void): void {
+    if (this.state === "ground" && !CONTROL_START.test(data)) {
+      if (data.length > 0) onText(data);
+      return;
+    }
     let index = 0;
     let textStart = 0;
     let sequenceStart = this.state === "ground" ? -1 : 0;
@@ -54,8 +76,13 @@ class VtSequenceScanner {
 
         if (kind && nextState) {
           if (textStart < index) onText(data.slice(textStart, index));
-          this.parts = [];
           this.kind = kind;
+          this.parts = [];
+          this.imagePrefix = "";
+          this.imagePrefixEligible = kind === "osc" || kind === "dcs";
+          this.imageHeaderPending = false;
+          this.imageHeader = "";
+          this.imageCandidate = false;
           this.state = nextState;
           sequenceStart = index;
           index += 1;
@@ -80,14 +107,14 @@ class VtSequenceScanner {
           } else if (ch === "]") {
             this.kind = "osc";
             this.stringIsOsc = true;
+            this.imagePrefix = this.parts.join("");
+            this.imagePrefixEligible = true;
             this.state = "string";
           } else if (ch === "P") {
             this.kind = "dcs";
             this.stringIsOsc = false;
-            this.state = "string";
-          } else if (ch === "X" || ch === "^" || ch === "_") {
-            this.kind = "string";
-            this.stringIsOsc = false;
+            this.imagePrefix = this.parts.join("");
+            this.imagePrefixEligible = true;
             this.state = "string";
           } else if (code >= 0x20 && code <= 0x2f) {
             this.state = "escape-intermediate";
@@ -132,7 +159,11 @@ class VtSequenceScanner {
 
       if (restartAtEscape) {
         this.appendPart(data.slice(sequenceStart, index));
-        if (!this.overflow) onSequence(this.kind!, this.parts.join(""));
+        if (!this.overflow) {
+          const sequence = this.parts.join("");
+          this.releasePending();
+          onSequence(this.kind!, sequence);
+        }
         this.reset();
         sequenceStart = index;
         this.kind = "escape";
@@ -145,7 +176,11 @@ class VtSequenceScanner {
 
       if (complete) {
         this.appendPart(data.slice(sequenceStart, index + 1));
-        if (!this.overflow) onSequence(this.kind!, this.parts.join(""));
+        if (!this.overflow) {
+          const sequence = this.parts.join("");
+          this.releasePending();
+          onSequence(this.kind!, sequence);
+        }
         this.reset();
         index += 1;
         textStart = index;
@@ -176,32 +211,116 @@ class VtSequenceScanner {
   }
 
   clear(): void {
+    this.releasePending();
     this.state = "ground";
     this.kind = undefined;
     this.stringIsOsc = false;
     this.parts = [];
     this.pendingLength = 0;
+    this.imagePrefix = "";
+    this.imagePrefixEligible = false;
+    this.imageHeaderPending = false;
+    this.imageHeader = "";
+    this.imageCandidate = false;
     this.overflow = false;
   }
 
   private reset(): void {
+    this.releasePending();
     this.state = "ground";
     this.kind = undefined;
     this.stringIsOsc = false;
     this.parts = [];
     this.pendingLength = 0;
+    this.imagePrefix = "";
+    this.imagePrefixEligible = false;
+    this.imageHeaderPending = false;
+    this.imageHeader = "";
+    this.imageCandidate = false;
     this.overflow = false;
   }
 
   private appendPart(part: string): void {
+    if (this.overflow || part.length === 0) return;
+    const headerWasPending = this.imageHeaderPending;
+    this.#inspectImagePrefix(part);
     if (this.overflow) return;
-    this.pendingLength += part.length;
-    if (this.pendingLength > MAX_SIDECAR_BYTES) {
-      this.overflow = true;
-      this.parts = [];
+    if (headerWasPending && this.imageHeaderPending) this.#inspectImageHeader(part);
+    if (this.overflow) return;
+
+    const bytes = Buffer.byteLength(part);
+    const nextLength = this.pendingLength + bytes;
+    const pendingLimit = this.imageCandidate ? this.maxPendingBytes : MAX_SIDECAR_BYTES;
+    const reserveBytes = this.imageCandidate && this.reserve
+      ? this.reservedBytes === 0 ? nextLength : bytes
+      : 0;
+    if (nextLength > pendingLimit || (reserveBytes > 0 && !this.reserve!(reserveBytes))) {
+      this.#overflowPending();
       return;
     }
+    this.pendingLength = nextLength;
+    this.reservedBytes += reserveBytes;
     this.parts.push(part);
+  }
+
+  #inspectImagePrefix(part: string): void {
+    if (!this.imagePrefixEligible) return;
+    const prefixOptions = this.kind === "osc" ? OSC_INLINE_FILE_PREFIXES : SIXEL_IMAGE_PREFIXES;
+    const prefixLength = this.kind === "osc" ? MAX_IMAGE_PREFIX_LENGTH : 3;
+    const prefix = this.imagePrefix + part.slice(0, Math.max(0, prefixLength - this.imagePrefix.length));
+    for (const imagePrefix of prefixOptions) {
+      if (prefix.startsWith(imagePrefix)) {
+        const prefixPartLength = imagePrefix.length - this.imagePrefix.length;
+        this.imagePrefix = "";
+        this.imagePrefixEligible = false;
+        if (this.kind === "dcs") {
+          this.imageCandidate = true;
+        } else {
+          this.imageHeaderPending = true;
+          this.#inspectImageHeader(part.slice(prefixPartLength));
+        }
+        return;
+      }
+    }
+    for (const imagePrefix of prefixOptions) {
+      if (imagePrefix.startsWith(prefix)) {
+        this.imagePrefix = prefix;
+        return;
+      }
+    }
+    this.imagePrefix = "";
+    this.imagePrefixEligible = false;
+  }
+
+  #inspectImageHeader(part: string): void {
+    const separator = part.indexOf(":");
+    const headerLength = this.imageHeader.length + (separator < 0 ? part.length : separator);
+    if (headerLength > MAX_IMAGE_HEADER_LENGTH) {
+      this.imageHeaderPending = false;
+      this.imageHeader = "";
+      this.#overflowPending();
+      return;
+    }
+    if (separator < 0) {
+      this.imageHeader += part;
+      return;
+    }
+    this.imageHeader += part.slice(0, separator);
+    this.imageCandidate = this.imageHeader.split(";").includes("inline=1");
+    this.imageHeaderPending = false;
+    this.imageHeader = "";
+  }
+
+  #overflowPending(): void {
+    this.overflow = true;
+    this.parts = [];
+    this.pendingLength = 0;
+    this.releasePending();
+  }
+
+  private releasePending(): void {
+    if (this.reservedBytes > 0) this.release?.(this.reservedBytes);
+    this.reservedBytes = 0;
   }
 }
 
@@ -221,8 +340,10 @@ interface DeferredImage {
  * on the reservation's last row and replay draws upward into already-written rows.
  */
 export class ReplayImages {
-  private readonly scanner = new VtSequenceScanner();
+  private readonly scanner: VtSequenceScanner;
   private readonly images = new Map<string, ReplayImage>();
+  private readonly resources?: RuntimeResourceLease;
+  private readonly maxSidecarBytes: number;
   private readonly pendingMarkers = new Set<string>();
   private readonly allocatedMarkers = new Set<string>();
   private readonly userPrivateUse = new Set<string>();
@@ -239,7 +360,14 @@ export class ReplayImages {
 
   private readonly geometryHandler;
 
-  constructor(private readonly terminal?: Terminal) {
+  constructor(private readonly terminal?: Terminal, resources?: RuntimeResourceLease) {
+    this.resources = resources;
+    this.maxSidecarBytes = resources?.imageBytesPerRuntime ?? MAX_SIDECAR_BYTES;
+    this.scanner = new VtSequenceScanner(
+      this.maxSidecarBytes,
+      resources ? (bytes) => this.reserveImageBytes(bytes) : undefined,
+      resources ? (bytes) => resources.releaseImage(bytes) : undefined,
+    );
     // Read the actual parsed cursor, not the requested CUU distance: upward
     // movement can clamp at the viewport or scrolling margin during repaint.
     this.geometryHandler = terminal?.parser.registerOscHandler(1337, (data) => {
@@ -325,9 +453,8 @@ export class ReplayImages {
 
   /** Clears sidecars and parser state when the mirrored terminal is reset. */
   reset(): void {
-    this.images.clear();
+    for (const marker of this.images.keys()) this.forgetImage(marker);
     this.pendingMarkers.clear();
-    this.sidecarBytes = 0;
     this.needsPrune = false;
     this.scanner.clear();
     this.savedCursorActive = false;
@@ -427,18 +554,29 @@ export class ReplayImages {
     this.deferredRestore = undefined;
   }
 
+  private reserveImageBytes(bytes: number): boolean {
+    if (!this.resources) return true;
+    while (!this.resources.reserveImage(bytes)) {
+      const oldest = this.images.keys().next().value as string | undefined;
+      if (oldest === undefined) return false;
+      this.forgetImage(oldest);
+    }
+    return true;
+  }
+
   private rememberImage(payload: string, reservedRows: number): string | undefined {
     const bytes = Buffer.byteLength(payload);
-    if (bytes > MAX_SIDECAR_BYTES) return undefined;
-    if (this.sidecarBytes + bytes > MAX_SIDECAR_BYTES && this.pendingMarkers.size === 0) {
+    if (bytes > this.maxSidecarBytes) return undefined;
+    if (this.sidecarBytes + bytes > this.maxSidecarBytes && this.pendingMarkers.size === 0) {
       this.pruneLiveMarkers();
     }
 
-    while (this.sidecarBytes + bytes > MAX_SIDECAR_BYTES) {
+    while (this.sidecarBytes + bytes > this.maxSidecarBytes) {
       const oldest = this.images.keys().next().value as string | undefined;
       if (oldest === undefined) return undefined;
       this.forgetImage(oldest);
     }
+    if (!this.reserveImageBytes(bytes)) return undefined;
 
     const marker = this.allocateMarker();
     this.images.set(marker, { payload, reservedRows, bytes });
@@ -454,6 +592,7 @@ export class ReplayImages {
     this.sidecarBytes -= image.bytes;
     this.images.delete(marker);
     this.pendingMarkers.delete(marker);
+    this.resources?.releaseImage(image.bytes);
     if (this.deferredRestore?.marker === marker) this.deferredRestore = undefined;
   }
 

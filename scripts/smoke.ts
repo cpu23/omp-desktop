@@ -416,7 +416,7 @@ async function phaseIRestored(fixture: RestoreFixture): Promise<void> {
   const pane = await attach(listed[0].id);
   pane.send("restored\n");
   await waitFor(
-    async () => (await runtimes()).find((entry) => entry.id === listed[0].id)?.status === "exited",
+    async () => !(await runtimes()).some((entry) => entry.id === listed[0].id),
     10_000,
     "the restored process to take input",
   );
@@ -488,9 +488,16 @@ async function phaseF(stateDir: string): Promise<void> {
     sidebar: JSON.stringify({ width: 300, collapsed: false }),
   };
   writtenState = JSON.stringify(doc);
+  const writeHeaders = { "content-type": "application/json", "X-OMP-Generation": await generation() };
+  const stale = await fetch(`${BASE}/api/state`, {
+    method: "PUT",
+    headers: { ...writeHeaders, "X-OMP-Generation": "previous-daemon" },
+    body: writtenState,
+  });
+  assert(stale.status === 409, "stale daemon generation cannot overwrite workspace state");
   const put = await fetch(`${BASE}/api/state`, {
     method: "PUT",
-    headers: { "content-type": "application/json" },
+    headers: writeHeaders,
     body: writtenState,
   });
   assert(put.ok, "PUT /api/state stores a v1 document");
@@ -502,13 +509,13 @@ async function phaseF(stateDir: string): Promise<void> {
   );
   const wrongVersion = await fetch(`${BASE}/api/state`, {
     method: "PUT",
-    headers: { "content-type": "application/json" },
+    headers: writeHeaders,
     body: JSON.stringify({ version: 3, savedAt: new Date().toISOString() }),
   });
   assert(wrongVersion.status === 400, "PUT rejects an unsupported workspace version");
   const notJson = await fetch(`${BASE}/api/state`, {
     method: "PUT",
-    headers: { "content-type": "application/json" },
+    headers: writeHeaders,
     body: "not json",
   });
   assert(notJson.status === 400, "PUT rejects a non-JSON body");
@@ -559,7 +566,8 @@ async function phaseH(fixture: CwdFixture): Promise<void> {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ resume }),
   })));
-  assert(concurrent.filter((response) => response.ok).length === 8, "concurrent transcript reads cannot exceed runtime capacity");
+  const refusals = await Promise.all(concurrent.filter((response) => !response.ok).map(async (response) => `${response.status}: ${await response.text()}`));
+  assert(concurrent.filter((response) => response.ok).length === 8, `concurrent transcript reads cannot exceed runtime capacity (statuses: ${concurrent.map((response) => response.status).join(", ")}; ${refusals.join("; ")})`);
   assert(concurrent.filter((response) => response.status === 409).length === 1, "one concurrent resume is rejected at capacity");
 }
 
@@ -726,7 +734,7 @@ try {
     {
       ...isolatedHome,
       OMP_DESKTOP_OMP: "/bin/sh",
-      OMP_DESKTOP_OMP_ARGS: "-c pwd",
+      OMP_DESKTOP_OMP_ARGS: "-c pwd;cat",
       OMP_DESKTOP_OVERLAY: "",
       OMP_DESKTOP_EXTENSION: "",
       OMP_DESKTOP_MAX_RUNTIMES: "8",

@@ -34,7 +34,7 @@
  */
 
 import { Database } from "bun:sqlite";
-import { existsSync } from "node:fs";
+import { statSync } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
@@ -69,6 +69,7 @@ export type SessionSummary = {
 const HEADER_BYTES = 8 * 1024;
 const PROMPT_MAX_CHARS = 200;
 const DEFAULT_LIMIT = 60;
+const MAX_SESSION_LIMIT = 200;
 /** Backwards activity scan step; one chunk covers the tail of almost every transcript. */
 const TAIL_CHUNK_BYTES = 64 * 1024;
 /** Roles that form the conversation; tool results and developer context are machinery, not use. */
@@ -78,6 +79,8 @@ const MAX_CONCURRENT_IO = 8;
 
 /** Memory budget for each metadata/cost memo table; oversized entries are skipped. */
 const CACHE_MAX_BYTES = 8 * 1024 * 1024;
+const COST_CARRY_CHARS = 4096;
+const COST_ANCHOR_BYTES = 256;
 
 type CacheState = { bytes: number; weights: Map<unknown, number> };
 const cacheStates = new WeakMap<object, CacheState>();
@@ -86,6 +89,11 @@ const cacheStates = new WeakMap<object, CacheState>();
 function approximateCacheBytes(value: unknown): number {
   if (typeof value === "string") return value.length * 2;
   if (typeof value !== "object" || value === null) return 8;
+  if (value instanceof Map) {
+    let bytes = 24;
+    for (const [key, item] of value) bytes += approximateCacheBytes(key) + approximateCacheBytes(item);
+    return bytes;
+  }
   if (Array.isArray(value)) {
     return 24 + value.reduce((total, item) => total + approximateCacheBytes(item), 0);
   }
@@ -148,7 +156,7 @@ async function mapConcurrent<T, R>(items: readonly T[], worker: (item: T) => Pro
   return results;
 }
 
-type FileVersion = { mtimeMs: number; bytes: number; ctimeMs: number; ino: number };
+type FileVersion = { mtimeMs: number; bytes: number; ctimeMs: number; ino: number; dev: number };
 type SessionFile = FileVersion & { path: string; dir: string; birthtimeMs: number };
 
 function hasSameVersion(cached: FileVersion, file: SessionFile): boolean {
@@ -156,58 +164,147 @@ function hasSameVersion(cached: FileVersion, file: SessionFile): boolean {
     cached.mtimeMs === file.mtimeMs &&
     cached.bytes === file.bytes &&
     cached.ctimeMs === file.ctimeMs &&
-    cached.ino === file.ino
+    cached.ino === file.ino &&
+    cached.dev === file.dev
   );
 }
 
 /**
- * Cost lives in per-message usage records spread across the whole transcript
- * (session cost is their sum, same accounting as omp's `get_session_stats`), so
- * unlike the 8 KiB header this has to read the file. This listing is polled per
- * sidebar refresh, so each transcript is summed once per file version and the
- * result cached; unreadable files contribute 0.
+ * Usage totals can be scattered throughout a transcript. Keep the scanned byte
+ * offset and matcher carry so append-only writes cost only new bytes; replacement,
+ * truncation and same-size rewrites are scanned completely again.
  */
-const costCache = new Map<string, FileVersion & { costUsd: number }>();
+type CostEntry = FileVersion & {
+  costUsd: number;
+  pending: string;
+  prefix: string;
+  tail: string;
+};
+const costCache = new Map<string, CostEntry>();
+const costReadsInFlight = new Map<string, Promise<number>>();
 
 /** Matches a whole usage cost object, so a chunk boundary can never yield a partial number. */
 const COST_PATTERN = /"cost":\s*\{[^}]*?"total":\s*([0-9.eE+-]+)\s*\}/g;
 
-async function readCost(file: SessionFile): Promise<number> {
-  const cached = costCache.get(file.path);
-  if (cached && hasSameVersion(cached, file)) {
-    cacheTouch(costCache, file.path, cached);
-    return cached.costUsd;
+function costCacheKey(file: SessionFile): string {
+  return JSON.stringify([file.path, file.dev, file.ino, file.bytes, file.mtimeMs, file.ctimeMs]);
+}
+
+function consumeCostText(
+  pending: string,
+  text: string,
+  costUsd: number,
+): { pending: string; costUsd: number } {
+  pending += text;
+  let scanned = 0;
+  for (const match of pending.matchAll(COST_PATTERN)) {
+    const amount = Number(match[1]);
+    if (Number.isFinite(amount) && amount > 0) costUsd += amount;
+    scanned = (match.index ?? 0) + match[0].length;
   }
-  let costUsd = 0;
-  try {
-    const decoder = new TextDecoder();
-    const reader = Bun.file(file.path).stream().getReader();
-    let pending = "";
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      pending += decoder.decode(value, { stream: true });
-      let scanned = 0;
-      for (const match of pending.matchAll(COST_PATTERN)) {
-        const amount = Number(match[1]);
-        if (Number.isFinite(amount) && amount > 0) costUsd += amount;
-        scanned = (match.index ?? 0) + match[0].length;
-      }
-      pending = pending.slice(scanned);
-      // A match is far shorter than this, so trimming cannot drop a straddler.
-      if (pending.length > 4096) pending = pending.slice(-4096);
-    }
-  } catch {
-    costUsd = 0;
+  pending = pending.slice(scanned);
+  // Keep the established bounded carry for incomplete usage objects/tokens.
+  if (pending.length > COST_CARRY_CHARS) pending = pending.slice(-COST_CARRY_CHARS);
+  return { pending, costUsd };
+}
+
+async function cachedCostAnchorsMatch(file: SessionFile, cached: CostEntry): Promise<boolean> {
+  const source = Bun.file(file.path);
+  const prefixEnd = Math.min(cached.bytes, COST_ANCHOR_BYTES);
+  const tailStart = Math.max(0, cached.bytes - COST_ANCHOR_BYTES);
+  const decoder = new TextDecoder("latin1");
+  const [prefix, tail] = await Promise.all([
+    source.slice(0, prefixEnd).arrayBuffer(),
+    source.slice(tailStart, cached.bytes).arrayBuffer(),
+  ]);
+  return decoder.decode(prefix) === cached.prefix && decoder.decode(tail) === cached.tail;
+}
+
+async function scanCost(
+  file: SessionFile,
+  startOffset: number,
+  carry: string,
+  initialCost: number,
+  initialPrefix: string,
+  initialTail: string,
+): Promise<CostEntry> {
+  const decoder = new TextDecoder("latin1");
+  const reader = Bun.file(file.path).slice(startOffset, file.bytes).stream().getReader();
+  let pending = carry;
+  let costUsd = initialCost;
+  let prefix = initialPrefix;
+  let tail = initialTail;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const text = decoder.decode(value);
+    const consumed = consumeCostText(pending, text, costUsd);
+    pending = consumed.pending;
+    costUsd = consumed.costUsd;
+    if (prefix.length < COST_ANCHOR_BYTES) prefix += text.slice(0, COST_ANCHOR_BYTES - prefix.length);
+    tail = (tail + text).slice(-COST_ANCHOR_BYTES);
   }
-  cacheSet(costCache, file.path, {
+  return {
     mtimeMs: file.mtimeMs,
     bytes: file.bytes,
     ctimeMs: file.ctimeMs,
     ino: file.ino,
+    dev: file.dev,
     costUsd,
-  });
-  return costUsd;
+    pending,
+    prefix,
+    tail,
+  };
+}
+
+async function readCostUncached(file: SessionFile): Promise<number> {
+  const cached = costCache.get(file.path);
+  let startOffset = 0;
+  let carry = "";
+  let costUsd = 0;
+  let prefix = "";
+  let tail = "";
+  // OMP appends on the same inode; full rewrites publish by atomic replacement.
+  // Endpoint anchors detect refills, not arbitrary interior edits followed by growth.
+  if (cached && cached.dev === file.dev && cached.ino === file.ino && cached.bytes < file.bytes) {
+    try {
+      if (await cachedCostAnchorsMatch(file, cached)) {
+        startOffset = cached.bytes;
+        carry = cached.pending;
+        costUsd = cached.costUsd;
+        prefix = cached.prefix;
+        tail = cached.tail;
+      }
+    } catch {
+      // If the append anchors cannot be checked, recompute from the current file.
+    }
+  }
+  try {
+    const next = await scanCost(file, startOffset, carry, costUsd, prefix, tail);
+    cacheSet(costCache, file.path, next);
+    return next.costUsd;
+  } catch {
+    // Unreadable files contribute 0 and are retried on the next listing.
+    return 0;
+  }
+}
+
+function readCost(file: SessionFile): Promise<number> {
+  const cached = costCache.get(file.path);
+  if (cached && hasSameVersion(cached, file)) {
+    cacheTouch(costCache, file.path, cached);
+    return Promise.resolve(cached.costUsd);
+  }
+  const key = costCacheKey(file);
+  const inFlight = costReadsInFlight.get(key);
+  if (inFlight) return inFlight;
+  const pending = readCostUncached(file);
+  costReadsInFlight.set(key, pending);
+  pending.then(
+    () => { if (costReadsInFlight.get(key) === pending) costReadsInFlight.delete(key); },
+    () => { if (costReadsInFlight.get(key) === pending) costReadsInFlight.delete(key); },
+  );
+  return pending;
 }
 
 /** Everything but cost; costs are summed only for the rows that survive the limit. */
@@ -234,6 +331,7 @@ async function readActivity(file: SessionFile): Promise<number | null> {
     bytes: file.bytes,
     ctimeMs: file.ctimeMs,
     ino: file.ino,
+    dev: file.dev,
     activityMs,
   });
   return activityMs;
@@ -362,6 +460,7 @@ async function readParsedHeader(file: SessionFile): Promise<HeadInfo | null> {
     bytes: file.bytes,
     ctimeMs: file.ctimeMs,
     ino: file.ino,
+    dev: file.dev,
     info,
   });
   return info;
@@ -370,30 +469,18 @@ async function readParsedHeader(file: SessionFile): Promise<HeadInfo | null> {
 export async function listSessions(
   options: { limit?: number; search?: string; sessionsRoot?: string } = {},
 ): Promise<SessionSummary[]> {
-  const root =
+  const root = resolve(
     options.sessionsRoot ??
-    process.env.OMP_DESKTOP_SESSIONS_DIR ??
-    join(homedir(), ".omp/agent/sessions");
-  const limit =
+      process.env.OMP_DESKTOP_SESSIONS_DIR ??
+      join(homedir(), ".omp/agent/sessions"),
+  );
+  const requestedLimit =
     typeof options.limit === "number" && Number.isFinite(options.limit) && options.limit > 0
       ? Math.floor(options.limit)
       : DEFAULT_LIMIT;
+  const limit = Math.min(requestedLimit, MAX_SESSION_LIMIT);
   const search = options.search?.toLowerCase() ?? "";
-
-  const files = await collectSessionFiles(root);
-  const livePaths = new Set(files.map((file) => file.path));
-  pruneCacheForRoot(costCache, root, livePaths);
-  pruneCacheForRoot(activityCache, root, livePaths);
-  pruneCacheForRoot(headerCache, root, livePaths);
-  const historyTitles = readHistoryTitles(join(dirname(root), "history.db"));
-  // Read every transcript: mtime cannot bound activity (imported files and clock
-  // skew can write messages newer than the file's last touch), so filtering by
-  // mtime first could hide a recent session, and search must see every match.
-  const summaries = (
-    await mapConcurrent(files, (file) => readSummary(file, historyTitles))
-  ).filter((summary): summary is SessionBase => summary !== null);
-  summaries.sort(byActivityDesc);
-
+  const { files, summaries } = await readSessionIndex(root);
   const matched = search
     ? summaries.filter(
         (summary) =>
@@ -405,14 +492,42 @@ export async function listSessions(
       )
     : summaries;
 
-  // A cost sum is a full-file read, unlike the 8 KiB header, so only the rows
-  // that actually cross the wire pay for it.
+  // Only rows crossing the response boundary pay the full-transcript cost scan.
   const byPath = new Map<string, SessionFile>(files.map((file): [string, SessionFile] => [file.path, file]));
-
   return mapConcurrent(matched.slice(0, limit), async (summary) => {
     const file = byPath.get(summary.path);
     return { ...summary, costUsd: file ? await readCost(file) : 0 };
   });
+}
+
+type SessionIndex = { files: SessionFile[]; summaries: SessionBase[] };
+const indexReadsInFlight = new Map<string, Promise<SessionIndex>>();
+
+/** Coalesce simultaneous polling reads without retaining stale search snapshots. */
+function readSessionIndex(root: string): Promise<SessionIndex> {
+  const existing = indexReadsInFlight.get(root);
+  if (existing) return existing;
+  const pending = (async () => {
+    const files = await collectSessionFiles(root);
+    const livePaths = new Set(files.map((file) => file.path));
+    pruneCacheForRoot(costCache, root, livePaths);
+    pruneCacheForRoot(activityCache, root, livePaths);
+    pruneCacheForRoot(headerCache, root, livePaths);
+    const historyTitles = readHistoryTitles(join(dirname(root), "history.db"));
+    // Imported files and clock-skewed timestamps remain eligible; search must
+    // see every match instead of pruning by file mtime.
+    const summaries = (
+      await mapConcurrent(files, (file) => readSummary(file, historyTitles))
+    ).filter((summary): summary is SessionBase => summary !== null);
+    summaries.sort(byActivityDesc);
+    return { files, summaries };
+  })();
+  indexReadsInFlight.set(root, pending);
+  pending.then(
+    () => { if (indexReadsInFlight.get(root) === pending) indexReadsInFlight.delete(root); },
+    () => { if (indexReadsInFlight.get(root) === pending) indexReadsInFlight.delete(root); },
+  );
+  return pending;
 }
 
 /**
@@ -452,6 +567,7 @@ async function collectSessionFiles(root: string): Promise<SessionFile[]> {
           bytes: info.size,
           ctimeMs: info.ctimeMs,
           ino: info.ino,
+          dev: info.dev,
           birthtimeMs: info.birthtimeMs,
         }
       : null;
@@ -581,26 +697,82 @@ function decodeDirName(dir: string): string {
   return rooted.length > 1 ? rooted.replace(/\/$/, "") : rooted;
 }
 
-/** Optional title enrichment from history.db; any failure yields no titles. */
+/** Optional title enrichment from history.db, cached against the main file and WAL. */
+type HistoryFileVersion = { mtimeMs: number; bytes: number; ctimeMs: number; ino: number; dev: number };
+type HistoryVersion = { main: HistoryFileVersion | null; wal: HistoryFileVersion | null };
+type HistoryTitlesEntry = { version: HistoryVersion; titles: Map<string, string> };
+const historyTitlesCache = new Map<string, HistoryTitlesEntry>();
+
+function historyFileVersion(path: string): HistoryFileVersion | null {
+  try {
+    const info = statSync(path);
+    return {
+      mtimeMs: info.mtimeMs,
+      bytes: info.size,
+      ctimeMs: info.ctimeMs,
+      ino: info.ino,
+      dev: info.dev,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function sameHistoryVersion(a: HistoryVersion, b: HistoryVersion): boolean {
+  const mainMatches =
+    a.main === null
+      ? b.main === null
+      : b.main !== null &&
+        a.main.mtimeMs === b.main.mtimeMs &&
+        a.main.bytes === b.main.bytes &&
+        a.main.ctimeMs === b.main.ctimeMs &&
+        a.main.ino === b.main.ino &&
+        a.main.dev === b.main.dev;
+  const walMatches =
+    a.wal === null
+      ? b.wal === null
+      : b.wal !== null &&
+        a.wal.mtimeMs === b.wal.mtimeMs &&
+        a.wal.bytes === b.wal.bytes &&
+        a.wal.ctimeMs === b.wal.ctimeMs &&
+        a.wal.ino === b.wal.ino &&
+        a.wal.dev === b.wal.dev;
+  return mainMatches && walMatches;
+}
+
 function readHistoryTitles(dbPath: string): Map<string, string> {
+  const cacheKey = resolve(dbPath);
+  const version: HistoryVersion = {
+    main: historyFileVersion(cacheKey),
+    wal: historyFileVersion(`${cacheKey}-wal`),
+  };
+  const cached = historyTitlesCache.get(cacheKey);
+  if (cached && sameHistoryVersion(cached.version, version)) {
+    cacheTouch(historyTitlesCache, cacheKey, cached);
+    return cached.titles;
+  }
   const titles = new Map<string, string>();
   try {
-    if (!existsSync(dbPath)) return titles;
-    const db = new Database(dbPath, { readonly: true });
-    try {
-      const rows: unknown[] = db.query("SELECT session_id, title FROM session_titles").all();
-      for (const row of rows) {
-        if (!isRecord(row)) continue;
-        const { session_id, title } = row;
-        if (typeof session_id === "string" && typeof title === "string" && title.trim()) {
-          titles.set(session_id, title.trim());
+    if (version.main !== null) {
+      const db = new Database(cacheKey, { readonly: true });
+      try {
+        const rows: unknown[] = db.query("SELECT session_id, title FROM session_titles").all();
+        for (const row of rows) {
+          if (!isRecord(row)) continue;
+          const { session_id, title } = row;
+          if (typeof session_id === "string" && typeof title === "string" && title.trim()) {
+            titles.set(session_id, title.trim());
+          }
         }
+      } finally {
+        db.close();
       }
-    } finally {
-      db.close();
     }
   } catch {
     // Missing/corrupt/locked history.db is fine: titles are enrichment only.
+    return titles;
   }
+  const updated = { version, titles };
+  cacheSet(historyTitlesCache, cacheKey, updated);
   return titles;
 }

@@ -1,6 +1,7 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import { SerializeAddon } from "@xterm/addon-serialize";
 import { Terminal } from "@xterm/headless";
+import { RuntimeResourceBudget } from "./resource-budget";
 import { TerminalReplay } from "./terminal-replay";
 
 function append(replay: TerminalReplay, data: string): Promise<void> {
@@ -243,6 +244,97 @@ describe("terminal replay snapshots", () => {
     } finally {
       replay.dispose();
       restored.dispose();
+    }
+  });
+
+  test("fences a plain-text visible-screen projection without serializing history", async () => {
+    const replay = new TerminalReplay(40, 3);
+    const serializeSpy = spyOn(SerializeAddon.prototype, "serialize");
+    try {
+      const before = append(replay, "history-only\r\nscreen-one\r\nscreen-two\r\nscreen-three");
+      const screenPromise = replay.screenSnapshot();
+      const after = append(replay, "\r\nlater-only");
+
+      const screen = await screenPromise;
+      await Promise.all([before, after]);
+      expect(screen.cols).toBe(40);
+      expect(screen.rows).toBe(3);
+      expect(screen.screen).toContain("screen-one");
+      expect(screen.screen).not.toContain("history-only");
+      expect(screen.screen).not.toContain("later-only");
+      expect(screen.screen.split("\n")).toHaveLength(3);
+      expect(serializeSpy).not.toHaveBeenCalled();
+    } finally {
+      serializeSpy.mockRestore();
+      replay.dispose();
+    }
+  });
+
+  test("image budget exhaustion preserves ordinary VT controls and split suffix text", async () => {
+    const resources = new RuntimeResourceBudget({
+      imageBytesPerRuntime: 0,
+      imageBytesTotal: 0,
+    }, 1);
+    const lease = resources.createLease(40, 8);
+    const replay = new TerminalReplay(40, 8, lease);
+    try {
+      await append(replay, "\x1b[31mred\x1b[0m\x1b]1337;File=inline=1;width=1:YWJj");
+      await append(replay, "\x07after");
+      const screen = await replay.screenSnapshot();
+      expect(screen.screen).toContain("red");
+      expect(screen.screen).toContain("after");
+    } finally {
+      replay.dispose();
+      lease.release();
+    }
+  });
+
+  test("new attachments reflect scrollback trimmed by another runtime's grant", async () => {
+    const resources = new RuntimeResourceBudget({
+      replayRowsPerRuntime: 4,
+      replayCellsTotal: 320,
+    }, 2);
+    const lease = resources.createLease(40, 2);
+    const replay = new TerminalReplay(40, 2, lease);
+    try {
+      await append(replay, [
+        "oldest-sentinel", "older-two", "older-three", "older-four", "recent-five", "latest-six",
+      ].join("\r\n"));
+      expect((await snapshot(replay)).data).toContain("oldest-sentinel");
+      const other = resources.createLease(40, 2);
+      try {
+        const trimmed = await snapshot(replay);
+        expect(trimmed.data).not.toContain("oldest-sentinel");
+        expect(trimmed.data).toContain("latest-six");
+      } finally {
+        other.release();
+      }
+    } finally {
+      replay.dispose();
+      lease.release();
+    }
+  });
+
+  test("retains the newest image when admission requires evicting an older sidecar", async () => {
+    const first = "\x1b]1337;File=inline=1;width=1:YWJj\x07";
+    const latest = "\x1b]1337;File=inline=1;width=1:ZGVm\x07";
+    const limit = Math.ceil(Buffer.byteLength(first) * 1.5);
+    const resources = new RuntimeResourceBudget({
+      imageBytesPerRuntime: limit,
+      imageBytesTotal: limit,
+    }, 1);
+    const lease = resources.createLease(40, 8);
+    const replay = new TerminalReplay(40, 8, lease);
+    try {
+      await append(replay, first);
+      expect((await snapshot(replay)).data).toContain(first);
+      await append(replay, `\r\n${latest}`);
+      const restored = await snapshot(replay);
+      expect(restored.data).toContain(latest);
+      expect(restored.data).not.toContain(first);
+    } finally {
+      replay.dispose();
+      lease.release();
     }
   });
 });

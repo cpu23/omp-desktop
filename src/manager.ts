@@ -1,6 +1,12 @@
 import { existsSync } from "node:fs";
 import { Runtime, type RuntimeSpec } from "./runtime";
 import type { RuntimeInfo } from "./protocol";
+import {
+  RuntimeResourceBudget,
+  resolveRuntimeResourceBudgetConfig,
+  type RuntimeResourceBudgetConfig,
+  type RuntimeResourceLease,
+} from "./resource-budget";
 import type { LiveSession } from "./state";
 
 export type SpawnRequest = {
@@ -31,6 +37,8 @@ export type ManagerDefaults = {
    * sessions.ts's reader, keeping session-store access out of here.
    */
   readResumeCwd?: (path: string) => Promise<string | null>;
+  /** Per-runtime and aggregate bounds for terminal replay/image/snapshot state. */
+  resourceBudgets?: Partial<RuntimeResourceBudgetConfig>;
 };
 
 export class RuntimeCapacityError extends Error {}
@@ -83,10 +91,15 @@ export class RuntimeManager {
   #pendingResumes = new Map<string, Promise<Runtime>>();
   /** Notified after any change to the set `liveSessions()` returns. */
   #changeSubs = new Set<(change: PoolChange) => void>();
+  #resourceBudget: RuntimeResourceBudget;
   readonly defaults: ManagerDefaults;
 
   constructor(defaults: ManagerDefaults) {
     this.defaults = defaults;
+    this.#resourceBudget = new RuntimeResourceBudget(
+      { ...resolveRuntimeResourceBudgetConfig(), ...defaults.resourceBudgets },
+      defaults.maxRuntimes,
+    );
   }
 
   list(): RuntimeInfo[] {
@@ -144,15 +157,16 @@ export class RuntimeManager {
     for (const sub of this.#changeSubs) sub(change);
   }
 
-  /** Watch one runtime's process lifecycle for pool changes. */
+  /** Remove exited runtimes only after Runtime has delivered final output. */
   #track(runtime: Runtime): void {
-    const changed = (change: PoolChange): void => {
-      // A runtime already removed by kill() is out of the pool; its later exit
-      // must not report one more change for a state that is already recorded.
-      if (this.#runtimes.has(runtime.id)) this.#changed(change);
-    };
-    runtime.subscribeExit(() => changed("exited"));
-    runtime.subscribeSessionFile(() => changed("started"));
+    runtime.subscribeExit(() => {
+      if (this.#runtimes.get(runtime.id) !== runtime) return;
+      this.#runtimes.delete(runtime.id);
+      this.#changed("exited");
+    });
+    runtime.subscribeSessionFile(() => {
+      if (this.#runtimes.get(runtime.id) === runtime) this.#changed("started");
+    });
   }
 
   async create(request: SpawnRequest = {}, options: CreateOptions = {}): Promise<Runtime> {
@@ -226,7 +240,19 @@ export class RuntimeManager {
         OMP_MOBILE_SLOT: id,
       },
     };
-    const runtime = new Runtime(spec);
+    let resources: RuntimeResourceLease;
+    try {
+      resources = this.#resourceBudget.createLease(spec.cols, spec.rows);
+    } catch {
+      throw new RuntimeCapacityError("terminal resource budget cannot accommodate another runtime viewport");
+    }
+    let runtime: Runtime;
+    try {
+      runtime = new Runtime(spec, resources);
+    } catch (error) {
+      resources.release();
+      throw error;
+    }
     // A resumed transcript is the process's identity from its first frame, not
     // only after omp's OSC 1337 sniff: dedupe, the durable ledger, and clients
     // all key sessions by transcript, and a fork to a sibling file (omp's answer
@@ -243,6 +269,7 @@ export class RuntimeManager {
       // A spawn that threw leaves no process behind; do not report a session
       // that is not running (the ledger would restore a phantom forever).
       this.#runtimes.delete(id);
+      runtime.dispose();
       throw error;
     }
     this.#changed("started");
@@ -270,23 +297,24 @@ export class RuntimeManager {
    * exited placeholder (and their binding's resume claim is the client's
    * concern, not the pool's).
    */
-  kill(id: string): boolean {
+  async kill(id: string): Promise<boolean> {
     const runtime = this.#runtimes.get(id);
     if (!runtime) return false;
     this.#runtimes.delete(id);
-    this.#stop(runtime, "SIGTERM");
+    const termination = this.#stop(runtime, "SIGTERM");
     this.#changed("stopped");
+    await termination;
     return true;
   }
 
-  #stop(runtime: Runtime, signal: NodeJS.Signals): Promise<void> {
+  async #stop(runtime: Runtime, signal: NodeJS.Signals): Promise<void> {
     this.#stopping.add(runtime);
-    const termination = runtime.kill(signal);
-    void termination.then(
-      () => this.#stopping.delete(runtime),
-      () => this.#stopping.delete(runtime),
-    );
-    return termination;
+    try {
+      await runtime.kill(signal);
+    } finally {
+      runtime.dispose();
+      this.#stopping.delete(runtime);
+    }
   }
 
   /**

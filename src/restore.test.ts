@@ -220,7 +220,7 @@ describe("daemon pool restore across a restart", () => {
       await waitFor(async () => (await ledgerFiles(stateDir)).join() === [exited, kept].join(), "the ledger to drop the stopped session");
       // Ordinary exit: omp quits inside its pane.
       await exitThroughAttach(b.id);
-      await waitFor(async () => (await runtimes()).find((entry) => entry.id === b.id)?.status === "exited", "the ordinary exit");
+      await waitFor(async () => !(await runtimes()).some((entry) => entry.id === b.id), "the ordinary exit");
       await waitFor(async () => (await ledgerFiles(stateDir)).join() === kept, "the settled ledger to hold only the live session");
       await stopDaemon(daemon);
       daemon = null;
@@ -267,7 +267,7 @@ describe("daemon pool restore across a restart", () => {
       // signal that came from outside the daemon, and the daemon observes the
       // exit while it is still running. Its own SIGTERM follows immediately.
       killOutsideDaemon(pid);
-      await waitFor(async () => (await runtimes()).find((entry) => entry.id === a.id)?.status === "exited", "the daemon to see the external kill");
+      await waitFor(async () => !(await runtimes()).some((entry) => entry.id === a.id), "the daemon to see the external kill");
       await stopDaemon(daemon);
       daemon = null;
       expect((await ledgerFiles(stateDir)).sort()).toEqual([first, second].sort());

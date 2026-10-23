@@ -13,7 +13,6 @@
  * stored width cannot swallow a narrow window. Only user-driven changes
  * overwrite the stored intent; a shrinking window just clamps the display.
  */
-import { syncWorkingAnimation } from "./working-indicator";
 import { syncRuntimeLimit } from "./runtime-limit";
 
 export const STORE_KEY = "omp-desktop.sidebar.v1";
@@ -155,7 +154,8 @@ function init(): void {
     list.hidden = show;
     settingsOpen.setAttribute("aria-expanded", String(show));
     (show ? settingsBack : settingsOpen).focus();
-    syncWorkingAnimation();
+    // Opening the static settings pane hides the list, which lets CSS suspend
+    // its indicators without a script-side animation loop.
     // The panel shows daemon-owned values (the session limit), so opening it
     // re-reads them instead of trusting what was true when the page loaded.
     if (show) void syncRuntimeLimit();
@@ -192,10 +192,14 @@ function init(): void {
     // Clamp for display only; the stored width is the user's intent and survives
     // a temporarily narrow window.
     const shown = clampWidth(width);
-    sidebar.style.setProperty("--sidebar-w", `${shown}px`);
-    resizer.setAttribute("aria-valuenow", String(shown));
-    resizer.setAttribute("aria-valuemin", String(MIN_WIDTH));
-    resizer.setAttribute("aria-valuemax", String(maxWidth()));
+    if (sidebar.style.getPropertyValue("--sidebar-w") !== `${shown}px`) {
+      sidebar.style.setProperty("--sidebar-w", `${shown}px`);
+    }
+    if (resizer.getAttribute("aria-valuenow") !== String(shown)) resizer.setAttribute("aria-valuenow", String(shown));
+    const minimum = String(MIN_WIDTH);
+    if (resizer.getAttribute("aria-valuemin") !== minimum) resizer.setAttribute("aria-valuemin", minimum);
+    const maximum = String(maxWidth());
+    if (resizer.getAttribute("aria-valuemax") !== maximum) resizer.setAttribute("aria-valuemax", maximum);
   };
 
   function setWidth(px: number, persist: boolean): void {

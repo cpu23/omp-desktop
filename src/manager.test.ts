@@ -23,6 +23,9 @@ const sniffingOmp = join(dir, "fake-omp-sniff");
 const announced = join(dir, "sessions", "-tmp-fixture", "2026-10-05T00-00-00-000Z_01a10000-0000-7000-8000-00000000ab01.jsonl");
 
 writeFileSync(waitingOmp, "#!/bin/sh\nprintf 'fake-omp-ready\\n'\nread line\nexit 0\n");
+const exitingOmp = join(dir, "fake-omp-exit");
+writeFileSync(exitingOmp, "#!/bin/sh\nprintf 'final-output\\n'\nexit 7\n");
+chmodSync(exitingOmp, 0o755);
 chmodSync(waitingOmp, 0o755);
 writeFileSync(
   sniffingOmp,
@@ -32,7 +35,7 @@ chmodSync(sniffingOmp, 0o755);
 
 const managers: RuntimeManager[] = [];
 
-function manager(file = waitingOmp, args: string[] = []): RuntimeManager {
+function manager(file = waitingOmp, args: string[] = [], maxRuntimes = 8): RuntimeManager {
   const created = new RuntimeManager({
     file,
     args,
@@ -40,7 +43,7 @@ function manager(file = waitingOmp, args: string[] = []): RuntimeManager {
     cols: 80,
     rows: 24,
     env: { HOME: dir, PATH: process.env.PATH ?? "/usr/bin:/bin", TERM: "xterm-256color" },
-    maxRuntimes: 8,
+    maxRuntimes,
   });
   managers.push(created);
   return created;
@@ -127,9 +130,9 @@ describe("durable pool snapshots", () => {
   });
 
   test("an explicit stop leaves the pool", async () => {
-    const pool = manager();
+    const pool = manager(waitingOmp, [], 1);
     const runtime = await pool.create({ resume: transcript });
-    expect(pool.kill(runtime.id)).toBe(true);
+    expect(await pool.kill(runtime.id)).toBe(true);
     expect(pool.liveSessions()).toEqual([]);
     expect(pool.get(runtime.id)).toBeUndefined();
     // A stopped transcript is started again only by a new explicit resume.
@@ -155,11 +158,12 @@ describe("durable pool snapshots", () => {
       "interactive Bash children to install their SIGTERM traps",
     );
 
-    expect(pool.kill(stopped.id)).toBe(true);
+    const stopping = pool.kill(stopped.id);
     expect(pool.get(stopped.id)).toBeUndefined();
     const shutdown = pool.killAll();
     expect(pool.list()).toEqual([]);
     await shutdown;
+    expect(await stopping).toBe(true);
 
     expect(stopped.status).toBe("exited");
     expect(remaining.status).toBe("exited");
@@ -186,8 +190,9 @@ describe("durable pool snapshots", () => {
     await waitFor(() => processExists(childPid), "the TERM-ignoring descendant to remain alive");
 
     try {
-      expect(pool.kill(runtime.id)).toBe(true);
+      const stopping = pool.kill(runtime.id);
       await pool.killAll();
+      expect(await stopping).toBe(true);
       expect(runtime.status).toBe("exited");
       await waitFor(() => !processIsRunning(childPid), "the SIGKILLed descendant to exit");
     } finally {
@@ -206,15 +211,16 @@ describe("durable pool snapshots", () => {
     const pool = manager("/bin/sh", ["-c", "exit 0"]);
     const warmup = await pool.create({});
     warmup.start();
-    await waitFor(() => warmup.status === "exited", "warmup PTY child exit");
-    pool.kill(warmup.id);
+    await waitFor(() => warmup.status === "exited" && pool.get(warmup.id) === undefined, "warmup PTY eviction");
     const baseline = linuxResourceCounts();
 
     for (let index = 0; index < 12; index += 1) {
       const runtime = await pool.create({});
       runtime.start();
-      await waitFor(() => runtime.status === "exited", `PTY child ${index + 1} exit`);
-      expect(pool.kill(runtime.id)).toBe(true);
+      await waitFor(
+        () => runtime.status === "exited" && pool.get(runtime.id) === undefined,
+        `PTY child ${index + 1} exit and eviction`,
+      );
     }
 
     await waitFor(() => {
@@ -226,15 +232,48 @@ describe("durable pool snapshots", () => {
     expect(after.threads).toBeLessThanOrEqual(baseline.threads + 2);
   });
 
-  test("an exited process leaves the pool; a later resume starts a replacement", async () => {
-    const pool = manager();
-    const runtime = await pool.create({ resume: transcript });
-    runtime.write("\n");
-    await waitFor(() => runtime.status === "exited", "the stand-in omp to exit");
-    expect(pool.liveSessions()).toEqual([]);
-    const replacement = await pool.create({ resume: transcript });
+  test("final output precedes exit delivery and an exited runtime releases capacity", async () => {
+    const pool = manager(exitingOmp, [], 1);
+    const runtime = await pool.create({});
+    const events: string[] = [];
+    const liveChunks: Uint8Array[] = [];
+    const secondSubscriberChunks: Uint8Array[] = [];
+    const unsubscribe = runtime.subscribeOutput(
+      () => events.push("snapshot"),
+      (bytes) => {
+        events.push("output");
+        liveChunks.push(bytes);
+      },
+    );
+    const unsubscribeSecond = runtime.subscribeOutput(
+      () => {},
+      (bytes) => secondSubscriberChunks.push(bytes),
+    );
+    const exited = Promise.withResolvers<void>();
+    runtime.subscribeExit(() => {
+      events.push("exit");
+      exited.resolve();
+    });
+
+    runtime.start();
+    await exited.promise;
+
+    expect(Buffer.concat(liveChunks.map((bytes) => Buffer.from(bytes))).toString("utf8")).toContain("final-output");
+    expect(secondSubscriberChunks).toHaveLength(liveChunks.length);
+    for (let index = 0; index < liveChunks.length; index += 1) {
+      expect(secondSubscriberChunks[index]).toBe(liveChunks[index]);
+    }
+    expect(events.indexOf("output")).toBeGreaterThanOrEqual(0);
+    expect(events.indexOf("output")).toBeLessThan(events.indexOf("exit"));
+    expect(pool.list()).toEqual([]);
+    expect(pool.get(runtime.id)).toBeUndefined();
+    expect(pool.allocated()).toBe(0);
+
+    const replacement = await pool.create({});
     expect(replacement.id).not.toBe(runtime.id);
-    expect(replacement.alive).toBe(true);
+    expect(pool.list()).toEqual([replacement.info()]);
+    unsubscribe();
+    unsubscribeSecond();
   });
 
   test("a transcript-less runtime is not restorable, and a sniffed transcript joins the pool", async () => {
@@ -256,12 +295,7 @@ describe("durable pool snapshots", () => {
     const changes: string[] = [];
     const unsubscribe = pool.subscribeChanges((change) => changes.push(change));
     const stopped = await pool.create({ resume: transcript });
-    // The exit of the stopped process is the only source of a stray event; the
-    // runtime's own subscription fires after the pool's, so awaiting it proves
-    // no late pool change follows a kill.
-    const stoppedExited = new Promise<void>((resolve) => stopped.subscribeExit(() => resolve()));
-    pool.kill(stopped.id);
-    await stoppedExited;
+    await pool.kill(stopped.id);
     const exited = await pool.create({ resume: transcript });
     exited.write("\n");
     await waitFor(() => exited.status === "exited", "the stand-in omp to exit");

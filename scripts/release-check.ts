@@ -4,7 +4,8 @@ import { mkdtemp, mkdir, copyFile, readFile, stat, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
-const source = resolve(import.meta.dir, "../..");
+const desktopSource = resolve(import.meta.dir, "..");
+const mobileSource = resolve(process.env.OMP_MOBILE_CHECKOUT ?? join(desktopSource, "../omp-mobile"));
 const bun = Bun.which("bun") ?? process.execPath;
 const omp = Bun.which(process.env.OMP_DESKTOP_OMP ?? "omp");
 if (!omp) throw new Error("Install the OMP CLI or set OMP_DESKTOP_OMP before running release:check.");
@@ -73,7 +74,7 @@ try {
   await mkdir(home, { recursive: true });
   await mkdir(env.TMPDIR!, { recursive: true });
   for (const project of ["omp-desktop", "omp-mobile"]) {
-    const from = join(source, project);
+    const from = project === "omp-desktop" ? desktopSource : mobileSource;
     // Include current edits/new public files, not just HEAD; never copy ignored private files.
     const ignoredTracked = await command(from, ["git", "ls-files", "-ci", "--exclude-standard"], true);
     if (ignoredTracked.trim()) throw new Error(`${project} tracks ignored private/generated files; untrack them before release.`);
