@@ -33,6 +33,31 @@ menu; the daemon above must remain running.
 - Closing a pane only detaches its view. Output continues in the daemon; use the sidebar stop action to end a
   session. See the [guide](docs/guide.md) for configuration, security and native setup details.
 
+## CI and local checks
+
+GitHub Actions runs on pull requests, pushes to `main`, and manual dispatch. Its Ubuntu Linux jobs install the
+locked Bun dependencies, run the TypeScript check and existing tests, smoke-test the daemon APIs in a disposable
+home/state directory, and build the native Tauri app. The daemon smoke does not need OMP, provider credentials,
+or any sibling checkout.
+
+Run the same JavaScript checks locally:
+
+```sh
+bun install --frozen-lockfile
+bun run check
+bun test
+bun run scripts/daemon-smoke.ts
+```
+
+The broader `bun run smoke` additionally exercises the OMP PTY integration and requires OMP 18.x on `PATH`.
+For a native Linux build, install Rust stable and the [Linux packages listed in the guide](docs/guide.md#native-linux-app),
+then run:
+
+```sh
+cargo build --manifest-path src-tauri/Cargo.toml --locked --release
+bun run app:build
+```
+
 ## Releases and links
 
 Source releases only—no prebuilt installers: [v0.1.3](https://github.com/cpu23/omp-desktop/releases/tag/v0.1.3)
