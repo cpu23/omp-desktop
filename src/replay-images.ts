@@ -327,6 +327,7 @@ class VtSequenceScanner {
 interface ReplayImage {
   payload: string;
   reservedRows: number;
+  clippedRows: number;
   bytes: number;
 }
 
@@ -379,8 +380,12 @@ export class ReplayImages {
         _core: { buffer: { savedY: number; ybase: number } };
       };
       const buffer = internals._core.buffer;
+      const requestedRows = image.reservedRows;
       const savedRow = Math.max(0, Math.min(terminal.rows - 1, buffer.savedY - buffer.ybase));
-      image.reservedRows = Math.max(0, savedRow - terminal.buffer.active.cursorY);
+      const actualRows = Math.max(0, savedRow - terminal.buffer.active.cursorY);
+      // Preserve only the rows that fit after the clamped upward movement.
+      if (requestedRows > actualRows) image.clippedRows = actualRows + 1;
+      image.reservedRows = actualRows;
       return true;
     });
   }
@@ -422,7 +427,7 @@ export class ReplayImages {
         // draw, then restore the serializer cursor after the reserved cell.
         output.push(" ", CURSOR_LEFT, ESC, "7");
         if (image.reservedRows > 0) output.push(`${CSI}${image.reservedRows}A`);
-        output.push(image.payload, ESC, "8", `${CSI}1C`);
+        output.push(withDesktopImageRows(image.payload, image.clippedRows), ESC, "8", `${CSI}1C`);
       } else if (image || this.allocatedMarkers.has(character)) {
         output.push(" ");
       } else {
@@ -474,7 +479,7 @@ export class ReplayImages {
   /** Image replay bytes for insertion before the engine restores final modes/cursor. */
   pendingImageData(): string {
     const image = this.deferredRestore && this.images.get(this.deferredRestore.marker);
-    return image ? image.payload : "";
+    return image ? withDesktopImageRows(image.payload, image.clippedRows) : "";
   }
   /** The exact unfinished parser bytes; append these after terminal state restoration. */
   pendingSequence(): string {
@@ -579,7 +584,7 @@ export class ReplayImages {
     if (!this.reserveImageBytes(bytes)) return undefined;
 
     const marker = this.allocateMarker();
-    this.images.set(marker, { payload, reservedRows, bytes });
+    this.images.set(marker, { payload, reservedRows, clippedRows: 0, bytes });
     this.pendingMarkers.add(marker);
     this.sidecarBytes += bytes;
     this.needsPrune = true;
@@ -704,6 +709,24 @@ function isInlineImage(sequence: string): boolean {
   if (separator < 0) return false;
   const header = sequence.slice(start, separator);
   return header.startsWith("File=") && header.slice(5).split(";").includes("inline=1");
+}
+
+// Carry the visible row budget with inline payloads; Sixel has no equivalent header.
+function withDesktopImageRows(sequence: string, clippedRows: number): string {
+  if (clippedRows <= 0 || !isInlineImage(sequence)) return sequence;
+  const headerStart = sequence.startsWith(`${ESC}]1337;`) ? 7 : 6;
+  const separator = sequence.indexOf(":", headerStart);
+  if (separator < 0) return sequence;
+
+  let rowBudget = clippedRows;
+  const fields = sequence.slice(headerStart, separator).split(";").filter((field) => {
+    if (!field.startsWith("desktopImageRows=")) return true;
+    const value = Number(field.slice("desktopImageRows=".length));
+    if (Number.isSafeInteger(value) && value > 0) rowBudget = Math.min(rowBudget, value);
+    return false;
+  });
+  fields.push(`desktopImageRows=${rowBudget}`);
+  return `${sequence.slice(0, headerStart)}${fields.join(";")}${sequence.slice(separator)}`;
 }
 
 function isSixelImage(sequence: string): boolean {
