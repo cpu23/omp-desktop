@@ -81,7 +81,10 @@ images may be evicted while their reserved rows remain. Scrollback grants share 
 for actual columns and both visible terminal buffers, and are rebalanced on creation, resize and release.
 The client separately caps decoded image pixels at 128 MB per pane. Cache eviction can leave a checkerboard
 placeholder. Partial image-row deletion preserves surviving tiles through scrolling redraws; images are released
-when their remaining rows leave history or the cache limit requires eviction.
+when their remaining rows leave history or the cache limit requires eviction. Text erasure also releases images
+whose last tile disappeared, including between image insertions in one parser write, so erased redraws do not
+evict still-visible charts. Fractional-height terminal rows use disjoint pixel-aligned clearing and drawing bounds
+to avoid leaving a strip of pixels after text overwrites an image.
 Use the sidebar stop action to terminate a session. Live sessions are recorded in a durable
 ledger and resumed from their OMP transcripts after a daemon restart; the old processes are not preserved, and
 in-flight work or unsaved input cannot be restored. Each transcript has one live process at a time; attaching an
@@ -144,7 +147,10 @@ the rebuilt bundle; wait for active work to finish first, since restarting ends 
 The replay mirror preserves the producer's saved cursor during image repaint. When an upward image move
 clamps at the viewport or scroll margin, it records the actual parsed image origin rather than assuming
 that moving down reverses the move. This prevents repeated redraws from inserting blank history rows.
-Rows already inserted by an older daemon remain in that daemon's history; a client reload does not repair them.
+The client draws only the surviving bottom slice of a clamped iTerm2 image, rather than painting its hidden top
+back over later text. Replay carries that visible-row budget in the inline-image header, so reconnecting at a
+different screen position cannot bring the hidden part back. Rows already inserted or lost by an older daemon
+remain damaged in that daemon's history; a client reload does not repair them.
 
 For a systemd installation, check `systemctl --user cat omp-desktopd` before deploying: `WorkingDirectory`
 and `ExecStart` must point to the updated checkout, not an older branch or worktree.
@@ -287,7 +293,15 @@ tests and real OMP extension/process smoke checks. It does not verify the native
 bun run check
 bun test
 bun run smoke
+bun run smoke:images
 ```
+
+`smoke:images` needs Playwright's browsers and native dependencies: install them once with
+`bunx playwright install --with-deps chromium webkit`. It checks actual image-layer pixels in Chromium
+(DOM and WebGL) and WebKit (DOM) at 1×, 1.25×, 1.5× and 2× display scales. Coverage includes PNG/WebP,
+text erasure, partial deletion, batched cache pressure, clamped upward redraws, margins, history scrolling,
+resize, and repeated replay followed by live output. Its temporary home, local fixture server and browser
+contexts do not use the user's daemon, sessions or credentials. Pull-request CI runs this matrix as well.
 
 `smoke` needs a real OMP executable (or `OMP_DESKTOP_OMP`) and runs in a disposable home with a local test daemon;
 it does not control a user's running daemon or services. With both sibling checkouts, Git and OMP installed,

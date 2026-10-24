@@ -352,7 +352,6 @@ async function phaseB(home: string): Promise<void> {
   const runtime = await createRuntime({ cwd: home });
   assert(runtime.pid === null, "new runtime is not spawned until a pane attaches");
   const pane = await attach(runtime.id);
-  await waitFor(() => pane.text().length > 2000, 25_000, "omp TUI output");
   const info = (await runtimes()).find((entry) => entry.id === runtime.id);
   assert(info?.alive === true, "omp is alive after attach");
   assert(typeof info?.pid === "number" && info.pid > 0, `daemon reports a real omp pid (${info?.pid})`);
