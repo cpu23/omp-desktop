@@ -7,7 +7,8 @@
  */
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, renameSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { listSessions, readSessionCwd } from "./sessions";
@@ -358,7 +359,7 @@ describe("message-derived activity", () => {
     expect((await listSessions({ sessionsRoot: root }))[0]?.costUsd).toBe(1.5);
   });
 
-  test("same-size in-place cost rewrites with restored mtime trigger a full rescan", async () => {
+  test("same-size in-place cost rewrites with restored mtime and changed ctime trigger a full rescan", async () => {
     const root = makeRoot();
     const path = writeSession(root, "2026-09-12T00-00-00-000Z_cost-in-place.jsonl", [
       session("cost-in-place", "2026-09-12T00:00:00.000Z"),
@@ -367,20 +368,36 @@ describe("message-derived activity", () => {
     ]);
     const mtime = "2026-09-12T00:00:00.000Z";
     setMtime(path, mtime);
-    expect((await listSessions({ sessionsRoot: root }))[0]?.costUsd).toBe(0.25);
+    const original = statSync(path);
+    let version = original;
+    // The cache is metadata-keyed. Real filesystems can assign identical ctime
+    // even to consecutive writes; control only that version field, not content.
+    // This fixture contains exactly one transcript, hence one async stat per listing.
+    const statSpy = spyOn(fsPromises, "stat").mockImplementation((async () => version) as unknown as typeof fsPromises.stat);
+    try {
+      expect((await listSessions({ sessionsRoot: root }))[0]?.costUsd).toBe(0.25);
 
-    writeFileSync(
-      path,
-      `${[
-        session("cost-in-place", "2026-09-12T00:00:00.000Z"),
-        user("2026-09-12T00:00:01.000Z", "hi"),
-        assistant("2026-09-12T00:00:05.000Z", 0.75),
-      ]
-        .map((event) => JSON.stringify(event))
-        .join("\n")}\n`,
-    );
-    setMtime(path, mtime);
-    expect((await listSessions({ sessionsRoot: root }))[0]?.costUsd).toBe(0.75);
+      writeFileSync(
+        path,
+        `${[
+          session("cost-in-place", "2026-09-12T00:00:00.000Z"),
+          user("2026-09-12T00:00:01.000Z", "hi"),
+          assistant("2026-09-12T00:00:05.000Z", 0.75),
+        ]
+          .map((event) => JSON.stringify(event))
+          .join("\n")}\n`,
+      );
+      setMtime(path, mtime);
+      version = statSync(path);
+      expect([version.dev, version.ino, version.size, version.mtimeMs]).toEqual([
+        original.dev, original.ino, original.size, original.mtimeMs,
+      ]);
+      Object.defineProperty(version, "ctimeMs", { value: original.ctimeMs + 1 });
+      expect((await listSessions({ sessionsRoot: root }))[0]?.costUsd).toBe(0.75);
+      expect(statSpy.mock.calls).toEqual([[path], [path]]);
+    } finally {
+      statSpy.mockRestore();
+    }
   });
 
   test("truncating a transcript discards the old accumulated cost", async () => {

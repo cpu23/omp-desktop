@@ -172,7 +172,10 @@ function hasSameVersion(cached: FileVersion, file: SessionFile): boolean {
 /**
  * Usage totals can be scattered throughout a transcript. Keep the scanned byte
  * offset and matcher carry so append-only writes cost only new bytes; replacement,
- * truncation and same-size rewrites are scanned completely again.
+ * truncation and same-size rewrites with changed metadata are scanned completely
+ * again. The warm cache does not reread unchanged versions: an in-place rewrite
+ * preserving size, inode and both timestamps is not detectable. Publish full
+ * transcript rewrites by atomic replacement, as OMP does.
  */
 type CostEntry = FileVersion & {
   costUsd: number;
