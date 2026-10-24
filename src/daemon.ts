@@ -1,12 +1,10 @@
-import { createHash } from "node:crypto";
-import { basename, isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
-import { mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { RuntimeManager, RuntimeCapacityError, PendingRuntimeCapacityError } from "./manager";
 import { listSessions, readSessionCwd } from "./sessions";
 import { isRecord } from "./guards";
-import { parseClientMessage, type RuntimeInfo, type RuntimesResponse, type ServerMessage } from "./protocol";
+import { MAX_RUNTIME_INPUT_CODE_UNITS, parseClientMessage, type RuntimeInfo, type RuntimesResponse, type ServerMessage } from "./protocol";
 import { PresentationReader } from "./presentation";
 import { STATE_LIMIT_BYTES, WorkspaceStateStore, RuntimeLedgerStore } from "./state";
 import {
@@ -17,6 +15,11 @@ import {
 } from "./settings";
 import { activeSystemdUnit } from "./systemd";
 import type { Runtime } from "./runtime";
+import { createWebAssets } from "./web-assets";
+import { conditionalJson, readLimitedBytes, BodyLimitError } from "./http-response";
+import { TerminalOutput } from "./terminal-output";
+import { IMAGE_FILE_LIMIT } from "./image-limits";
+import { PasteStore, PasteCapacityError } from "./paste-store";
 
 const HOST = process.env.OMP_DESKTOP_HOST ?? "127.0.0.1";
 const PORT = Number(process.env.OMP_DESKTOP_PORT ?? 4180);
@@ -47,7 +50,7 @@ const PASTE_TYPES: Record<string, string> = {
   "image/webp": "webp",
   "image/gif": "gif",
 };
-const PASTE_LIMIT = 32 * 1024 * 1024;
+const pasteStore = new PasteStore(PASTE_DIR);
 // Durable workspace state (layout, pins, settings). The client caches it in
 // browser storage and mirrors every change here, so a reboot, a cleared browser
 // profile or a different port cannot lose the workspace description. Tests and
@@ -157,60 +160,13 @@ const manager = new RuntimeManager({
   },
 });
 
-const clientBuild = await Bun.build({
-  entrypoints: [join(import.meta.dir, "client.ts")],
-  target: "browser",
-  sourcemap: "inline",
-});
-const clientBundle = clientBuild.outputs.find((output) => output.path.endsWith(".js"));
-if (!clientBuild.success || !clientBundle) {
-  console.error("client bundle failed");
-  for (const log of clientBuild.logs) console.error(log);
-  process.exit(1);
-}
-
-const clientCode = await clientBundle.text();
-const stylesCode = await Bun.file(join(ROOT, "public/styles.css")).text();
-// Shown in the pane header and polled by the client: an open tab must notice a
-// daemon restart with new code, otherwise a stale bundle looks like "nothing
-// changed" (the panes are rebuilt on every daemon start). Styles are hashed too:
-// a CSS-only change would otherwise stay invisible in an open tab.
-const BUILD = createHash("sha1").update(clientCode).update(stylesCode).digest("hex").slice(0, 7);
+const webAssets = await createWebAssets(ROOT);
+const BUILD = webAssets.build;
 const NO_STORE = { "cache-control": "no-store" };
 
-/** Static text responses, keyed by the exact pathname they answer. */
-const TEXT_ASSETS: Record<string, { type: string; body: string }> = {
-  "/": { type: "text/html; charset=utf-8", body: await Bun.file(join(ROOT, "public/index.html")).text() },
-  "/client.js": { type: "text/javascript; charset=utf-8", body: clientCode },
-  "/styles.css": { type: "text/css; charset=utf-8", body: stylesCode },
-  "/xterm.css": {
-    type: "text/css; charset=utf-8",
-    body: await Bun.file(join(ROOT, "node_modules/@xterm/xterm/css/xterm.css")).text(),
-  },
-};
 
-type WsData = { runtime?: Runtime; unsubData?: () => void; unsubExit?: () => void };
+type WsData = { runtime?: Runtime; output?: TerminalOutput; unsubData?: () => void; unsubExit?: () => void };
 
-const FONT_DIR = join(ROOT, "public/fonts");
-const FONT_TYPES: Record<string, string> = {
-  ttf: "font/ttf",
-  otf: "font/otf",
-  woff: "font/woff",
-  woff2: "font/woff2",
-};
-
-async function serveFont(pathname: string): Promise<Response> {
-  const name = basename(decodeURIComponent(pathname));
-  const ext = name.slice(name.lastIndexOf(".") + 1).toLowerCase();
-  if (!/^[A-Za-z0-9._-]+$/.test(name) || !(ext in FONT_TYPES)) {
-    return new Response("bad font", { status: 400 });
-  }
-  const file = Bun.file(join(FONT_DIR, name));
-  if (!(await file.exists())) return new Response("not found", { status: 404 });
-  return new Response(file, {
-    headers: { "content-type": FONT_TYPES[ext], "cache-control": "public, max-age=86400" },
-  });
-}
 
 /** Resume is restricted to real session files under the store: the daemon runs
  *  whatever path it is handed as argv, and this endpoint is reachable from any
@@ -340,6 +296,7 @@ const server = Bun.serve<WsData>({
     const url = new URL(req.url);
     if (
       url.pathname === "/api/runtimes" ||
+      url.pathname.startsWith("/api/runtimes/") ||
       url.pathname === "/api/settings" ||
       url.pathname === "/api/restart" ||
       url.pathname === "/ws/term"
@@ -352,16 +309,13 @@ const server = Bun.serve<WsData>({
       if (!runtime) return new Response("unknown runtime", { status: 404 });
       return srv.upgrade(req, { data: { runtime } }) ? undefined : new Response("upgrade failed", { status: 400 });
     }
-    if (url.pathname.startsWith("/fonts/")) return serveFont(url.pathname);
-    const asset = TEXT_ASSETS[url.pathname];
-    if (req.method === "GET" && asset) {
-      return new Response(asset.body, { headers: { "content-type": asset.type, ...NO_STORE } });
+    if (!url.pathname.startsWith("/api/")) {
+      const asset = await webAssets.response(req);
+      if (asset) return asset;
     }
     switch (`${req.method} ${url.pathname}`) {
       case "GET /api/settings":
-        return Response.json(settingsPayload(desiredMaxRuntimes, EFFECTIVE_MAX_RUNTIMES), {
-          headers: NO_STORE,
-        });
+        return conditionalJson(req, settingsPayload(desiredMaxRuntimes, EFFECTIVE_MAX_RUNTIMES));
       case "PUT /api/settings": {
         const body: unknown = await req.json().catch(() => null);
         if (!isRecord(body) || !isPositiveInteger(body.maxRuntimes)) {
@@ -410,10 +364,10 @@ const server = Bun.serve<WsData>({
         return beginRestart();
       }
       case "GET /api/build":
-        return Response.json({ build: BUILD }, { headers: NO_STORE });
+        return conditionalJson(req, { build: BUILD });
       case "GET /api/state": {
         try {
-          return Response.json(await stateStore.read(), { headers: NO_STORE });
+          return conditionalJson(req, await stateStore.read());
         } catch (error) {
           return new Response(
             `state read failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -422,13 +376,15 @@ const server = Bun.serve<WsData>({
         }
       }
       case "PUT /api/state": {
-        const declared = Number(req.headers.get("content-length") ?? "0");
-        if (Number.isFinite(declared) && declared > STATE_LIMIT_BYTES) {
-          return new Response("state document too large", { status: 413 });
+        if (req.headers.get("x-omp-generation") !== GENERATION) {
+          return new Response("daemon generation changed; reconcile workspace before saving", { status: 409 });
         }
-        const text = await req.text();
-        if (Buffer.byteLength(text) > STATE_LIMIT_BYTES) {
-          return new Response("state document too large", { status: 413 });
+        let text: string;
+        try {
+          text = new TextDecoder().decode(await readLimitedBytes(req, STATE_LIMIT_BYTES));
+        } catch (error) {
+          if (error instanceof BodyLimitError) return new Response(error.message, { status: 413 });
+          return new Response("could not read workspace body", { status: 400 });
         }
         let body: unknown;
         try {
@@ -460,13 +416,22 @@ const server = Bun.serve<WsData>({
         const type = (req.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
         const ext = PASTE_TYPES[type];
         if (!ext) return new Response("unsupported image type", { status: 415 });
-        const bytes = await req.arrayBuffer();
+        let bytes: Uint8Array;
+        try {
+          bytes = await readLimitedBytes(req, IMAGE_FILE_LIMIT);
+        } catch (error) {
+          return new Response(error instanceof Error ? error.message : "invalid image body", {
+            status: error instanceof BodyLimitError ? 413 : 400,
+          });
+        }
         if (bytes.byteLength === 0) return new Response("empty body", { status: 400 });
-        if (bytes.byteLength > PASTE_LIMIT) return new Response("image too large", { status: 413 });
-        await mkdir(PASTE_DIR, { recursive: true });
-        const path = join(PASTE_DIR, `${new Date().toISOString().replace(/[:.]/g, "-")}-${crypto.randomUUID().slice(0, 8)}.${ext}`);
-        await Bun.write(path, bytes);
-        return Response.json({ path }, { headers: NO_STORE });
+        try {
+          return Response.json({ path: await pasteStore.write(bytes, ext) }, { headers: NO_STORE });
+        } catch (error) {
+          return new Response(error instanceof Error ? error.message : "image upload failed", {
+            status: error instanceof PasteCapacityError ? 507 : 500,
+          });
+        }
       }
       case "GET /api/runtimes": {
         // Enrich with extension state in parallel; each read has its own
@@ -485,7 +450,7 @@ const server = Bun.serve<WsData>({
           runtimes,
           defaults: { cwd: manager.defaults.cwd, maxRuntimes: manager.defaults.maxRuntimes },
         };
-        return Response.json(body, { headers: NO_STORE });
+        return conditionalJson(req, body);
       }
       case "POST /api/runtimes": {
         const body: unknown = await req.json().catch(() => null);
@@ -541,39 +506,82 @@ const server = Bun.serve<WsData>({
           limit: Number(url.searchParams.get("limit") ?? 60),
           search: url.searchParams.get("search") ?? undefined,
         });
-        return Response.json({ sessions }, { headers: NO_STORE });
+        return conditionalJson(req, { sessions });
       }
       default:
         break;
     }
+    const terminalMatch = /^\/api\/runtimes\/([A-Za-z0-9_-]+)\/(screen|input)$/.exec(url.pathname);
+    if (terminalMatch) {
+      const runtime = manager.get(terminalMatch[1]!);
+      if (!runtime) return new Response("unknown runtime", { status: 404 });
+      if (terminalMatch[2] === "screen" && req.method === "GET") {
+        try {
+          runtime.start();
+        } catch (error) {
+          await manager.kill(runtime.id);
+          return new Response(error instanceof Error ? error.message : "runtime unavailable", { status: 503 });
+        }
+        try {
+          return conditionalJson(req, await runtime.screenSnapshot());
+        } catch (error) {
+          return new Response(error instanceof Error ? error.message : "terminal snapshot unavailable", { status: 503 });
+        }
+      }
+      if (terminalMatch[2] === "input" && req.method === "POST") {
+        if (!runtime.alive) return new Response("runtime is not running", { status: 409 });
+        let body: unknown;
+        try {
+          body = JSON.parse(new TextDecoder().decode(await readLimitedBytes(req, 128 * 1024)));
+        } catch (error) {
+          return new Response("invalid terminal input body", { status: error instanceof BodyLimitError ? 413 : 400 });
+        }
+        if (!isRecord(body) || typeof body.data !== "string" || body.data.length > MAX_RUNTIME_INPUT_CODE_UNITS) {
+          return new Response(`terminal input must contain at most ${MAX_RUNTIME_INPUT_CODE_UNITS} characters`, { status: 400 });
+        }
+        runtime.write(body.data);
+        return Response.json({ ok: true }, { headers: NO_STORE });
+      }
+      return new Response("method not allowed", { status: 405 });
+    }
     const killMatch = /^\/api\/runtimes\/([A-Za-z0-9_-]+)$/.exec(url.pathname);
     if (killMatch && req.method === "DELETE") {
-      return manager.kill(killMatch[1])
+      return (await manager.kill(killMatch[1]))
         ? Response.json({ ok: true }, { headers: NO_STORE })
         : new Response("unknown runtime", { status: 404 });
     }
     return new Response("not found", { status: 404 });
   },
   websocket: {
+    maxPayloadLength: 128 * 1024,
+    backpressureLimit: 256 * 1024,
+    closeOnBackpressureLimit: true,
     open(ws) {
       const runtime = ws.data.runtime;
       if (!runtime) {
         ws.close();
         return;
       }
-      runtime.start();
+      try {
+        runtime.start();
+      } catch {
+        void manager.kill(runtime.id);
+        ws.close(1011, "Runtime could not start");
+        return;
+      }
+      const output = ws.data.output = new TerminalOutput(ws);
       ws.data.unsubData = runtime.subscribeOutput((replay, info) => {
         const hello: ServerMessage = {
           type: "hello",
           runtime: info,
           replayBytes: Buffer.byteLength(replay),
         };
-        ws.send(JSON.stringify(hello));
-        if (replay.length > 0) ws.send(Buffer.from(replay, "utf8"));
-      }, (data) => ws.send(Buffer.from(data, "utf8")));
+        output.send(JSON.stringify(hello));
+        if (replay.length > 0) output.replay(replay, hello.replayBytes);
+      }, (data) => output.send(data));
       ws.data.unsubExit = runtime.subscribeExit((exit) => {
         const message: ServerMessage = { type: "exit", exitCode: exit.exitCode, daemonShutdown: shuttingDown };
-        ws.send(JSON.stringify(message));
+        output.send(JSON.stringify(message));
       });
     },
     message(ws, raw) {
@@ -584,7 +592,11 @@ const server = Bun.serve<WsData>({
       if (msg.type === "input") runtime.write(msg.data);
       else runtime.resize(msg.cols, msg.rows);
     },
+    drain(ws) {
+      ws.data.output?.drain();
+    },
     close(ws) {
+      ws.data.output?.dispose();
       ws.data.unsubData?.();
       ws.data.unsubExit?.();
     },

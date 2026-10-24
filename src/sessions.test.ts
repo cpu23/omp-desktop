@@ -7,7 +7,8 @@
  */
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, renameSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { listSessions, readSessionCwd } from "./sessions";
@@ -337,6 +338,91 @@ describe("message-derived activity", () => {
     expect(sessions[0].costUsd).toBe(1);
   });
 
+  test("appended usage carries incomplete cost JSON without double-counting", async () => {
+    const root = makeRoot();
+    const path = writeSession(root, "2026-09-12T00-00-00-000Z_cost-append.jsonl", [
+      session("cost-append", "2026-09-12T00:00:00.000Z"),
+      user("2026-09-12T00:00:01.000Z", "hi"),
+      assistant("2026-09-12T00:00:05.000Z", 0.25),
+    ]);
+    expect((await listSessions({ sessionsRoot: root }))[0]?.costUsd).toBe(0.25);
+
+    appendFileSync(
+      path,
+      '{"type":"message","timestamp":"2026-09-12T00:01:00.000Z","message":{"role":"assistant","usage":{"cost":{"total":0.',
+    );
+    expect((await listSessions({ sessionsRoot: root }))[0]?.costUsd).toBe(0.25);
+    appendFileSync(path, "75}}}}\n");
+    expect((await listSessions({ sessionsRoot: root }))[0]?.costUsd).toBe(1);
+
+    appendFileSync(path, `${JSON.stringify(assistant("2026-09-12T00:02:00.000Z", 0.5))}\n`);
+    expect((await listSessions({ sessionsRoot: root }))[0]?.costUsd).toBe(1.5);
+  });
+
+  test("same-size in-place cost rewrites with restored mtime and changed ctime trigger a full rescan", async () => {
+    const root = makeRoot();
+    const path = writeSession(root, "2026-09-12T00-00-00-000Z_cost-in-place.jsonl", [
+      session("cost-in-place", "2026-09-12T00:00:00.000Z"),
+      user("2026-09-12T00:00:01.000Z", "hi"),
+      assistant("2026-09-12T00:00:05.000Z", 0.25),
+    ]);
+    const mtime = "2026-09-12T00:00:00.000Z";
+    setMtime(path, mtime);
+    const original = statSync(path);
+    let version = original;
+    // The cache is metadata-keyed. Real filesystems can assign identical ctime
+    // even to consecutive writes; control only that version field, not content.
+    // This fixture contains exactly one transcript, hence one async stat per listing.
+    const statSpy = spyOn(fsPromises, "stat").mockImplementation((async () => version) as unknown as typeof fsPromises.stat);
+    try {
+      expect((await listSessions({ sessionsRoot: root }))[0]?.costUsd).toBe(0.25);
+
+      writeFileSync(
+        path,
+        `${[
+          session("cost-in-place", "2026-09-12T00:00:00.000Z"),
+          user("2026-09-12T00:00:01.000Z", "hi"),
+          assistant("2026-09-12T00:00:05.000Z", 0.75),
+        ]
+          .map((event) => JSON.stringify(event))
+          .join("\n")}\n`,
+      );
+      setMtime(path, mtime);
+      version = statSync(path);
+      expect([version.dev, version.ino, version.size, version.mtimeMs]).toEqual([
+        original.dev, original.ino, original.size, original.mtimeMs,
+      ]);
+      Object.defineProperty(version, "ctimeMs", { value: original.ctimeMs + 1 });
+      expect((await listSessions({ sessionsRoot: root }))[0]?.costUsd).toBe(0.75);
+      expect(statSpy.mock.calls).toEqual([[path], [path]]);
+    } finally {
+      statSpy.mockRestore();
+    }
+  });
+
+  test("truncating a transcript discards the old accumulated cost", async () => {
+    const root = makeRoot();
+    const path = writeSession(root, "2026-09-12T00-00-00-000Z_cost-truncate.jsonl", [
+      session("cost-truncate", "2026-09-12T00:00:00.000Z"),
+      user("2026-09-12T00:00:01.000Z", "hi"),
+      assistant("2026-09-12T00:00:05.000Z", 0.25),
+      assistant("2026-09-12T00:01:05.000Z", 0.75),
+    ]);
+    expect((await listSessions({ sessionsRoot: root }))[0]?.costUsd).toBe(1);
+
+    writeFileSync(
+      path,
+      `${[
+        session("cost-truncate", "2026-09-12T00:00:00.000Z"),
+        user("2026-09-12T00:00:01.000Z", "hi"),
+        assistant("2026-09-12T00:00:05.000Z", 0.5),
+      ]
+        .map((event) => JSON.stringify(event))
+        .join("\n")}\n`,
+    );
+    expect((await listSessions({ sessionsRoot: root }))[0]?.costUsd).toBe(0.5);
+  });
+
   test("refreshes cached cost after a same-size replacement with preserved mtime", async () => {
     const root = makeRoot();
     const path = writeSession(root, "2026-09-12T00-00-00-000Z_cost-rewrite.jsonl", [
@@ -462,6 +548,7 @@ describe("parsed header cache", () => {
           (entry) => entry.id,
         ),
       ).toEqual(["bulk-0000"]);
+      expect(await listSessions({ sessionsRoot: root, limit: Number.MAX_SAFE_INTEGER })).toHaveLength(200);
 
       rmSync(join(dir, "bulk-0000.jsonl"));
       const imported = writeSession(root, "000-imported.jsonl", [
@@ -475,6 +562,44 @@ describe("parsed header cache", () => {
     } finally {
       fileSpy.mockRestore();
     }
+  });
+
+  test("simultaneous listings share transcript indexing and cost work", async () => {
+    const root = makeRoot();
+    writeSession(root, "2026-09-01T00-00-00-000Z_concurrent.jsonl", [
+      session("concurrent", "2026-09-01T00:00:00.000Z"),
+      user("2026-09-01T00:00:01.000Z", "prompt"),
+      assistant("2026-09-01T00:00:02.000Z", 0.5),
+    ]);
+    const fileSpy = spyOn(Bun, "file");
+    try {
+      const results = await Promise.all(
+        Array.from({ length: 8 }, () => listSessions({ sessionsRoot: root })),
+      );
+      expect(results.map((sessions) => sessions[0]?.costUsd)).toEqual(Array(8).fill(0.5));
+      expect(fileSpy.mock.calls.length).toBe(3);
+    } finally {
+      fileSpy.mockRestore();
+    }
+  });
+
+  test("separate session roots keep independently cached index results", async () => {
+    const firstRoot = makeRoot();
+    const secondRoot = makeRoot();
+    writeSession(firstRoot, "2026-09-01T00-00-00-000Z_shared.jsonl", [
+      session("first-root", "2026-09-01T00:00:00.000Z"),
+      user("2026-09-01T00:00:01.000Z", "first"),
+    ]);
+    writeSession(secondRoot, "2026-09-01T00-00-00-000Z_shared.jsonl", [
+      session("second-root", "2026-09-01T00:00:00.000Z"),
+      user("2026-09-01T00:00:01.000Z", "second"),
+    ]);
+    const [first, second] = await Promise.all([
+      listSessions({ sessionsRoot: firstRoot }),
+      listSessions({ sessionsRoot: secondRoot }),
+    ]);
+    expect(first.map((entry) => entry.id)).toEqual(["first-root"]);
+    expect(second.map((entry) => entry.id)).toEqual(["second-root"]);
   });
 
   test("retries a transient header read failure", async () => {
@@ -510,16 +635,43 @@ describe("parsed header cache", () => {
       assistant("2026-09-01T00:00:02.000Z"),
     ]);
     const historyPath = join(root, "history.db");
-    const createDb = new Database(historyPath);
-    createDb.run("CREATE TABLE session_titles (session_id TEXT, title TEXT)");
-    createDb.run("INSERT INTO session_titles VALUES ('history', 'First external title')");
-    createDb.close();
+    const historyDb = new Database(historyPath);
+    historyDb.query("PRAGMA journal_mode=WAL").get();
+    historyDb.run("CREATE TABLE session_titles (session_id TEXT, title TEXT)");
+    historyDb.run("INSERT INTO session_titles VALUES ('history', 'First external title')");
+    try {
+      expect((await listSessions({ sessionsRoot }))[0]?.title).toBe("First external title");
+      historyDb.run("UPDATE session_titles SET title = 'Renamed external title' WHERE session_id = 'history'");
+      // The writer remains open, so the rename is in the WAL and the main DB
+      // file itself need not change.
+      expect((await listSessions({ sessionsRoot }))[0]?.title).toBe("Renamed external title");
+    } finally {
+      historyDb.close();
+    }
+  });
 
-    expect((await listSessions({ sessionsRoot }))[0]?.title).toBe("First external title");
-    const renameDb = new Database(historyPath);
-    renameDb.run("UPDATE session_titles SET title = 'Renamed external title' WHERE session_id = 'history'");
-    renameDb.close();
-    expect((await listSessions({ sessionsRoot }))[0]?.title).toBe("Renamed external title");
+  test("recovers external titles after a transient database lock without a file mutation", async () => {
+    const root = makeRoot();
+    const sessionsRoot = join(root, "sessions");
+    writeSession(sessionsRoot, "2026-09-01T00-00-00-000Z_locked-history.jsonl", [
+      session("locked-history", "2026-09-01T00:00:00.000Z"),
+      user("2026-09-01T00:00:01.000Z", "prompt"),
+    ]);
+    const historyDb = new Database(join(root, "history.db"));
+    historyDb.run("CREATE TABLE session_titles (session_id TEXT, title TEXT)");
+    historyDb.run("INSERT INTO session_titles VALUES ('locked-history', 'Recovered external title')");
+    let locked = false;
+    try {
+      historyDb.run("BEGIN EXCLUSIVE");
+      locked = true;
+      expect((await listSessions({ sessionsRoot }))[0]?.title).not.toBe("Recovered external title");
+      historyDb.run("ROLLBACK");
+      locked = false;
+      expect((await listSessions({ sessionsRoot }))[0]?.title).toBe("Recovered external title");
+    } finally {
+      if (locked) historyDb.run("ROLLBACK");
+      historyDb.close();
+    }
   });
 });
 

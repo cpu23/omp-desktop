@@ -9,14 +9,14 @@
    below: the look must not depend on what the host has installed. */
 @font-face {
   font-family: "OMP DejaVu Mono";
-  src: url("/fonts/DejaVuSansMono.ttf") format("truetype");
+  src: url("/fonts/DejaVuSansMono.woff2") format("woff2");
   font-display: swap;
 }
 
 /* Ship both text weights; do not rely on host fonts or synthesized bold. */
 @font-face {
   font-family: "Hack";
-  src: url("/fonts/Hack-Regular.ttf") format("truetype");
+  src: url("/fonts/Hack-Regular.woff2") format("woff2");
   font-display: block;
   font-weight: 400;
   font-style: normal;
@@ -24,7 +24,7 @@
 
 @font-face {
   font-family: "Hack";
-  src: url("/fonts/Hack-Bold.ttf") format("truetype");
+  src: url("/fonts/Hack-Bold.woff2") format("woff2");
   font-display: block;
   font-weight: 700;
   font-style: normal;
@@ -37,7 +37,7 @@
    advance and ~1em ink overflow a 0.6em cell, which clips and shifts icons. */
 @font-face {
   font-family: "JetBrainsMono Nerd Font Mono";
-  src: url("/fonts/JetBrainsMonoNerdFontMono-Regular.ttf") format("truetype");
+  src: url("/fonts/JetBrainsMonoNerdFontMono-Regular.woff2") format("woff2");
   unicode-range: U+E000-F8FF, U+F0000-FFFFD, U+100000-10FFFD;
   font-display: block;
   font-weight: 400;
@@ -833,26 +833,100 @@ body.session-dragging * {
   width: 1ch;
   text-align: center;
   color: var(--row-accent, #808080);
+  font-weight: 400;
+  height: 1em;
+  line-height: 1em;
+  overflow: hidden;
+}
+
+.row-working .working-spinner::before {
+  content: "⣾\A⣽\A⣻\A⢿\A⡿\A⣟\A⣯\A⣷\A⣾";
+  display: block;
+  white-space: pre;
+  line-height: 1em;
+  animation: working-spinner 640ms steps(8, end) infinite;
+  will-change: transform;
 }
 
 .row-working .shimmer-accent {
   --shimmer-mid: var(--row-accent, #808080);
   --shimmer-high: var(--row-accent, #808080);
-}
-
-/* Keep terminal-like fixed geometry: the row already uses bold monospace.
-   Only colour changes between tiers; never invalidate text widths per tick. */
-.shimmer-char {
+  position: relative;
+  display: block;
   color: var(--shimmer-low, var(--dim));
-  font-weight: 700;
+  -webkit-text-fill-color: currentColor;
 }
 
-.shimmer-char[data-tier="1"] {
+.row-working .working-shimmer-sweep {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: calc(100% + 12ch);
+  pointer-events: none;
+  mask-image: linear-gradient(90deg, transparent 0, #000 2ch, #000 10ch, transparent 12ch, transparent 100%);
+  -webkit-mask-image: linear-gradient(90deg, transparent 0, #000 2ch, #000 10ch, transparent 12ch, transparent 100%);
+  animation: working-shimmer-sweep var(--shimmer-cycle, 1s) linear infinite;
+  will-change: transform;
+}
+
+.row-working .working-shimmer-text {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  padding-right: 12ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--shimmer-high, var(--accent));
+  -webkit-text-fill-color: currentColor;
+  animation: working-shimmer-counter var(--shimmer-cycle, 1s) linear infinite;
+  will-change: transform;
+}
+
+@keyframes working-spinner {
+  from { transform: translateY(0); }
+  to { transform: translateY(-8em); }
+}
+
+@keyframes working-shimmer-sweep {
+  from { transform: translateX(-16ch); }
+  to { transform: translateX(calc(100% - 8ch)); }
+}
+
+@keyframes working-shimmer-counter {
+  from { transform: translateX(16ch); }
+  to { transform: translateX(calc(-100% + 8ch)); }
+}
+
+:root[data-motion="reduce"] .row-working .working-spinner::before {
+  animation: none;
+}
+
+:root[data-motion="reduce"] .row-working .shimmer {
   color: var(--shimmer-mid, var(--muted));
 }
 
-.shimmer-char[data-tier="2"] {
-  color: var(--shimmer-high, var(--accent));
+:root[data-motion="reduce"] .row-working .working-shimmer-sweep {
+  display: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root[data-motion="system"] .row-working .working-spinner::before {
+    animation: none;
+  }
+
+  :root[data-motion="system"] .row-working .shimmer {
+    color: var(--shimmer-mid, var(--muted));
+  }
+
+  :root[data-motion="system"] .row-working .working-shimmer-sweep {
+    display: none;
+  }
+}
+
+:root[data-document-visibility="hidden"] .row-working .working-spinner::before,
+:root[data-document-visibility="hidden"] .row-working .working-shimmer-sweep,
+:root[data-document-visibility="hidden"] .row-working .working-shimmer-text {
+  animation-play-state: paused;
 }
 
 .row-done {

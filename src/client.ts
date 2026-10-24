@@ -3,7 +3,7 @@ import {
   applySidebarState, onSidebarStateChange, sidebarFolderView, sidebarFolderExpanded,
   toggleSidebarFolder, STORE_KEY as SIDEBAR_KEY,
 } from "./sidebar";
-import { doneIndicator, syncWorkingAnimation, workingIndicator } from "./working-indicator";
+import { doneIndicator, workingIndicator } from "./working-indicator";
 import { CompletionTracker } from "./completion-tracker";
 import { CompletionNotifications } from "./notifications";
 import { Terminal } from "@xterm/xterm";
@@ -17,6 +17,7 @@ import { isRecord } from "./guards";
 import { insertFilePaths, wireFileDrop } from "./file-drop";
 import { initializeHotkeys } from "./hotkeys";
 import { syncRuntimeLimit } from "./runtime-limit";
+import { splitInputChunks } from "./client-input";
 import {
   attachable,
   bindingForRuntime,
@@ -35,6 +36,7 @@ import {
   parseSessionList,
   parseStateResponse,
   type RuntimeInfo,
+  type ServerMessage,
   type SessionSummaryLike,
 } from "./protocol";
 
@@ -110,7 +112,7 @@ let layout: StoredLayout = { tree: { kind: "leaf", pane: "p1" }, panes: {}, focu
 let activeSpaceId = "s1";
 spaces.set(activeSpaceId, layout);
 let spaceSeq = 1;
-/** True when the current panes came from a stored document (browser or daemon). */
+/** True after local restoration or the initial compatible daemon reconciliation. */
 let restoredLocal = false;
 let runtimes: RuntimeInfo[] = [];
 let sessions: SessionSummaryLike[] = [];
@@ -147,6 +149,7 @@ let pinnedSessions = readPins();
 let stateSaveError: string | null = null;
 let stateDelivering = false;
 let stateQueued = false;
+let stateSaveTimer: number | undefined;
 /**
  * Publishing gate. Closed until the daemon's document has been read (or proven
  * absent) and every adopted field is in memory, so a partial or fallback
@@ -156,6 +159,7 @@ let stateQueued = false;
 let stateGate: "pending" | "ready" | "blocked" = "pending";
 /** Why publishing is blocked; surfaced when a save is attempted while gated. */
 let stateGateReason = "";
+let stateGateGeneration: string | null = null;
 /** Fingerprint of the last document the daemon accepted, to skip no-op PUTs. */
 let deliveredState = "";
 
@@ -168,19 +172,41 @@ function savePins(): void {
   }
   queueStateSave();
 }
+type SidebarRowRecord = {
+  element: HTMLElement;
+  name: HTMLElement;
+  sub: HTMLElement;
+  pin: HTMLButtonElement;
+  runtime: RuntimeInfo | null;
+  session: SessionSummaryLike | null;
+  snapshot: SessionSummaryLike | null;
+  nameKey: string;
+  subKey: string;
+  dragPayload: Record<string, unknown>;
+};
 
-function pinButton(session: SessionSummaryLike | null): HTMLButtonElement {
+type SidebarFolderRecord = {
+  element: HTMLElement;
+  heading: HTMLButtonElement;
+  marker: HTMLElement;
+  label: HTMLElement;
+  contents: HTMLElement;
+};
+
+const sidebarRows = new Map<string, SidebarRowRecord>();
+const sidebarFolders = new Map<string, SidebarFolderRecord>();
+let sidebarFolderSeq = 0;
+let sidebarEmpty: HTMLElement | null = null;
+
+function pinButton(currentSession: () => SessionSummaryLike | null): HTMLButtonElement {
   const button = document.createElement("button");
   button.className = "pin";
-  const pinned = session !== null && pinnedSessions.some((entry) => entry.path === session.path);
   button.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M9 3h6l-1 6 4 4v2H6v-2l4-4-1-6Z"/><path d="M12 15v6"/></svg>';
-  button.setAttribute("aria-pressed", String(pinned));
-  button.disabled = session === null;
-  button.title = session ? `${pinned ? "Unpin" : "Pin"} chat` : "Waiting for session file";
-  button.setAttribute("aria-label", button.title);
   button.addEventListener("click", (event) => {
     event.stopPropagation();
+    const session = currentSession();
     if (!session) return;
+    const pinned = pinnedSessions.some((entry) => entry.path === session.path);
     pinnedSessions = pinned
       ? pinnedSessions.filter((entry) => entry.path !== session.path)
       : [...pinnedSessions, session];
@@ -195,7 +221,10 @@ let renderPending = false;
 
 /** Pointer capture keeps session moves inside the page: WebKitGTK's OS drag
  * transport can end custom-MIME HTML drags before delivering a drop. */
-function wireSessionDrag(element: HTMLElement, payload: Record<string, unknown>): void {
+function wireSessionDrag(
+  element: HTMLElement,
+  payload: Record<string, unknown> | (() => Record<string, unknown>),
+): void {
   let origin: { x: number; y: number; pointer: number } | null = null;
   let moved = false;
   let suppressClick = false;
@@ -274,8 +303,9 @@ function wireSessionDrag(element: HTMLElement, payload: Record<string, unknown>)
     if (document.body.hasPointerCapture(event.pointerId)) document.body.releasePointerCapture(event.pointerId);
     if (shouldDrop && destination) {
       event.preventDefault();
-      if (destination.dataset.space) handleSpaceDrop(destination.dataset.space, payload);
-      else if (destination.dataset.pane) handlePaneDrop(destination.dataset.pane, payload);
+      const currentPayload = typeof payload === "function" ? payload() : payload;
+      if (destination.dataset.space) handleSpaceDrop(destination.dataset.space, currentPayload);
+      else if (destination.dataset.pane) handlePaneDrop(destination.dataset.pane, currentPayload);
     }
     dragging = false;
     if (renderPending) renderSidebar();
@@ -303,22 +333,37 @@ function handlePaneDrop(paneId: string, payload: Record<string, unknown>): void 
 
 // ---------------------------------------------------------------- daemon API
 
+const jsonReads = new Map<string, Promise<unknown | null>>();
+
 /**
- * Fetch JSON for a boundary that validates its own shape. Returns null (and shows
- * the failure in the status chip) on transport errors or a non-2xx status.
+ * Fetch JSON for a boundary that validates its own shape. Identical overlapping
+ * reads share one request; failures still return null and surface in the status.
  */
-async function getJson(path: string, init?: RequestInit): Promise<unknown | null> {
-  try {
-    const res = await fetch(path, { cache: "no-store", ...init });
-    if (!res.ok) {
-      setStatus(`${path} → ${res.status}`, "warn");
+function getJson(path: string, init?: RequestInit): Promise<unknown | null> {
+  const shareable = (init?.method ?? "GET").toUpperCase() === "GET";
+  const readKey = path === "/api/runtimes" ? path : `${path}\u0000${daemonId ?? ""}`;
+  const existing = shareable ? jsonReads.get(readKey) : undefined;
+  if (existing) return existing;
+  const request = (async (): Promise<unknown | null> => {
+    try {
+      const res = await fetch(path, { cache: "no-cache", ...init });
+      if (!res.ok) {
+        setStatus(`${path} → ${res.status}`, "warn");
+        return null;
+      }
+      return (await res.json()) as unknown;
+    } catch {
+      setStatus("daemon unreachable", "warn");
       return null;
     }
-    return (await res.json()) as unknown;
-  } catch {
-    setStatus("daemon unreachable", "warn");
-    return null;
+  })();
+  if (shareable) {
+    jsonReads.set(readKey, request);
+    void request.then(() => {
+      if (jsonReads.get(readKey) === request) jsonReads.delete(readKey);
+    });
   }
+  return request;
 }
 
 async function refreshRuntimes(options: { restore?: boolean } = {}): Promise<boolean> {
@@ -330,7 +375,15 @@ async function refreshRuntimes(options: { restore?: boolean } = {}): Promise<boo
   }
   const previousGeneration = daemonId;
   daemonUp = true;
-  if (payload.generation) daemonId = payload.generation;
+  daemonId = payload.generation;
+  const generationChanged = previousGeneration !== daemonId;
+  if (generationChanged) {
+    stateGate = "pending";
+    stateGateGeneration = null;
+    stateGateReason = "";
+    deliveredState = "";
+    stateQueued = false;
+  }
   // A new (or never-seen) generation means the pool this client knew is gone
   // and the daemon may be rebuilding it right now. Watch the pool while it
   // grows so restored sessions no pane claims still get a view.
@@ -350,6 +403,8 @@ async function refreshRuntimes(options: { restore?: boolean } = {}): Promise<boo
   // the daemon restarted) and reattaches runtimes that are still alive.
   for (const pane of panes.values()) pane.syncFromRuntimes();
   setStatus(`${runtimes.length} live`, "ok");
+  if (generationChanged && options.restore !== false) await reconcileWorkspaceState();
+  if (options.restore !== false && stateGate === "pending") return true;
   // Reopen panes whose session came back after boot; the boot path passes
   // restore:false so adoption finishes before anything is resumed.
   if (options.restore !== false) {
@@ -482,6 +537,7 @@ class Pane {
   #body: HTMLElement;
   #host: HTMLElement;
   #placeholder: HTMLElement;
+  #placeholderKey = "";
   #jumpLatest: HTMLButtonElement;
   #titleEl: HTMLElement;
   #stateEl: HTMLElement;
@@ -493,6 +549,7 @@ class Pane {
   #selectionEvents = new AbortController();
   #selectionRevision = 0;
   #disposeFileDrop: (() => void) | null = null;
+  #needsRepaint = false;
 
   constructor(id: string, binding: PaneBinding) {
     this.id = id;
@@ -599,7 +656,11 @@ class Pane {
     loadImageAddon(this.term);
     this.term.loadAddon(new WebLinksAddon(openTerminalLink));
     this.term.onData((data) => {
-      if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: "input", data }));
+      const socket = this.ws;
+      if (socket?.readyState !== WebSocket.OPEN) return;
+      for (const chunk of splitInputChunks(data)) {
+        socket.send(JSON.stringify({ type: "input", data: chunk }));
+      }
     });
     this.term.onSelectionChange(() => { this.#selectionRevision++; });
     this.term.onScroll(() => this.#syncJumpLatest());
@@ -643,8 +704,9 @@ class Pane {
 
   #syncJumpLatest(): void {
     const buffer = this.term.buffer.active;
-    this.#jumpLatest.hidden = !this.binding.runtimeId ||
+    const hidden = !this.binding.runtimeId ||
       buffer.type !== "normal" || buffer.baseY - buffer.viewportY < this.term.rows;
+    if (this.#jumpLatest.hidden !== hidden) this.#jumpLatest.hidden = hidden;
   }
 
   get visible(): boolean {
@@ -750,17 +812,24 @@ class Pane {
     this.sendResize();
   }
 
-  /** Restore pixels after this terminal's DOM was detached and reattached. */
+  /** Marks a pane tree move that may discard the renderer's pixels. */
+  markNeedsRepaint(): void {
+    this.#needsRepaint = true;
+  }
+
+  /** Refit after attachment; repaint only when the pane tree was moved. */
   refreshAfterAttach(): void {
     if (!this.visible || this.#replaying) return;
     this.#fitGrid();
     // Another view of this runtime may have changed the PTY's geometry while
     // this space was hidden. Reassert it even if our own grid did not change.
     this.sendResize(true);
-    // Resizing only requests a render when the grid changes. A detached
-    // renderer can lose its pixels without changing geometry, so repaint the
-    // current viewport while preserving xterm's buffer and scroll position.
-    this.term.refresh(0, this.term.rows - 1);
+    if (this.#needsRepaint) {
+      // The DOM/GPU renderer can lose its pixels when the pane tree is moved,
+      // but a live replay on an attached pane already paints its own writes.
+      this.term.refresh(0, this.term.rows - 1);
+      this.#needsRepaint = false;
+    }
   }
 
   /** Fit whole cells without changing text geometry to fill leftover space. */
@@ -852,11 +921,13 @@ class Pane {
         if (message?.type === "hello") {
           // TUI replay contains absolute cursor moves and may disable wrapping.
           // Parse it at the producer's size before fitting the restored pane.
-          this.term.resize(message.runtime.cols, message.runtime.rows);
+          if (this.term.cols !== message.runtime.cols || this.term.rows !== message.runtime.rows) {
+            this.term.resize(message.runtime.cols, message.runtime.rows);
+          }
           replayBytes = message.replayBytes;
           if (replayBytes === 0) finishReplay();
         }
-        this.#handleControl(event.data);
+        this.#handleControl(message);
         return;
       }
       if (event.data instanceof ArrayBuffer) {
@@ -883,8 +954,7 @@ class Pane {
     };
   }
 
-  #handleControl(raw: string): void {
-    const msg = parseServerMessage(raw);
+  #handleControl(msg: ServerMessage | null): void {
     if (!msg) return;
     if (msg.type === "hello") {
       this.binding.title = displayTitle(msg.runtime);
@@ -983,24 +1053,34 @@ class Pane {
   }
 
   renderHeader(): void {
-    this.#titleEl.textContent = this.binding.title ?? "no session";
-    this.#titleEl.title = this.binding.sessionFile ?? "";
-    if (this.binding.runtimeId) this.#stateEl.textContent = "";
+    const title = this.binding.title ?? "no session";
+    const sessionFile = this.binding.sessionFile ?? "";
+    if (this.#titleEl.textContent !== title) this.#titleEl.textContent = title;
+    if (this.#titleEl.title !== sessionFile) this.#titleEl.title = sessionFile;
+    if (this.binding.runtimeId && this.#stateEl.textContent !== "") this.#stateEl.textContent = "";
   }
 
   renderPlaceholder(): void {
-    this.#placeholder.replaceChildren();
+    const bound = Boolean(this.binding.runtimeId);
+    const display = bound ? "none" : "flex";
+    if (this.#placeholder.style.display !== display) this.#placeholder.style.display = display;
+    const hostDisplay = bound ? "" : "none";
+    if (this.#host.style.display !== hostDisplay) this.#host.style.display = hostDisplay;
     this.#syncJumpLatest();
-    if (this.binding.runtimeId) {
-      this.#placeholder.style.display = "none";
-      this.#host.style.display = "";
+    if (bound) {
+      this.#placeholderKey = "bound";
       return;
     }
-    this.#placeholder.style.display = "flex";
-    this.#host.style.display = "none";
+    const title = this.binding.title;
+    const sessionFile = this.binding.sessionFile;
+    const known = sessionFile ? sessionSummary(sessionFile) : undefined;
+    const key = JSON.stringify([title, this.#notice, sessionFile, known?.cwd ?? ""]);
+    if (this.#placeholderKey === key) return;
+    this.#placeholderKey = key;
+    this.#placeholder.replaceChildren();
     const text = document.createElement("div");
-    text.textContent = this.binding.title
-      ? `${this.binding.title} — not running`
+    text.textContent = title
+      ? `${title} — not running`
       : "empty pane — choose a session from the sidebar or start one";
     this.#placeholder.append(text);
     if (this.#notice) {
@@ -1014,11 +1094,9 @@ class Pane {
     const row = document.createElement("div");
     row.style.display = "flex";
     row.style.gap = "8px";
-    const sessionFile = this.binding.sessionFile;
     if (sessionFile) {
       // Pins keep older transcripts reachable, so they carry the fallback cwd too;
       // the daemon resolves the recorded cwd itself when the file has one.
-      const known = sessionSummary(sessionFile);
       const resume = document.createElement("button");
       resume.textContent = "resume this session";
       resume.addEventListener("click", () =>
@@ -1403,6 +1481,7 @@ function renderLayout(): void {
   closePaneMenu();
   const tree = layout.tree;
   const ids = leaves(tree);
+  for (const pane of panes.values()) pane.markNeedsRepaint();
   panesEl.replaceChildren(buildNode(tree));
   for (const id of ids) {
     const pane = panes.get(id);
@@ -1473,7 +1552,9 @@ function startResize(
     divider.removeEventListener("pointerup", onEnd);
     divider.removeEventListener("pointercancel", onEnd);
     divider.classList.remove("dragging");
-    node.ratio = apply(node.ratio);
+    const finalRatio = apply(node.ratio);
+    if (finalRatio === startRatio) return;
+    node.ratio = finalRatio;
     save();
     // The observer's debounced fit can land mid-drag, so force every pane onto its
     // final geometry once the pointer is up rather than trusting the last callback.
@@ -1520,48 +1601,235 @@ function acknowledgeCompletion(runtimeId: string | null): boolean {
 }
 
 
-/**
- * Working/Done come only from the extension's authoritative state
- * (`presentation`): PTY byte traffic says bytes moved, not that omp is
- * answering, so a missing presentation shows no indicator at all. Working wins
- * while the next turn runs; selecting a session acknowledges its finished turn.
- */
-function runtimeIndicator(runtime: RuntimeInfo, title: string): HTMLElement | null {
-  const presentation = runtime.presentation;
-  if (!daemonUp || !runtime.alive || !presentation) return null;
-  if (presentation.agentActive) return workingIndicator(title);
-  return presentation.completion &&
-    acknowledgedCompletions.get(runtime.id) !== presentation.completion.identity ? doneIndicator() : null;
+/** Updates the existing pin control without replacing its focused row node. */
+function syncPinButton(record: SidebarRowRecord): void {
+  const session = record.snapshot;
+  const pinned = session !== null && pinnedSessions.some((entry) => entry.path === session.path);
+  const title = session ? `${pinned ? "Unpin" : "Pin"} chat` : "Waiting for session file";
+  if (record.pin.disabled !== (session === null)) record.pin.disabled = session === null;
+  if (record.pin.getAttribute("aria-pressed") !== String(pinned)) {
+    record.pin.setAttribute("aria-pressed", String(pinned));
+  }
+  if (record.pin.title !== title) record.pin.title = title;
+  if (record.pin.getAttribute("aria-label") !== title) record.pin.setAttribute("aria-label", title);
 }
 
-/** Working titles include their spinner; completed titles keep their marker. */
-function rowName(title: string, status: HTMLElement | null): HTMLElement {
+function createSidebarRow(kind: "runtime" | "session"): SidebarRowRecord {
+  const element = document.createElement("div");
   const name = document.createElement("span");
   name.className = "name";
-  if (status?.classList.contains("row-working")) {
-    name.append(status);
-    return name;
+  const sub = document.createElement("span");
+  sub.className = "sub";
+  const actions = document.createElement("div");
+  actions.className = "row-actions";
+  const record: SidebarRowRecord = {
+    element,
+    name,
+    sub,
+    pin: null!,
+    runtime: null,
+    session: null,
+    snapshot: null,
+    nameKey: "",
+    subKey: "",
+    dragPayload: kind === "runtime"
+      ? { kind: "runtime", runtimeId: "" }
+      : { kind: "session", path: "", cwd: "", title: "" },
+  };
+  record.pin = pinButton(() => record.snapshot);
+  if (kind === "runtime") {
+    const kill = document.createElement("button");
+    kill.className = "kill";
+    kill.textContent = "✕";
+    kill.title = "Stop this session";
+    kill.addEventListener("click", (event) => {
+      event.stopPropagation();
+      if (record.runtime) void killRuntime(record.runtime.id);
+    });
+    actions.append(kill, record.pin);
+  } else {
+    actions.append(record.pin);
+  }
+  element.append(name, sub, actions);
+  element.addEventListener("click", () => {
+    const pane = focusedPane();
+    if (!pane) return;
+    if (record.runtime) {
+      pane.bind(bindingForRuntime(record.runtime, daemonId, displayTitle(record.runtime)));
+    } else if (record.session) {
+      void openSession(pane, record.session);
+    }
+  });
+  wireSessionDrag(element, () => record.dragPayload);
+  return record;
+}
+
+function updateSidebarRowName(
+  record: SidebarRowRecord,
+  title: string,
+  indicator: "working" | "done" | "none",
+): void {
+  const key = `${indicator}\u0000${title}`;
+  if (record.nameKey === key) return;
+  record.nameKey = key;
+  record.name.replaceChildren();
+  if (indicator === "working") {
+    record.name.append(workingIndicator(title));
+    return;
   }
   const label = document.createElement("span");
   label.className = "title";
   label.textContent = title;
-  name.append(label);
-  if (status) name.append(status);
-  return name;
+  record.name.append(label);
+  if (indicator === "done") record.name.append(doneIndicator());
+}
+
+function updateSidebarRowSub(record: SidebarRowRecord, key: string, text: string): void {
+  if (record.subKey === key) return;
+  record.subKey = key;
+  record.sub.textContent = text;
+  record.sub.hidden = !text;
+}
+
+function updateRuntimeSidebarRow(
+  record: SidebarRowRecord,
+  runtime: RuntimeInfo,
+  title: string,
+  cwd: string,
+  ownerId: string | undefined,
+  folderView: boolean,
+  snapshot: SessionSummaryLike | null,
+): void {
+  record.runtime = runtime;
+  record.session = null;
+  record.snapshot = snapshot;
+  const className = runtime.alive ? "row live loaded" : "row recent loaded";
+  if (record.element.className !== className) record.element.className = className;
+  if (record.element.dataset.cwd !== cwd) record.element.dataset.cwd = cwd;
+  const rowTitle = `${cwd}\n${runtime.sessionFile ?? "(session file not known yet)"}\n${runtime.id}`;
+  if (record.element.title !== rowTitle) record.element.title = rowTitle;
+  const accent = runtimeAccent(runtime);
+  if (record.element.style.getPropertyValue("--row-accent") !== accent) {
+    record.element.style.setProperty("--row-accent", accent);
+  }
+  const presentation = runtime.presentation;
+  const indicator = daemonUp && runtime.alive && presentation
+    ? presentation.agentActive
+      ? "working"
+      : presentation.completion &&
+          acknowledgedCompletions.get(runtime.id) !== presentation.completion.identity
+        ? "done"
+        : "none"
+    : "none";
+  updateSidebarRowName(record, title, indicator);
+  const sub = ownerId ? ownerId.replace("p", "pane ") : folderView ? "" : cwd.replace(/^\/home\/[^/]+/, "~");
+  updateSidebarRowSub(record, `runtime\u0000${sub}`, sub);
+  record.dragPayload.runtimeId = runtime.id;
+  syncPinButton(record);
+}
+
+function updateRecentSidebarRow(
+  record: SidebarRowRecord,
+  session: SessionSummaryLike,
+  folderView: boolean,
+): void {
+  record.runtime = null;
+  record.session = session;
+  record.snapshot = session;
+  if (record.element.className !== "row recent") record.element.className = "row recent";
+  if (record.element.dataset.cwd !== session.cwd) record.element.dataset.cwd = session.cwd;
+  const rowTitle = `${session.cwd}\n${session.path}`;
+  if (record.element.title !== rowTitle) record.element.title = rowTitle;
+  updateSidebarRowName(record, session.title || session.cwd, "none");
+  const relative = sessionRelative(session.updatedAt);
+  const cwd = session.cwd.split("/").filter(Boolean).pop() ?? "/";
+  const subKey = `session\u0000${relative}\u0000${folderView ? "" : cwd}`;
+  if (record.subKey !== subKey) {
+    record.subKey = subKey;
+    record.sub.replaceChildren();
+    const time = document.createElement("span");
+    time.className = "time";
+    time.textContent = relative;
+    record.sub.append(time);
+    if (!folderView) {
+      const cwdEl = document.createElement("span");
+      cwdEl.className = "cwd";
+      cwdEl.textContent = cwd;
+      record.sub.append(cwdEl);
+    }
+    record.sub.hidden = false;
+  }
+  record.dragPayload.path = session.path;
+  record.dragPayload.cwd = session.cwd;
+  record.dragPayload.title = session.title;
+  syncPinButton(record);
+}
+
+function reconcileChildren(container: HTMLElement, desired: HTMLElement[]): void {
+  const wanted = new Set(desired);
+  for (const child of Array.from(container.children)) {
+    if (!wanted.has(child as HTMLElement)) child.remove();
+  }
+  for (let index = 0; index < desired.length; index++) {
+    const element = desired[index];
+    const current = container.children[index] ?? null;
+    if (current !== element) container.insertBefore(element, current);
+  }
+}
+
+function folderRecord(cwd: string): SidebarFolderRecord {
+  const existing = sidebarFolders.get(cwd);
+  if (existing) return existing;
+  const element = document.createElement("div");
+  element.className = "sidebar-folder";
+  const heading = document.createElement("button");
+  heading.type = "button";
+  heading.className = "folder-heading";
+  heading.dataset.cwd = cwd;
+  heading.title = cwd;
+  const marker = document.createElement("span");
+  marker.className = "folder-marker";
+  marker.setAttribute("aria-hidden", "true");
+  const label = document.createElement("span");
+  label.className = "folder-label";
+  heading.append(marker, label);
+  const contents = document.createElement("div");
+  contents.className = "folder-sessions";
+  contents.id = `sidebar-folder-${++sidebarFolderSeq}`;
+  heading.setAttribute("aria-controls", contents.id);
+  heading.addEventListener("click", () => {
+    toggleSidebarFolder(cwd);
+    heading.focus();
+  });
+  element.append(heading, contents);
+  const record = { element, heading, marker, label, contents };
+  sidebarFolders.set(cwd, record);
+  return record;
+}
+
+function updateFolder(record: SidebarFolderRecord, cwd: string): void {
+  const expanded = sidebarFolderExpanded(cwd);
+  const marker = expanded ? "▾" : "▸";
+  if (record.marker.textContent !== marker) record.marker.textContent = marker;
+  const label = cwd.replace(/^\/home\/[^/]+/, "~") || "(unknown folder)";
+  if (record.label.textContent !== label) record.label.textContent = label;
+  if (record.heading.getAttribute("aria-expanded") !== String(expanded)) {
+    record.heading.setAttribute("aria-expanded", String(expanded));
+  }
+  if (record.contents.hidden === expanded) record.contents.hidden = !expanded;
 }
 
 function renderSidebar(): void {
-  // Rebuilding rows mid-drag cancels the drag the user is performing.
+  // Defer reconciliation while a row is being dragged so the active pointer
+  // source and its payload remain attached until the drop completes.
   if (dragging) {
     renderPending = true;
     return;
   }
   renderPending = false;
-  sessionListEl.replaceChildren();
 
   const query = searchEl.value.trim().toLowerCase();
   const folderView = sidebarFolderView();
-  const folders = new Map<string, HTMLElement[]>();
   const sessionByPath = new Map<string, SessionSummaryLike>();
   for (const session of sessions) {
     if (!sessionByPath.has(session.path)) sessionByPath.set(session.path, session);
@@ -1570,8 +1838,6 @@ function renderSidebar(): void {
   for (const runtime of runtimes) {
     if (runtime.sessionFile) liveFiles.add(runtime.sessionFile);
   }
-  // Pinned snapshots keep older chats reachable beyond the recent-session limit.
-  // Transcript paths identify pins across stop/resume and daemon restarts.
   let pinsChanged = false;
   pinnedSessions = pinnedSessions.map((pin) => {
     const fresh = sessionByPath.get(pin.path);
@@ -1583,8 +1849,11 @@ function renderSidebar(): void {
   });
   if (pinsChanged) savePins();
   const pinnedPaths = new Set(pinnedSessions.map((session) => session.path));
-  const pinnedRows: HTMLElement[] = [];
-  const otherRows: HTMLElement[] = [];
+  const paneForRuntime = new Map<string, string>();
+  for (const pane of panes.values()) {
+    const runtimeId = pane.binding.runtimeId;
+    if (runtimeId && !paneForRuntime.has(runtimeId)) paneForRuntime.set(runtimeId, pane.id);
+  }
   const liveRuntimes = query
     ? runtimes.filter((runtime) => {
       const summary = runtime.sessionFile ? sessionSummary(runtime.sessionFile) : undefined;
@@ -1599,141 +1868,74 @@ function renderSidebar(): void {
       `${session.title} ${session.cwd}`.toLowerCase().includes(query)),
   );
 
-  if (!liveRuntimes.length && !recent.length) {
-    const empty = document.createElement("div");
-    empty.className = "side-empty";
-    empty.textContent = daemonUp ? (query ? "no matches" : "no sessions") : "daemon unreachable";
-    sessionListEl.append(empty);
-  }
-
-  // Which pane shows a runtime, for the row subtitle; first matching pane wins.
-  const paneForRuntime = new Map<string, string>();
-  for (const pane of panes.values()) {
-    const runtimeId = pane.binding.runtimeId;
-    if (runtimeId && !paneForRuntime.has(runtimeId)) paneForRuntime.set(runtimeId, pane.id);
-  }
-
+  const pinnedRows: SidebarRowRecord[] = [];
+  const otherRows: SidebarRowRecord[] = [];
+  const activeKeys = new Set<string>();
   for (const runtime of liveRuntimes) {
     const title = displayTitle(runtime);
-    // The transcript's recorded directory is the session's project; runtime.cwd
-    // is only the process launch dir (equal for a resumed session, not for one
-    // omp relocated out of a disallowed launch dir).
+    // The transcript directory is the project; runtime.cwd may only be its
+    // process launch directory after omp relocates out of a disallowed path.
     const summary = runtime.sessionFile ? sessionSummary(runtime.sessionFile) : undefined;
     const cwd = summary?.cwd ?? runtime.cwd;
-    const row = document.createElement("div");
-    row.className = runtime.alive ? "row live loaded" : "row recent loaded";
-    row.dataset.cwd = cwd;
-    // The live edge and the working shimmer both read this one session colour;
-    // without a validated accent they fall back to mobile's grey.
-    row.style.setProperty("--row-accent", runtimeAccent(runtime));
-    row.title = `${cwd}\n${runtime.sessionFile ?? "(session file not known yet)"}\n${runtime.id}`;
-    const ownerId = paneForRuntime.get(runtime.id);
-    const name = rowName(title, runtimeIndicator(runtime, title));
-    const sub = document.createElement("span");
-    sub.className = "sub";
-    sub.textContent = ownerId ? ownerId.replace("p", "pane ") : folderView ? "" : cwd.replace(/^\/home\/[^/]+/, "~");
-    sub.hidden = !sub.textContent;
-    const kill = document.createElement("button");
-    kill.className = "kill";
-    kill.textContent = "✕";
-    kill.title = "Stop this session";
-    kill.addEventListener("click", (event) => {
-      event.stopPropagation();
-      void killRuntime(runtime.id);
-    });
-    // A live session with no index row (new, or outside the loaded window) may
-    // carry an existing pin snapshot, but never a synthesized time: runtime
-    // activity is PTY byte traffic, not conversation, and "now" would relabel
-    // an old chat as freshly used. No snapshot disables the pin button until
-    // the next session-index refresh carries the row.
+    const key = `runtime:${runtime.id}`;
+    activeKeys.add(key);
+    const record = sidebarRows.get(key) ?? createSidebarRow("runtime");
+    sidebarRows.set(key, record);
     const snapshot = runtime.sessionFile
       ? summary ?? pinnedSessions.find((entry) => entry.path === runtime.sessionFile) ?? null
       : null;
-    const actions = document.createElement("div");
-    actions.className = "row-actions";
-    actions.append(kill, pinButton(snapshot));
-    row.append(name, sub, actions);
-    row.addEventListener("click", () => {
-      const pane = focusedPane();
-      if (pane) pane.bind(bindingForRuntime(runtime, daemonId, displayTitle(runtime)));
-    });
-    wireSessionDrag(row, { kind: "runtime", runtimeId: runtime.id });
-    (runtime.sessionFile && pinnedPaths.has(runtime.sessionFile) ? pinnedRows : otherRows).push(row);
+    updateRuntimeSidebarRow(record, runtime, title, cwd, paneForRuntime.get(runtime.id), folderView, snapshot);
+    (runtime.sessionFile && pinnedPaths.has(runtime.sessionFile) ? pinnedRows : otherRows).push(record);
+  }
+  for (const session of recent) {
+    const key = `session:${session.path}`;
+    activeKeys.add(key);
+    const record = sidebarRows.get(key) ?? createSidebarRow("session");
+    sidebarRows.set(key, record);
+    updateRecentSidebarRow(record, session, folderView);
+    (pinnedPaths.has(session.path) ? pinnedRows : otherRows).push(record);
+  }
+  for (const [key, record] of sidebarRows) {
+    if (activeKeys.has(key)) continue;
+    record.element.remove();
+    sidebarRows.delete(key);
   }
 
-  for (const session of recent) {
-    const row = document.createElement("div");
-    row.className = "row recent";
-    row.dataset.cwd = session.cwd;
-    row.title = `${session.cwd}\n${session.path}`;
-    const name = rowName(session.title || session.cwd, null);
-    const sub = document.createElement("span");
-    sub.className = "sub";
-    const rel = document.createElement("span");
-    rel.className = "time";
-    rel.textContent = sessionRelative(session.updatedAt);
-    const cwdEl = document.createElement("span");
-    cwdEl.className = "cwd";
-    cwdEl.textContent = session.cwd.split("/").filter(Boolean).pop() ?? "/";
-    sub.append(rel);
-    if (!folderView) sub.append(cwdEl);
-    const actions = document.createElement("div");
-    actions.className = "row-actions";
-    actions.append(pinButton(session));
-    row.append(name, sub, actions);
-    row.addEventListener("click", () => {
-      const pane = focusedPane();
-      if (pane) void openSession(pane, session);
-    });
-    wireSessionDrag(row, { kind: "session", path: session.path, cwd: session.cwd, title: session.title });
-    (pinnedPaths.has(session.path) ? pinnedRows : otherRows).push(row);
+  const rows = [...pinnedRows, ...otherRows];
+  const desiredTopLevel: HTMLElement[] = [];
+  if (rows.length === 0) {
+    if (!sidebarEmpty) {
+      sidebarEmpty = document.createElement("div");
+      sidebarEmpty.className = "side-empty";
+    }
+    const text = daemonUp ? (query ? "no matches" : "no sessions") : "daemon unreachable";
+    if (sidebarEmpty.textContent !== text) sidebarEmpty.textContent = text;
+    desiredTopLevel.push(sidebarEmpty);
+  }
+
+  const rowsByFolder = new Map<string, SidebarRowRecord[]>();
+  for (const row of rows) {
+    const cwd = row.element.dataset.cwd ?? "";
+    const folderRows = rowsByFolder.get(cwd) ?? [];
+    folderRows.push(row);
+    rowsByFolder.set(cwd, folderRows);
   }
   if (folderView) {
-    for (const row of [...pinnedRows, ...otherRows]) {
-      const cwd = row.dataset.cwd!;
-      const rows = folders.get(cwd) ?? [];
-      folders.set(cwd, rows);
-      rows.push(row);
-    }
-    for (const [cwd, rows] of folders) {
-      const folder = document.createElement("div");
-      folder.className = "sidebar-folder";
-      const heading = document.createElement("button");
-      heading.type = "button";
-      heading.className = "folder-heading";
-      heading.dataset.cwd = cwd;
-      heading.title = cwd;
-      const expanded = sidebarFolderExpanded(cwd);
-      heading.setAttribute("aria-expanded", String(expanded));
-      const marker = document.createElement("span");
-      marker.className = "folder-marker";
-      marker.textContent = expanded ? "▾" : "▸";
-      marker.setAttribute("aria-hidden", "true");
-      const label = document.createElement("span");
-      label.className = "folder-label";
-      label.textContent = cwd.replace(/^\/home\/[^/]+/, "~") || "(unknown folder)";
-      heading.append(marker, label);
-      const contents = document.createElement("div");
-      contents.className = "folder-sessions";
-      contents.id = `sidebar-folder-${sessionListEl.childElementCount}`;
-      heading.setAttribute("aria-controls", contents.id);
-      contents.hidden = !expanded;
-      contents.append(...rows);
-      heading.addEventListener("click", () => {
-        toggleSidebarFolder(cwd);
-        for (const button of sessionListEl.querySelectorAll<HTMLButtonElement>(".folder-heading")) {
-          if (button.dataset.cwd === cwd) button.focus();
-        }
-      });
-      folder.append(heading, contents);
-      sessionListEl.append(folder);
+    for (const [cwd, folderRows] of rowsByFolder) {
+      const folder = folderRecord(cwd);
+      updateFolder(folder, cwd);
+      reconcileChildren(folder.contents, folderRows.map((row) => row.element));
+      desiredTopLevel.push(folder.element);
     }
   } else {
-    sessionListEl.append(...pinnedRows, ...otherRows);
+    desiredTopLevel.push(...rows.map((row) => row.element));
   }
-  // New rows bring new spinner/shimmer nodes: the loop is only alive while one
-  // of them paints.
-  syncWorkingAnimation();
+  for (const [cwd, folder] of sidebarFolders) {
+    if (rowsByFolder.has(cwd)) continue;
+    folder.element.remove();
+    sidebarFolders.delete(cwd);
+  }
+  reconcileChildren(sessionListEl, desiredTopLevel);
 }
 
 function focusedPane(): Pane | null {
@@ -1907,29 +2109,16 @@ function save(): void {
   queueStateSave();
 }
 
-function workspaceStateDoc(): unknown {
-  return {
-    version: STATE_VERSION,
-    savedAt: new Date().toISOString(),
-    layout: workspaceLayoutDocument(),
-    pins: pinnedSessions,
-    cellSize,
-    sidebar: localStorage.getItem(SIDEBAR_KEY),
-  };
-}
-
-/**
- * Mirror the workspace to the daemon's state file (durable) while browser storage
- * stays the fast cache. Serialized: a save during a PUT queues one follow-up, so
- * the document that lands on disk is the last one, not an earlier one. A failure
- * stays visible in the status chip until the next state change persists it.
- */
 function queueStateSave(): void {
   if (stateDelivering) {
     stateQueued = true;
     return;
   }
-  void deliverState();
+  if (stateSaveTimer !== undefined) return;
+  stateSaveTimer = window.setTimeout(() => {
+    stateSaveTimer = undefined;
+    void deliverState();
+  }, 0);
 }
 
 async function deliverState(): Promise<void> {
@@ -1951,17 +2140,35 @@ async function deliverState(): Promise<void> {
     return;
   }
   stateDelivering = true;
+  let deliveryFailed = false;
+  let deliveryGeneration: string | null = null;
   try {
     do {
       stateQueued = false;
+      const generation = daemonId;
+      if (!generation || stateGateGeneration !== generation) {
+        stateGate = "pending";
+        stateGateGeneration = null;
+        break;
+      }
+      deliveryGeneration = generation;
+      const layoutDocument = workspaceLayoutDocument();
+      const sidebar = localStorage.getItem(SIDEBAR_KEY);
       const fingerprint = JSON.stringify({
-        layout: workspaceLayoutDocument(),
+        layout: layoutDocument,
         pins: pinnedSessions,
         cellSize,
-        sidebar: localStorage.getItem(SIDEBAR_KEY),
+        sidebar,
       });
       if (fingerprint === deliveredState && !stateSaveError) break;
-      const body = JSON.stringify(workspaceStateDoc());
+      const body = JSON.stringify({
+        version: STATE_VERSION,
+        savedAt: new Date().toISOString(),
+        layout: layoutDocument,
+        pins: pinnedSessions,
+        cellSize,
+        sidebar,
+      });
       const bodyBytes = new TextEncoder().encode(body).length;
       if (bodyBytes > STATE_LIMIT_BYTES) {
         stateSaveError = `workspace state is too large to save (${Math.ceil(bodyBytes / 1024)} KiB)`;
@@ -1970,11 +2177,22 @@ async function deliverState(): Promise<void> {
       }
       const res = await fetch("/api/state", {
         method: "PUT",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", "X-OMP-Generation": generation },
         body,
       });
+      if (daemonId !== generation || stateGateGeneration !== generation) break;
+      if (res.status === 409) {
+        stateGate = "pending";
+        stateGateGeneration = null;
+        stateQueued = false;
+        void refreshRuntimes().then((reachable) =>
+          reachable && stateGate !== "ready" ? reconcileWorkspaceState() : undefined,
+        );
+        break;
+      }
       if (!res.ok) {
         const detail = (await res.text().catch(() => "")).slice(0, 200);
+        if (daemonId !== generation || stateGateGeneration !== generation) break;
         throw new Error(detail || `HTTP ${res.status}`);
       }
       deliveredState = fingerprint;
@@ -1984,6 +2202,8 @@ async function deliverState(): Promise<void> {
       }
     } while (stateQueued);
   } catch (error) {
+    if (deliveryGeneration !== daemonId || stateGateGeneration !== deliveryGeneration) return;
+    deliveryFailed = true;
     const detail = error instanceof Error ? error.message : String(error);
     const message = `workspace state not saved: ${detail}`;
     if (stateSaveError !== message) {
@@ -1993,8 +2213,13 @@ async function deliverState(): Promise<void> {
     }
   } finally {
     stateDelivering = false;
+    if (stateQueued && !deliveryFailed && stateGate === "ready" && stateGateGeneration === daemonId) {
+      stateQueued = false;
+      queueStateSave();
+    }
   }
 }
+
 
 /** Union of two pin lists by transcript path; the fresher snapshot wins, local on ties. */
 function mergePins(local: SessionSummaryLike[], remote: SessionSummaryLike[]): SessionSummaryLike[] {
@@ -2014,16 +2239,26 @@ function mergePins(local: SessionSummaryLike[], remote: SessionSummaryLike[]): S
  * document can never overwrite the durable copy.
  */
 async function reconcileWorkspaceState(): Promise<void> {
+  const generation = daemonId;
+  if (!generation) {
+    stateGate = "blocked";
+    stateGateGeneration = null;
+    stateGateReason = "daemon generation is unavailable";
+    return;
+  }
   const payload = parseStateResponse(await getJson("/api/state"));
+  if (daemonId !== generation) return;
   if (payload === null) {
     // Unreadable copy: publishing stays closed so fallback state cannot replace it.
     stateGate = "blocked";
+    stateGateGeneration = null;
     stateGateReason = "the daemon's saved workspace could not be read";
     return;
   }
   if (payload.kind === "unsupported") {
     // A newer document must not be overwritten by this build either.
     stateGate = "blocked";
+    stateGateGeneration = null;
     stateGateReason = `the state file is version ${String(payload.version)} — update the app to read it`;
     setStatus(`workspace state file is version ${String(payload.version)} — update the app to read it`, "warn");
     return;
@@ -2061,6 +2296,8 @@ async function reconcileWorkspaceState(): Promise<void> {
   }
   // Compatible read and every adopted field in memory: the next publish carries
   // the whole workspace, never a partial one.
+  restoredLocal = true;
+  stateGateGeneration = generation;
   stateGate = "ready";
   queueStateSave();
 }
@@ -2231,17 +2468,15 @@ void fontsReady.then(() => {
 
 // Shared font size is persisted; its Ctrl/Cmd defaults are editable in Settings.
 function setCellSize(size: number): void {
-  cellSize = Math.min(CELL_MAX, Math.max(CELL_MIN, size));
+  const next = Math.min(CELL_MAX, Math.max(CELL_MIN, size));
+  if (next === cellSize) return;
+  cellSize = next;
   try {
     localStorage.setItem(CELL_KEY, String(cellSize));
   } catch {
     console.warn("omp-desktop: font size cannot be cached in browser storage");
   }
-  for (const id of leaves()) {
-    const pane = panes.get(id);
-    pane?.fitPane();
-    pane?.sendResize(true);
-  }
+  for (const id of leaves()) panes.get(id)?.fitPane();
   queueStateSave();
 }
 
@@ -2277,17 +2512,46 @@ load();
 renderLayout();
 renderSpaceTabs();
 renderSidebar();
-void checkBuild();
-window.setInterval(() => void checkBuild(), 10_000);
+let pollingReady = false;
+let pollTimers: number[] = [];
+
+function stopPolling(): void {
+  for (const timer of pollTimers) window.clearInterval(timer);
+  pollTimers = [];
+}
+
+function startPolling(): void {
+  stopPolling();
+  if (!pollingReady || document.hidden) return;
+  pollTimers = [
+    window.setInterval(() => void refreshRuntimes(), 2500),
+    window.setInterval(() => void refreshSessions(), 30_000),
+    window.setInterval(() => void checkBuild(), 10_000),
+  ];
+}
+
+if (!document.hidden) void checkBuild();
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) void checkBuild();
+  if (document.hidden) {
+    stopPolling();
+    return;
+  }
+  void checkBuild();
+  if (pollingReady) {
+    void refreshRuntimes();
+    void refreshSessions();
+    startPolling();
+  }
 });
 
 async function boot(): Promise<void> {
-  // Adoption may rebuild the panes from the daemon's document, so restoration
-  // waits for it instead of racing the first refresh.
-  const reachable = await refreshRuntimes({ restore: false });
-  await refreshSessions();
+  // Runtime and session-index reads do not depend on each other. Apply the
+  // daemon workspace only after both are adopted so restore decisions use the
+  // complete boot snapshot and the current daemon generation.
+  const [reachable] = await Promise.all([
+    refreshRuntimes({ restore: false }),
+    refreshSessions(),
+  ]);
   if (reachable) {
     await reconcileWorkspaceState();
     const bound = [...panes.values()].some((pane) => pane.binding.runtimeId);
@@ -2323,7 +2587,7 @@ async function boot(): Promise<void> {
   }
   const pane = focusedPane();
   pane?.focus();
-  window.setInterval(() => void refreshRuntimes(), 2500);
-  window.setInterval(() => void refreshSessions(), 30_000);
+  pollingReady = true;
+  startPolling();
 }
 void boot();

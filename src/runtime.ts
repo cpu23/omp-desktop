@@ -1,8 +1,9 @@
 import { spawn, type IPty } from "bun-pty";
 import { readFileSync, readdirSync } from "node:fs";
 import { basename } from "node:path";
-import type { RuntimeInfo } from "./protocol";
+import type { RuntimeInfo, RuntimeScreenSnapshot } from "./protocol";
 import { sniffSessionFile } from "./sniff";
+import { RuntimeResourceBudget, type RuntimeResourceLease } from "./resource-budget";
 import { TerminalReplay } from "./terminal-replay";
 
 export type RuntimeSpec = {
@@ -39,11 +40,14 @@ export class Runtime {
   #pty: IPty | null = null;
   #exit: RuntimeExit | null = null;
   #replay: TerminalReplay;
-  #dataSubs = new Set<(data: string) => void>();
+  #resources: RuntimeResourceLease;
+  #dataSubs = new Set<(data: Uint8Array) => void>();
+  #pendingDataSubscribers = 0;
   #exitSubs = new Set<(exit: RuntimeExit) => void>();
   #fileSubs = new Set<(sessionFile: string) => void>();
   #terminationTimer: Timer | null = null;
   #terminating = false;
+  #disposed = false;
   #processGroupIdentity: ProcessGroupIdentity | null = null;
   #terminationPromise: Promise<void> | null = null;
   #resolveTermination: (() => void) | null = null;
@@ -52,10 +56,11 @@ export class Runtime {
   /** Tail of the last chunk: an OSC sequence can split across PTY reads. */
   #sniffCarry = "";
 
-  constructor(spec: RuntimeSpec) {
+  constructor(spec: RuntimeSpec, resources?: RuntimeResourceLease) {
     this.id = spec.id;
     this.spec = spec;
-    this.#replay = new TerminalReplay(spec.cols, spec.rows);
+    this.#resources = resources ?? new RuntimeResourceBudget().createLease(spec.cols, spec.rows);
+    this.#replay = new TerminalReplay(spec.cols, spec.rows, this.#resources);
   }
 
   get alive(): boolean {
@@ -108,7 +113,7 @@ export class Runtime {
 
   /** Idempotent: a second call while alive is a no-op. */
   start(): void {
-    if (this.#pty || this.#terminating) return;
+    if (this.#pty || this.#terminating || this.#disposed) return;
     const pty = spawn(this.spec.file, this.spec.args, {
       name: "xterm-256color",
       cols: this.spec.cols,
@@ -121,11 +126,11 @@ export class Runtime {
     this.#exit = null;
     this.startedAt = new Date();
     this.bytesOut = 0;
-    this.#replay.dispose();
-    this.#replay = new TerminalReplay(this.spec.cols, this.spec.rows);
     pty.onData((data) => {
-      const bytes = Buffer.byteLength(data);
-      this.bytesOut += bytes;
+      let liveBytes = this.#dataSubs.size + this.#pendingDataSubscribers > 0
+        ? Buffer.from(data, "utf8")
+        : undefined;
+      this.bytesOut += liveBytes?.byteLength ?? Buffer.byteLength(data);
       this.lastActivityAt = Date.now();
       const sniffed = sniffSessionFile(this.#sniffCarry, data);
       this.#sniffCarry = sniffed.carry;
@@ -134,7 +139,10 @@ export class Runtime {
         for (const sub of this.#fileSubs) sub(this.sessionFile);
       }
       this.#replay.append(data, () => {
-        for (const sub of this.#dataSubs) sub(data);
+        const bytes = liveBytes;
+        liveBytes = undefined;
+        if (!bytes) return;
+        for (const sub of this.#dataSubs) sub(bytes);
       });
     });
     pty.onExit((event) => {
@@ -146,7 +154,11 @@ export class Runtime {
           this.#terminationExitObserved = true;
           this.#finishTermination();
         }
-        for (const sub of this.#exitSubs) sub(exit);
+        try {
+          for (const sub of this.#exitSubs) sub(exit);
+        } finally {
+          this.dispose();
+        }
       });
     });
   }
@@ -155,18 +167,32 @@ export class Runtime {
    * between the captured screen and the live subscription. */
   subscribeOutput(
     replay: (data: string, info: RuntimeInfo) => void,
-    data: (data: string) => void,
+    data: (data: Uint8Array) => void,
   ): () => void {
+    if (this.#disposed) return () => {};
     let cancelled = false;
+    let waitingForSnapshot = true;
+    this.#pendingDataSubscribers += 1;
     this.#replay.snapshot((snapshot) => {
-      if (cancelled) return;
+      if (!waitingForSnapshot) return;
+      waitingForSnapshot = false;
+      this.#pendingDataSubscribers -= 1;
+      if (cancelled || this.#disposed) return;
       replay(snapshot.data, { ...this.info(), cols: snapshot.cols, rows: snapshot.rows });
-      if (!cancelled) this.#dataSubs.add(data);
+      if (!cancelled && !this.#disposed) this.#dataSubs.add(data);
     });
     return () => {
       cancelled = true;
+      if (waitingForSnapshot) {
+        waitingForSnapshot = false;
+        if (!this.#disposed) this.#pendingDataSubscribers -= 1;
+      }
       this.#dataSubs.delete(data);
     };
+  }
+
+  screenSnapshot(): Promise<RuntimeScreenSnapshot> {
+    return this.#replay.screenSnapshot();
   }
 
   subscribeExit(sub: (exit: RuntimeExit) => void): () => void {
@@ -186,13 +212,32 @@ export class Runtime {
 
   /** Remember the size even when not running, so the next spawn uses it. */
   resize(cols: number, rows: number): void {
+    if (this.#disposed) return;
+    const pty = this.#pty;
+    if ((!pty && cols === this.spec.cols && rows === this.spec.rows) ||
+        (pty && cols === pty.cols && rows === pty.rows)) {
+      return;
+    }
+    if (!this.#resources.setGeometry(cols, rows)) return;
     this.#replay.resize(cols, rows);
-    if (!this.#pty) {
+    if (!pty) {
       this.spec.cols = cols;
       this.spec.rows = rows;
       return;
     }
-    this.#pty.resize(cols, rows);
+    pty.resize(cols, rows);
+  }
+
+  /** Release replay, image, snapshot, and subscriber ownership exactly once. */
+  dispose(): void {
+    if (this.#disposed) return;
+    this.#disposed = true;
+    this.#replay.dispose();
+    this.#resources.release();
+    this.#pendingDataSubscribers = 0;
+    this.#dataSubs.clear();
+    this.#exitSubs.clear();
+    this.#fileSubs.clear();
   }
   /**
    * Stop the PTY's dedicated process group. Keep the PTY reader open so its
@@ -212,9 +257,8 @@ export class Runtime {
     this.#terminating = true;
     const pid = pty.pid;
     this.#terminationEscalationComplete = signal === "SIGKILL";
-    const termination = new Promise<void>((resolve) => {
-      this.#resolveTermination = resolve;
-    });
+    const { promise: termination, resolve } = Promise.withResolvers<void>();
+    this.#resolveTermination = resolve;
     this.#terminationPromise = termination;
 
     // bun-pty starts the command in its own session, making its PID the

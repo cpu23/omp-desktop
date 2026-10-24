@@ -21,8 +21,8 @@ import { parsePresentation, type RuntimePresentation } from "./protocol";
 /** Same runtime-id shape the extension accepts for `OMP_MOBILE_SLOT` (also blocks path traversal). */
 const RUNTIME_ID = /^rt-[A-Za-z0-9-]{1,64}$/;
 const DEFAULT_TIMEOUT_MS = 600;
-/** The client polls `/api/runtimes` every 2.5s; these keep one poll from doubling the work. */
-const DEFAULT_OK_TTL_MS = 500;
+/** Share nearby window polls without extending the client's 2.5s refresh cadence. */
+const DEFAULT_OK_TTL_MS = 2000;
 const DEFAULT_FAIL_TTL_MS = 1500;
 const MAX_STATUS_BYTES = 16 * 1024;
 

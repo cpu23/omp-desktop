@@ -51,6 +51,9 @@ export type RuntimeInfo = {
    */
   presentation?: RuntimePresentation | null;
 };
+export type RuntimeScreenSnapshot = { cols: number; rows: number; screen: string };
+
+export const MAX_RUNTIME_INPUT_CODE_UNITS = 16_384;
 
 export type ClientMessage =
   | { type: "input"; data: string }
@@ -210,7 +213,7 @@ export function parseClientMessage(raw: string): ClientMessage | null {
     return null;
   }
   if (!isRecord(value)) return null;
-  if (value.type === "input" && typeof value.data === "string") {
+  if (value.type === "input" && typeof value.data === "string" && value.data.length <= MAX_RUNTIME_INPUT_CODE_UNITS) {
     return { type: "input", data: value.data };
   }
   if (value.type === "resize" && typeof value.cols === "number" && typeof value.rows === "number") {

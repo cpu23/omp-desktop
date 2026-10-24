@@ -6,6 +6,8 @@
  */
 import { describe, expect, test } from "bun:test";
 import {
+  MAX_RUNTIME_INPUT_CODE_UNITS,
+  parseClientMessage,
   parseRuntimeInfo,
   parseRuntimeOne,
   parseRuntimesResponse,
@@ -115,6 +117,22 @@ describe("runtime presentation parsing", () => {
       expect(hello.runtime.presentation).toBeUndefined();
       expect(hello.replayBytes).toBe(4);
     }
+  });
+});
+
+describe("runtime input bounds", () => {
+  test("accepts chunks up to the UTF-16 code-unit limit and rejects larger messages", () => {
+    const accepted = "x".repeat(MAX_RUNTIME_INPUT_CODE_UNITS);
+    const rejected = `${accepted}x`;
+    expect(parseClientMessage(JSON.stringify({ type: "input", data: accepted }))).toEqual({
+      type: "input",
+      data: accepted,
+    });
+    expect(parseClientMessage(JSON.stringify({ type: "input", data: rejected }))).toBeNull();
+
+    const paired = "😀".repeat(MAX_RUNTIME_INPUT_CODE_UNITS / 2);
+    expect(parseClientMessage(JSON.stringify({ type: "input", data: paired }))?.type).toBe("input");
+    expect(parseClientMessage(JSON.stringify({ type: "input", data: `${paired}😀` }))).toBeNull();
   });
 });
 describe("workspace state version parsing", () => {

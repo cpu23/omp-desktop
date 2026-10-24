@@ -33,6 +33,15 @@ menu; the daemon above must remain running.
 - Closing a pane only detaches its view. Output continues in the daemon; use the sidebar stop action to end a
   session. See the [guide](docs/guide.md) for configuration, security and native setup details.
 
+## Unreleased
+
+- Ship minified, gzip-compressed, fingerprinted assets without inline source maps; replace browser TTF delivery with WOFF2.
+- Drive working indicators with transform animations instead of per-frame JavaScript or changing glyph layout.
+- Release exited-runtime capacity and terminal resources; finish explicit stop cleanup before reporting success.
+- Bound shared replay/image/snapshot retention and pasted-image storage; preserve ordered replay/live output through WebSocket backpressure.
+- Incrementally index appended session costs, coalesce status reads and workspace writes, and pause hidden-client polling.
+- Preserve sidebar nodes and offline workspace edits across daemon restarts; generation-fence workspace writes and expose lightweight Mobile viewport/input endpoints.
+
 ## Releases and links
 
 Source releases only—no prebuilt installers: [v0.1.3](https://github.com/cpu23/omp-desktop/releases/tag/v0.1.3)

@@ -2,14 +2,17 @@ import { SerializeAddon } from "@xterm/addon-serialize";
 import { UnicodeGraphemesAddon } from "@xterm/addon-unicode-graphemes";
 import { Terminal } from "@xterm/headless";
 import { ReplayImages } from "./replay-images";
+import type { RuntimeResourceLease } from "./resource-budget";
+import type { RuntimeScreenSnapshot } from "./protocol";
 
-const SCROLLBACK_ROWS = 20_000;
+const DEFAULT_SCROLLBACK_ROWS = 20_000;
 
 type Snapshot = { data: string; cols: number; rows: number };
 type ReplayTask =
   | { type: "write"; data: string; onParsed: () => void }
   | { type: "resize"; cols: number; rows: number }
-  | { type: "snapshot"; callback: (snapshot: Snapshot) => void };
+  | { type: "snapshot"; callback: (snapshot: Snapshot) => void }
+  | { type: "screen"; callback: (snapshot: RuntimeScreenSnapshot) => void };
 
 type TerminalAttributes = {
   isBold(): number;
@@ -70,22 +73,30 @@ export class TerminalReplay {
   readonly #terminal: Terminal;
   readonly #serializer: SerializeAddon;
   readonly #images: ReplayImages;
+  readonly #resources?: RuntimeResourceLease;
   // Reuse expensive scrollback serialization until parsed output or geometry changes.
   #snapshotCache: Snapshot | undefined;
-  #tasks: ReplayTask[] = [];
+  #snapshotCacheBytes = 0;
+  #tasks: (ReplayTask | undefined)[] = [];
   #taskIndex = 0;
   #running = false;
   #disposed = false;
+  #screenRejectors = new Set<(error: Error) => void>();
 
-  constructor(cols: number, rows: number) {
+  constructor(cols: number, rows: number, resources?: RuntimeResourceLease) {
+    this.#resources = resources;
     this.#terminal = new Terminal({
       allowProposedApi: true,
       cursorBlink: true,
       cols,
       rows,
-      scrollback: SCROLLBACK_ROWS,
+      scrollback: resources?.scrollbackRows ?? DEFAULT_SCROLLBACK_ROWS,
     });
-    this.#images = new ReplayImages(this.#terminal);
+    this.#images = new ReplayImages(this.#terminal, resources);
+    resources?.setScrollbackHandler((scrollback) => {
+      this.#invalidateSnapshot();
+      this.#terminal.options.scrollback = scrollback;
+    });
 
     const unicode = new UnicodeGraphemesAddon();
     this.#terminal.loadAddon(unicode as unknown as Parameters<Terminal["loadAddon"]>[0]);
@@ -114,14 +125,36 @@ export class TerminalReplay {
     this.#enqueue({ type: "snapshot", callback });
   }
 
+  /** Fence parsed output and project only the active buffer's visible rows. */
+  screenSnapshot(): Promise<RuntimeScreenSnapshot> {
+    if (this.#disposed) return Promise.reject(new Error("terminal replay disposed"));
+    const { promise, resolve, reject } = Promise.withResolvers<RuntimeScreenSnapshot>();
+    const rejectOnce = (error: Error): void => {
+      this.#screenRejectors.delete(rejectOnce);
+      reject(error);
+    };
+    this.#screenRejectors.add(rejectOnce);
+    this.#enqueue({
+      type: "screen",
+      callback: (snapshot) => {
+        this.#screenRejectors.delete(rejectOnce);
+        resolve(snapshot);
+      },
+    });
+    return promise;
+  }
+
   dispose(): void {
     if (this.#disposed) return;
     this.#disposed = true;
     this.#tasks = [];
     this.#taskIndex = 0;
     this.#running = false;
-    this.#snapshotCache = undefined;
+    for (const reject of this.#screenRejectors) reject(new Error("terminal replay disposed"));
+    this.#screenRejectors.clear();
+    this.#invalidateSnapshot();
     this.#images.dispose();
+    this.#resources?.setScrollbackHandler(undefined);
     this.#terminal.dispose();
   }
 
@@ -135,16 +168,23 @@ export class TerminalReplay {
 
 
     while (true) {
-      const task = this.#tasks[this.#taskIndex++];
+      const task = this.#tasks[this.#taskIndex];
       if (!task) {
         this.#tasks = [];
         this.#taskIndex = 0;
         return;
       }
+      this.#tasks[this.#taskIndex] = undefined;
+      this.#taskIndex += 1;
+      if (this.#taskIndex >= 512 && this.#taskIndex * 2 >= this.#tasks.length) {
+        this.#tasks = this.#tasks.slice(this.#taskIndex);
+        this.#taskIndex = 0;
+      }
 
       if (task.type === "resize") {
         if (task.cols !== this.#terminal.cols || task.rows !== this.#terminal.rows) {
-          this.#snapshotCache = undefined;
+          if (this.#resources && !this.#resources.setGeometry(task.cols, task.rows)) continue;
+          this.#invalidateSnapshot();
           this.#terminal.resize(task.cols, task.rows);
         }
         continue;
@@ -153,8 +193,12 @@ export class TerminalReplay {
         this.#writeSnapshotFence(task);
         return;
       }
+      if (task.type === "screen") {
+        this.#writeScreenFence(task);
+        return;
+      }
 
-      this.#snapshotCache = undefined;
+      this.#invalidateSnapshot();
       const data = this.#images.prepare(task.data);
       this.#running = true;
       this.#terminal.write(data, () => {
@@ -181,9 +225,35 @@ export class TerminalReplay {
       }
     });
   }
+
+  #writeScreenFence(task: Extract<ReplayTask, { type: "screen" }>): void {
+    this.#running = true;
+    this.#terminal.write("", () => {
+      if (this.#disposed) return;
+      try {
+        const terminal = this.#terminal;
+        const buffer = terminal.buffer.active;
+        const lines = new Array<string>(terminal.rows);
+        for (let row = 0; row < terminal.rows; row += 1) {
+          lines[row] = buffer.getLine(buffer.viewportY + row)?.translateToString(false) ?? "";
+        }
+        task.callback({ cols: terminal.cols, rows: terminal.rows, screen: lines.join("\n") });
+      } finally {
+        this.#finishTask();
+      }
+    });
+  }
+
   #finishTask(): void {
     this.#running = false;
     this.#drain();
+  }
+
+  #invalidateSnapshot(): void {
+    if (!this.#snapshotCache) return;
+    this.#resources?.releaseSnapshot(this.#snapshotCacheBytes);
+    this.#snapshotCache = undefined;
+    this.#snapshotCacheBytes = 0;
   }
 
   #takeSnapshot(): Snapshot {
@@ -191,7 +261,7 @@ export class TerminalReplay {
 
     const terminal = this.#terminal;
     const internal = (terminal as unknown as TerminalInternals)._core;
-    const serialized = this.#serializer.serialize({ scrollback: SCROLLBACK_ROWS });
+    const serialized = this.#serializer.serialize({ scrollback: this.#resources?.scrollbackRows ?? DEFAULT_SCROLLBACK_ROWS });
     const data =
       "\x1bc" +
       this.#tabStopsSequence(internal?.buffers?.normal?.tabs, false) +
@@ -206,9 +276,14 @@ export class TerminalReplay {
       this.#cursorVisibilitySequence() +
       this.#images.pendingSequence();
     const snapshot = { data, cols: terminal.cols, rows: terminal.rows };
-    this.#snapshotCache = snapshot;
+    const bytes = Buffer.byteLength(data);
+    if (!this.#resources || this.#resources.reserveSnapshot(bytes)) {
+      this.#snapshotCache = snapshot;
+      this.#snapshotCacheBytes = this.#resources ? bytes : 0;
+    }
     return { ...snapshot };
   }
+
 
   /** Restore DECSTBM before origin-mode cursor positioning. */
   #scrollRegionSequence(): string {

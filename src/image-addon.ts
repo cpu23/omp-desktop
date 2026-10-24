@@ -1,5 +1,6 @@
 import { ImageAddon } from "@xterm/addon-image";
 import type { IMarker, Terminal } from "@xterm/xterm";
+import { IMAGE_FILE_LIMIT } from "./image-limits";
 
 type ImageHandler = {
   start(): void;
@@ -13,7 +14,7 @@ type ImageHandler = {
  * existing limit, then supply the missing size before invoking its decoder.
  * Explicitly sized images retain the original streaming path. */
 export function loadImageAddon(term: Terminal): ImageAddon {
-  const addon = new ImageAddon();
+  const addon = new ImageAddon({ iipSizeLimit: IMAGE_FILE_LIMIT });
   term.loadAddon(addon);
   retainPartiallyDeletedImages(term, addon);
   const internals = addon as unknown as {
@@ -29,10 +30,11 @@ export function loadImageAddon(term: Terminal): ImageAddon {
   let mode: "header" | "buffer" | "pass" | "abort" = "header";
   let header: number[] = [];
   let headerText = "";
-  let chunks: Uint8Array[] = [];
+  let chunks: Array<Uint8Array | undefined> = [];
   let length = 0;
   let previous = 0;
   let last = 0;
+  let decodePoints: Uint32Array | undefined;
 
   function clear(): void {
     mode = "header";
@@ -113,9 +115,15 @@ export function loadImageAddon(term: Terminal): ImageAddon {
         if (!Number.isInteger(size) || size <= 0 || size > internals._opts.iipSizeLimit) return end(false);
         const normalized = Uint32Array.from(`${headerText};size=${size}:`, (char) => char.charCodeAt(0));
         put(normalized, 0, normalized.length);
-        for (const chunk of chunks) {
-          const points = Uint32Array.from(chunk);
-          put(points, 0, points.length);
+        decodePoints ??= new Uint32Array(16 * 1024);
+        for (let index = 0; index < chunks.length; index++) {
+          const chunk = chunks[index]!;
+          for (let offset = 0; offset < chunk.length; offset += decodePoints.length) {
+            const count = Math.min(decodePoints.length, chunk.length - offset);
+            for (let i = 0; i < count; i++) decodePoints[i] = chunk[offset + i];
+            put(decodePoints, 0, count);
+          }
+          chunks[index] = undefined;
         }
       }
       return end(success);

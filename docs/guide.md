@@ -76,8 +76,9 @@ session attaches it to the focused pane.
 Closing a pane or space only detaches its view. The daemon keeps a terminal-state mirror and restores its screen,
 scrolling margins (DECSTBM) and cursor visibility when a pane reconnects, along with up to 20,000 history rows and
 retained inline images. Replay follows the producer's resize history instead of parsing a truncated raw-output tail
-at the latest size. Encoded image sidecars are capped at 128 MiB per runtime; the oldest images may be evicted
-while their reserved rows remain.
+at the latest size. Encoded image sidecars are capped at 128 MiB per runtime and 512 MiB across the daemon; the oldest
+images may be evicted while their reserved rows remain. Scrollback grants share an aggregate cell budget, accounting
+for actual columns and both visible terminal buffers, and are rebalanced on creation, resize and release.
 The client separately caps decoded image pixels at 128 MB per pane. Cache eviction can leave a checkerboard
 placeholder. Partial image-row deletion preserves surviving tiles through scrolling redraws; images are released
 when their remaining rows leave history or the cache limit requires eviction.
@@ -88,6 +89,8 @@ existing session reuses its process. On first upgrading from a daemon that preda
 live pool with `bun run scripts/checkpoint-sessions.ts` before restarting. The command does not stop processes;
 finish their current work before the restart.
 Stopping a session allows 500 ms for graceful termination before forcing a still-owned child to exit.
+A successful stop response waits for process cleanup and resource release, so its slot can be reused immediately.
+Natural exits also release capacity, after final output has passed the parser/subscriber boundary.
 On Linux, initial process-group signals require a verified original PTY leader identity; if it cannot be verified,
 only the PTY child is targeted. If the leader exits during graceful termination, escalation checks for remaining
 members of its original process group and session before signaling them. A reused leader PID is rejected;
@@ -101,6 +104,10 @@ Browser and native profiles do not share local settings, but the daemon workspac
 pins and settings if webview storage is lost. The live-process limit is shared across spaces (default 16).
 The client bundle and stylesheet are built at daemon startup; restart the daemon to apply changes, which also
 ends its PTY children. Recorded sessions resume on its next start.
+Production assets are minified, gzip-compressed and cache-validated; fingerprinted URLs are immutable, while HTML
+and canonical URLs revalidate. Fonts use WOFF2, and production JavaScript does not include inline source maps.
+Unchanged sidebar nodes are retained, periodic polling pauses while hidden, and workspace writes are coalesced.
+Local edits made while the daemon is unavailable survive reconciliation with its older workspace document.
 When scrolled at least one screen above the latest output, a double-down-chevron button appears in the pane.
 Click **Jump to latest** to return to the bottom and focus the terminal.
 
@@ -113,8 +120,10 @@ The terminal uses Unicode 15 grapheme widths so emoji and joined emoji occupy th
 Terminal panes use WebGL on hardware and unknown renderers. Recognized software rasterizers (including
 SwiftShader and llvmpipe) use the existing DOM renderer instead; its **DOM** indicator warns that box/block
 glyphs may have seams. Masked or unavailable renderer information does not disable WebGL.
-Unchanged terminal snapshots are reused for subsequent attaches; new output or changed geometry invalidates
-the cache. This retains at most one serialized snapshot per runtime without reducing scrollback or image state.
+Unchanged terminal snapshots are reused for subsequent attaches until output or geometry changes. Cached snapshots
+have per-runtime and aggregate byte budgets; a snapshot too large to cache still replays completely, uncached.
+Slow WebSocket readers receive ordered replay, live bytes and exit metadata. A reader that exceeds the bounded
+pending-live queue is disconnected for resynchronization rather than silently losing bytes.
 
 ### Clipboard and file drops
 
@@ -155,13 +164,17 @@ terminal output. Notifications default to off, require OS/browser permission, an
 the app. Browsers deliver web notifications while the page is open; the native shell uses OS notifications.
 Working sessions show a spinner immediately before the shimmering session title, with no separate “Working…” label.
 The Motion setting still controls animation; long titles truncate without squeezing the subtitle.
-The shimmer follows OMP's 30 Hz animation cadence and the spinner's 80 ms phase, with fixed bold monospace
-geometry. Hidden documents, collapsed rows and the settings view suspend animation; Motion **Off** freezes
-the shimmer. Cached glyph references avoid querying or measuring the DOM on every animation tick.
+The spinner and title shimmer use transform animations, a fixed glyph strip and a counter-translated gradient mask:
+no per-frame JavaScript, glyph replacement or geometry reads. Hidden documents, collapsed rows and the settings view
+suspend animation; Motion **Off** retains the existing settled appearance.
 
 Saved-session header, activity and cost caches each have an approximate 8 MiB budget. Listings still scan
 file metadata to detect new, changed, replaced and deleted transcripts; unchanged cached files do not need
 their contents reread. Activity ordering and search cover the complete store, not just the visible rows.
+Cost accounting reads newly appended journal bytes instead of rescanning an unchanged prefix. Truncation and atomic
+file replacement invalidate the accumulated total; this assumes OMP's append-only journal/atomic-rewrite contract.
+Externally rewriting interior bytes while also growing a file is not guaranteed to invalidate an incremental total.
+Concurrent listings share indexing work, and responses are capped at 200 rows without narrowing search coverage.
 
 Set a custom **Session limit** in Settings. The limit is shared by all windows and spaces and is saved by the
 daemon, not just the browser profile. A saved change that differs from the running limit shows **Restart now**;
@@ -196,6 +209,12 @@ All variables are optional. Defaults below assume a single-user machine.
 | `OMP_DESKTOP_HOST` | `127.0.0.1` | Daemon listen address; keep it on loopback because the API has no authentication. |
 | `OMP_DESKTOP_PORT` | `4180` | Daemon and native-shell port. |
 | `OMP_DESKTOP_MAX_RUNTIMES` | `16` | Initial process limit across all spaces; a custom limit saved in Settings takes precedence. |
+| `OMP_DESKTOP_REPLAY_ROWS_PER_RUNTIME` | `20000` | Per-runtime scrollback ceiling, subject to the shared cell budget. |
+| `OMP_DESKTOP_REPLAY_CELLS_TOTAL` | `33554432` | Aggregate terminal cells, including both visible buffers and granted scrollback. |
+| `OMP_DESKTOP_IMAGE_BYTES_PER_RUNTIME` | `134217728` | Encoded image-sidecar budget per runtime. |
+| `OMP_DESKTOP_IMAGE_BYTES_TOTAL` | `536870912` | Encoded image-sidecar budget across runtimes. |
+| `OMP_DESKTOP_SNAPSHOT_BYTES_PER_RUNTIME` | `8388608` | Cached replay snapshot budget per runtime; larger snapshots are served uncached. |
+| `OMP_DESKTOP_SNAPSHOT_BYTES_TOTAL` | `67108864` | Aggregate cached replay snapshot budget. |
 | `OMP_DESKTOP_SYSTEMD_UNIT` | auto-detected | Unit the daemon delegates its restart to; set explicitly for unusual unit names or non-user services (bypasses the `MainPID` ownership check). |
 | `OMP_DESKTOP_CWD` | `$HOME` | New-session directory and fallback if a resumed transcript's recorded directory is gone. |
 | `OMP_DESKTOP_OMP` | `omp` | OMP executable. |
@@ -203,6 +222,7 @@ All variables are optional. Defaults below assume a single-user machine.
 | `OMP_DESKTOP_OVERLAY` | empty | Optional OMP `--config` overlay; by default the user's OMP configuration is used unchanged. |
 | `OMP_DESKTOP_SESSIONS_DIR` | `$HOME/.omp/agent/sessions` | Session index and resume validation root. |
 | `OMP_DESKTOP_PASTE_DIR` | `$TMPDIR/omp-desktop-pastes` | Stored pasted images. |
+| `OMP_DESKTOP_PASTE_BUDGET_BYTES` | `536870912` | Pasted-image directory quota, at least 32 MiB; also capped at 4096 files. Full storage returns `507` without deleting existing images. |
 | `OMP_DESKTOP_STATE_DIR` | `$XDG_STATE_HOME/omp-desktop` or `~/.local/state/omp-desktop` | Directory for durable workspace state and session ledger. |
 | `OMP_DESKTOP_STATE_FILE` | `<state dir>/state.json` | Explicit workspace-state path; overrides the directory for this file. |
 | `OMP_DESKTOP_LEDGER_FILE` | `<state dir>/sessions.json` | Explicit durable live-session ledger path. |
@@ -216,10 +236,33 @@ All variables are optional. Defaults below assume a single-user machine.
 
 The sessions directory is read-only for Desktop's indexing and resume checks; OMP writes transcripts. Workspace
 state and the live-session ledger are separate files.
+These budgets limit retained terminal/cache data, not total daemon RSS or the memory of OMP child processes.
+Individual pasted and inline images permit up to 32 MiB of encoded image data; the client separately limits decoded
+pixels. Existing pasted files count toward the directory quota and are never automatically deleted.
 
 The default token-file path is retained for existing installations. Extension sockets use an owner-only directory
 and socket; when a token is configured, both Desktop and Mobile must use the same one. Set `OMP_MOBILE_IPC_TOKEN`,
 `OMP_MOBILE_TOKEN`, or `OMP_MOBILE_TOKEN_FILE` to configure it.
+
+## Local API and verification
+
+The API remains loopback-only and unauthenticated; do not expose it directly to a network.
+
+| Route | Contract |
+| --- | --- |
+| `GET /api/runtimes` | Runtime list and the current daemon `generation`; naturally exited runtimes leave the pool. |
+| `GET /api/runtimes/:id/screen` | Parser-fenced `{cols, rows, screen}` for the visible plain-text screen; no history serialization or resize. |
+| `POST /api/runtimes/:id/input` | `{data: string}`, at most 16,384 UTF-16 code units and a 128 KiB request body. |
+| `DELETE /api/runtimes/:id` | Stop and release the runtime before returning success. |
+| `PUT /api/state` | Workspace document; requires `X-OMP-Generation` from the current runtime-list response. Missing or stale generations return `409`. |
+
+Polling JSON routes support conditional ETags and gzip. Input producers must split larger text at Unicode-safe
+boundaries; the browser client does so before sending. WebSocket application queues are bounded to 4 MiB of pending
+live data and 4096 frames, with lazy replay encoding and native backpressure/drain handling.
+
+Run `OMP_MOBILE_CHECKOUT=/path/to/omp-mobile bun run release:check` from the Desktop checkout for paired verification.
+It checks the invoking worktree and the chosen companion in a disposable home, including frozen installs, typechecks,
+tests and real OMP extension/process smoke checks. It does not verify the native shell, provider login or real push delivery.
 
 ## Security and limitations
 
