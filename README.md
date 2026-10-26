@@ -28,6 +28,7 @@ menu; the daemon above must remain running.
 ## Spaces and files
 
 - Click **+** to add a space. Drag a pane or sidebar session onto another space's tab to move/open it there.
+- Drag a space tab left or right to reorder workspaces. The active space stays selected, and the order is saved across restarts.
 - Drop files onto a pane to insert their paths without submitting. Native drops preserve original paths for all
   file types; file contents are not uploaded.
 - Closing a pane only detaches its view. Output continues in the daemon; use the sidebar stop action to end a
@@ -36,6 +37,7 @@ menu; the daemon above must remain running.
 ## Unreleased
 
 - Use compact, borderless sidebar rows grouped exclusively into Loaded (with count), Pinned, then Recent by last activity; reveal pin/stop controls on hover or keyboard focus. Start sessions with **+** beside search; remove sidebar collapse and the live-count footer.
+- Reorder workspace tabs by dragging, with insertion indicators and persisted ordering.
 - Ship minified, gzip-compressed, fingerprinted assets without inline source maps; replace browser TTF delivery with WOFF2.
 - Drive working indicators with transform animations instead of per-frame JavaScript or changing glyph layout.
 - Release exited-runtime capacity and terminal resources; finish explicit stop cleanup before reporting success.
