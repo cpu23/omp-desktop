@@ -1303,6 +1303,77 @@ function replacePaneId(node: LayoutNode, from: string, to: string): LayoutNode {
   };
 }
 
+/** Keep tab reordering in-page, like session dragging, for WebKitGTK. */
+function wireSpaceReorder(): void {
+  let origin: { id: string; x: number; pointer: number; tab: HTMLElement } | null = null;
+  let moved = false;
+  let destination: { group: HTMLElement; id: string; after: boolean } | null = null;
+  let suppressClick = false;
+  const clearDestination = (): void => {
+    destination?.group.classList.remove("space-insert-before", "space-insert-after");
+    destination = null;
+  };
+  spaceTabsEl.addEventListener("pointerdown", (event) => {
+    const tab = (event.target as Element).closest<HTMLElement>(".space-tab");
+    if (!tab?.dataset.space || origin || dragging || !event.isPrimary || event.button !== 0) return;
+    origin = { id: tab.dataset.space, x: event.clientX, pointer: event.pointerId, tab };
+    moved = false;
+    suppressClick = false;
+    tab.setPointerCapture(event.pointerId);
+  });
+  spaceTabsEl.addEventListener("pointermove", (event) => {
+    if (!origin || event.pointerId !== origin.pointer) return;
+    if (!moved && Math.abs(event.clientX - origin.x) < 8) return;
+    moved = true;
+    dragging = true;
+    origin.tab.classList.add("space-reorder-source");
+    event.preventDefault();
+    window.getSelection()?.removeAllRanges();
+    clearDestination();
+    const group = document.elementFromPoint(event.clientX, event.clientY)
+      ?.closest<HTMLElement>(".space-tab-group");
+    const id = group?.querySelector<HTMLElement>(".space-tab")?.dataset.space;
+    if (!group || !spaceTabsEl.contains(group) || !id || id === origin.id) return;
+    const rect = group.getBoundingClientRect();
+    const after = event.clientX >= rect.left + rect.width / 2;
+    destination = { group, id, after };
+    group.classList.add(after ? "space-insert-after" : "space-insert-before");
+  });
+  const finish = (event: PointerEvent): void => {
+    if (!origin || event.pointerId !== origin.pointer) return;
+    const source = origin;
+    const target = destination;
+    const shouldDrop = moved && event.type === "pointerup" && target;
+    suppressClick = moved;
+    origin = null;
+    source.tab.classList.remove("space-reorder-source");
+    clearDestination();
+    if (source.tab.hasPointerCapture(event.pointerId)) source.tab.releasePointerCapture(event.pointerId);
+    if (shouldDrop && spaces.has(source.id) && spaces.has(target.id)) {
+      const entries = [...spaces].filter(([id]) => id !== source.id);
+      const index = entries.findIndex(([id]) => id === target.id) + Number(target.after);
+      entries.splice(index, 0, [source.id, spaces.get(source.id)!]);
+      spaces.clear();
+      for (const [id, stored] of entries) spaces.set(id, stored);
+      renderSpaceTabs();
+      save();
+    }
+    dragging = false;
+    if (renderPending) renderSidebar();
+  };
+  spaceTabsEl.addEventListener("pointerup", finish);
+  spaceTabsEl.addEventListener("pointercancel", finish);
+  spaceTabsEl.addEventListener("lostpointercapture", finish);
+  spaceTabsEl.addEventListener("click", (event) => {
+    if (!suppressClick) return;
+    suppressClick = false;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  }, true);
+}
+
+wireSpaceReorder();
+
 function renderSpaceTabs(): void {
   spaceTabsEl.replaceChildren();
   let index = 0;
@@ -1317,6 +1388,7 @@ function renderSpaceTabs(): void {
     tab.textContent = `Space ${++index}`;
     tab.setAttribute("aria-selected", String(id === activeSpaceId));
     tab.tabIndex = id === activeSpaceId ? 0 : -1;
+    tab.title = "Drag to reorder spaces";
     tab.addEventListener("click", () => switchSpace(id));
     const close = document.createElement("button");
     close.className = "space-close";
