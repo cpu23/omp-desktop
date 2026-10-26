@@ -164,10 +164,17 @@ fall back to upload; other pathless files are ignored. Paths containing control 
 
 ### Sidebar, settings and shortcuts
 
-The sidebar lists live and saved sessions; it supports search, pins, session/folder views, and opt-in completion
-notifications. Working/completion indicators and per-session accents come from the optional extension, not
-terminal output. Notifications default to off, require OS/browser permission, and are not replayed when reopening
-the app. Browsers deliver web notifications while the page is open; the native shell uses OS notifications.
+The session view groups compact, borderless two-line rows into **Loaded**, **Pinned**, then **Recent**.
+Each session appears only in its highest applicable section: a loaded, pinned session appears under Loaded,
+not Pinned or Recent. The Loaded heading includes its count; Recent is ordered by last conversation activity,
+newest first. Rows show the directory and title, with an unread-completion dot when attention is needed.
+Hover or focus within a row to reveal pin and stop controls. Start a session with **+** beside search.
+The sidebar stays open and remains resizable; settings retain the optional folder view.
+
+The sidebar supports search, pins and opt-in completion notifications. Working/completion indicators and
+per-session accents come from the optional extension, not terminal output. Notifications default to off,
+require OS/browser permission, and are not replayed when reopening the app. Browsers deliver web notifications
+while the page is open; the native shell uses OS notifications.
 Working sessions show a spinner immediately before the shimmering session title, with no separate “Working…” label.
 The Motion setting still controls animation; long titles truncate without squeezing the subtitle.
 The spinner and title shimmer use transform animations, a fixed glyph strip and a counter-translated gradient mask:

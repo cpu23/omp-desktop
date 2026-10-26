@@ -1,9 +1,5 @@
-/* Styling mirrors omp-mobile (omp-mobile/public/styles.css): same OLED palette,
-   same mono chrome, same card/button/input treatments. Deliberate deviations,
-   both about density rather than looks: control heights are scaled for a mouse
-   (mobile sizes exist for fingers) and the sidebar row card drops mobile's
-   hover lift so dense lists do not shimmer. Tokens below are copied verbatim
-   from the mobile stylesheet and should be updated together with it. */
+/* Shared OLED palette and mono chrome with omp-mobile. Desktop session rows
+   are compact and borderless; section spacing provides the visual hierarchy. */
 
 /* Mobile's UI/terminal font, vendored for the same reason as the nerd face
    below: the look must not depend on what the host has installed. */
@@ -244,8 +240,7 @@ select:focus-visible {
   padding: 0 0 8px;
 }
 
-/* Search and its collapse button share a row; the input keeps the block width
-   minus the button. */
+/* Search, new-session and settings controls share one compact row. */
 .side-search {
   display: flex;
   gap: 6px;
@@ -397,12 +392,25 @@ select:focus-visible {
 .side-list {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 0;
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
   padding: 0 0 10px;
+}
+
+.session-section-heading {
+  flex: 0 0 auto;
+  margin: 14px 8px 5px;
+  color: var(--muted);
+  font: 700 10px/18px var(--mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.session-section-heading:first-child {
+  margin-top: 4px;
 }
 
 .side-list::-webkit-scrollbar {
@@ -418,15 +426,16 @@ select:focus-visible {
   background: var(--dim);
 }
 
-/* Status moved here when the app header was removed: the sidebar bottom keeps
-   connection failures visible. Long messages truncate instead of widening the
-   sidebar; warn recolours the line (and, via sidebar.ts, the collapsed-state
-   expand control) so a daemon failure is not silently hidden. */
+/* Keep connection failures visible without a routine live-count footer. */
 .side-status {
   flex: 0 0 auto;
   padding: 8px 2px 0;
   border-top: 1px solid var(--line);
   overflow: hidden;
+}
+
+.side-status:has(.status[data-kind="ok"]) {
+  display: none;
 }
 
 .status {
@@ -726,76 +735,29 @@ body.session-dragging * {
   will-change: transform;
 }
 
-/* Collapsed state: the sidebar and its resizer are hidden and this strip is the
-   only way back in. Full height, so the hit area is the whole edge. */
-.sidebar-expand {
-  flex: 0 0 16px;
-  display: inline-grid;
-  place-items: center;
-  padding: 0;
-  background: var(--panel);
-  color: var(--muted);
-  border: 0;
-  border-right: 1px solid var(--line);
-  cursor: pointer;
-  font: 12px/1 var(--mono);
-  transition:
-    background-color 0.15s ease,
-    color 0.15s ease;
-}
 
-.sidebar-expand:hover {
-  background: var(--panel-raised);
-  color: var(--text);
-}
-
-.sidebar-expand[data-kind="warn"] {
-  color: var(--warn);
-}
-
-.sidebar-expand[hidden] {
-  display: none;
-}
-
-/* Loaded sessions have a grey surface; alive processes also keep their session
-   accent edge. Saved rows are outlined on the sidebar colour. */
 .row {
   position: relative;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  grid-template-areas:
-    "name name"
-    "sub actions";
-  align-items: center;
-  column-gap: 7px;
-  row-gap: 3px;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: "sub" "name";
+  align-content: center;
+  gap: 2px;
+  flex: 0 0 52px;
+  height: 52px;
   width: 100%;
-  text-align: left;
-  padding: 7px 9px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 5px;
   background: transparent;
+  text-align: left;
   cursor: pointer;
   user-select: none;
-  transition: border-color 0.16s ease;
 }
 
-.row.loaded {
-  background: var(--panel-raised);
-}
-
-.row:hover {
-  border-color: var(--dim);
-}
-
-/* After .row:hover on purpose: same specificity, so the live edge keeps the
-   session colour while the other sides dim on hover. padding-left is one less
-   than the base so the 2px edge does not shift the content. The colour is the
-   mobile extension's resolved session accent; a session whose accent cannot be
-   resolved (or has no extension state at all) falls back to mobile's grey. */
-.row.live {
-  border-left: 2px solid var(--row-accent, #808080);
-  padding-left: 8px;
+.row:hover,
+.row:focus-within {
+  background: var(--panel-soft);
 }
 
 .row .name {
@@ -805,9 +767,9 @@ body.session-dragging * {
   justify-content: space-between;
   gap: 7px;
   min-width: 0;
-  min-height: 22px;
+  min-height: 18px;
   overflow: hidden;
-  font: 700 12px var(--mono);
+  font: 400 12px/18px var(--mono);
 }
 
 .row .name .title {
@@ -939,33 +901,38 @@ body.session-dragging * {
 
 .row .sub {
   grid-area: sub;
-  display: flex;
-  align-items: baseline;
-  gap: 6px;
-  min-width: 0;
-  color: var(--dim);
-  font: 10px var(--mono);
-}
-
-.row .sub .cwd {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  color: var(--muted);
+  font: 10px/16px var(--mono);
 }
 
-/* Actions share the metadata line, leaving the full title width available. */
+/* Secondary controls only overlay the directory on hover or keyboard focus. */
 .row-actions {
-  grid-area: actions;
-  display: grid;
-  grid-template-columns: 22px 22px;
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  display: flex;
   align-items: center;
   gap: 3px;
+  background: var(--panel-soft);
+  opacity: 0;
+  pointer-events: none;
 }
 
-.row .sub {
-  overflow: hidden;
+.row:hover .row-actions,
+.row:focus-within .row-actions {
+  opacity: 1;
+  pointer-events: auto;
 }
+
+.row:hover .sub,
+.row:focus-within .sub {
+  padding-right: 52px;
+}
+
 
 .row .pin,
 .row .kill {
@@ -982,8 +949,6 @@ body.session-dragging * {
 }
 
 .row .pin {
-  grid-column: 2;
-  grid-row: 1;
   display: inline-grid;
   place-items: center;
   width: 22px;
@@ -1006,8 +971,6 @@ body.session-dragging * {
 }
 
 .row .kill {
-  grid-column: 1;
-  grid-row: 1;
   width: 22px;
   height: 22px;
   font-size: 12px;
@@ -1021,7 +984,6 @@ body.session-dragging * {
 }
 
 .row .pin[aria-pressed="true"] {
-  opacity: 1;
   color: var(--accent);
 }
 

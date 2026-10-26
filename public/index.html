@@ -10,34 +10,19 @@
   <body>
     <!-- Space tabs sit above the pane workspace. #status remains in the sidebar
          so connection failures stay visible, and #build stays in the DOM (hidden)
-         for the client's bundle-reload check. The resizer and collapsed-state
-         expand control are wired by src/sidebar.ts; motion settings are wired
-         by src/working-indicator.ts; the session limit is wired by
-         src/runtime-limit.ts. -->
+         for the client's bundle-reload check. The resizer is wired by
+         src/sidebar.ts; motion settings are wired by src/working-indicator.ts;
+         the session limit is wired by src/runtime-limit.ts. -->
     <div id="app">
       <aside id="sidebar">
         <div class="side-block side-search">
           <input id="search" type="search" placeholder="search sessions…" autocomplete="off" spellcheck="false" />
+          <button id="new-session" class="sidebar-toggle" type="button" title="Start a new omp session in the focused pane" aria-label="Start a new omp session in the focused pane">+</button>
           <button id="sidebar-settings-open" class="sidebar-toggle" type="button" title="Sidebar settings" aria-label="Sidebar settings" aria-controls="sidebar-settings" aria-expanded="false">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68h.08a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09A1.65 1.65 0 0 0 15 4.6a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.32 9v.08a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09A1.65 1.65 0 0 0 19.4 15Z" />
               <circle cx="12" cy="12" r="3" />
             </svg>
-          </button>
-          <button
-            id="sidebar-collapse"
-            class="sidebar-toggle"
-            type="button"
-            title="Collapse sidebar"
-            aria-expanded="true"
-            aria-controls="sidebar"
-          >
-            «
-          </button>
-        </div>
-        <div id="sidebar-new-session" class="side-block">
-          <button id="new-session" class="side-action" title="Start a new omp session in the focused pane">
-            + new session
           </button>
         </div>
         <div id="session-list" class="side-list"></div>
@@ -147,17 +132,6 @@
         tabindex="0"
         title="Drag to resize · double-click to reset"
       ></div>
-      <button
-        id="sidebar-expand"
-        class="sidebar-expand"
-        type="button"
-        title="Expand sidebar"
-        aria-expanded="false"
-        aria-controls="sidebar"
-        hidden
-      >
-        »
-      </button>
       <section id="workspace">
         <nav class="space-bar" aria-label="Browser spaces">
           <div id="space-tabs" role="tablist" aria-label="Spaces"></div>

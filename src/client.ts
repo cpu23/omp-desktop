@@ -195,6 +195,7 @@ type SidebarFolderRecord = {
 
 const sidebarRows = new Map<string, SidebarRowRecord>();
 const sidebarFolders = new Map<string, SidebarFolderRecord>();
+const sidebarHeadings = new Map<string, HTMLElement>();
 let sidebarFolderSeq = 0;
 let sidebarEmpty: HTMLElement | null = null;
 
@@ -402,7 +403,7 @@ async function refreshRuntimes(options: { restore?: boolean } = {}): Promise<boo
   // One pass per pane clears vanished bindings (keeping a resume claim only when
   // the daemon restarted) and reattaches runtimes that are still alive.
   for (const pane of panes.values()) pane.syncFromRuntimes();
-  setStatus(`${runtimes.length} live`, "ok");
+  setStatus("", "ok");
   if (generationChanged && options.restore !== false) await reconcileWorkspaceState();
   if (options.restore !== false && stateGate === "pending") return true;
   // Reopen panes whose session came back after boot; the boot path passes
@@ -1571,17 +1572,6 @@ function startResize(
 
 // ---------------------------------------------------------------- sidebar
 
-function sessionRelative(iso: string): string {
-  const then = new Date(iso).getTime();
-  if (!Number.isFinite(then)) return "";
-  const minutes = Math.round((Date.now() - then) / 60000);
-  if (minutes < 1) return "now";
-  if (minutes < 60) return `${minutes}m`;
-  const hours = Math.round(minutes / 60);
-  if (hours < 24) return `${hours}h`;
-  const days = Math.round(hours / 24);
-  return days < 30 ? `${days}d` : `${Math.round(days / 30)}mo`;
-}
 
 /** Mobile's fallback for a session whose accent the extension cannot resolve. */
 const ACCENT_FALLBACK = "#808080";
@@ -1696,8 +1686,6 @@ function updateRuntimeSidebarRow(
   runtime: RuntimeInfo,
   title: string,
   cwd: string,
-  ownerId: string | undefined,
-  folderView: boolean,
   snapshot: SessionSummaryLike | null,
 ): void {
   record.runtime = runtime;
@@ -1722,7 +1710,7 @@ function updateRuntimeSidebarRow(
         : "none"
     : "none";
   updateSidebarRowName(record, title, indicator);
-  const sub = ownerId ? ownerId.replace("p", "pane ") : folderView ? "" : cwd.replace(/^\/home\/[^/]+/, "~");
+  const sub = cwd.replace(/^\/home\/[^/]+/, "~") || "/";
   updateSidebarRowSub(record, `runtime\u0000${sub}`, sub);
   record.dragPayload.runtimeId = runtime.id;
   syncPinButton(record);
@@ -1731,7 +1719,6 @@ function updateRuntimeSidebarRow(
 function updateRecentSidebarRow(
   record: SidebarRowRecord,
   session: SessionSummaryLike,
-  folderView: boolean,
 ): void {
   record.runtime = null;
   record.session = session;
@@ -1741,24 +1728,8 @@ function updateRecentSidebarRow(
   const rowTitle = `${session.cwd}\n${session.path}`;
   if (record.element.title !== rowTitle) record.element.title = rowTitle;
   updateSidebarRowName(record, session.title || session.cwd, "none");
-  const relative = sessionRelative(session.updatedAt);
-  const cwd = session.cwd.split("/").filter(Boolean).pop() ?? "/";
-  const subKey = `session\u0000${relative}\u0000${folderView ? "" : cwd}`;
-  if (record.subKey !== subKey) {
-    record.subKey = subKey;
-    record.sub.replaceChildren();
-    const time = document.createElement("span");
-    time.className = "time";
-    time.textContent = relative;
-    record.sub.append(time);
-    if (!folderView) {
-      const cwdEl = document.createElement("span");
-      cwdEl.className = "cwd";
-      cwdEl.textContent = cwd;
-      record.sub.append(cwdEl);
-    }
-    record.sub.hidden = false;
-  }
+  const cwd = session.cwd.replace(/^\/home\/[^/]+/, "~") || "/";
+  updateSidebarRowSub(record, `session\u0000${cwd}`, cwd);
   record.dragPayload.path = session.path;
   record.dragPayload.cwd = session.cwd;
   record.dragPayload.title = session.title;
@@ -1849,11 +1820,6 @@ function renderSidebar(): void {
   });
   if (pinsChanged) savePins();
   const pinnedPaths = new Set(pinnedSessions.map((session) => session.path));
-  const paneForRuntime = new Map<string, string>();
-  for (const pane of panes.values()) {
-    const runtimeId = pane.binding.runtimeId;
-    if (runtimeId && !paneForRuntime.has(runtimeId)) paneForRuntime.set(runtimeId, pane.id);
-  }
   const liveRuntimes = query
     ? runtimes.filter((runtime) => {
       const summary = runtime.sessionFile ? sessionSummary(runtime.sessionFile) : undefined;
@@ -1864,10 +1830,10 @@ function renderSidebar(): void {
   for (const session of sessions) candidates.set(session.path, session);
   const recent = [...candidates.values()].filter((session) =>
     !liveFiles.has(session.path) &&
-    (!query || sessionByPath.has(session.path) ||
-      `${session.title} ${session.cwd}`.toLowerCase().includes(query)),
-  );
+    (!query || `${session.title} ${session.cwd}`.toLowerCase().includes(query)),
+  ).sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt) || a.path.localeCompare(b.path));
 
+  const loadedRows: SidebarRowRecord[] = [];
   const pinnedRows: SidebarRowRecord[] = [];
   const otherRows: SidebarRowRecord[] = [];
   const activeKeys = new Set<string>();
@@ -1884,15 +1850,15 @@ function renderSidebar(): void {
     const snapshot = runtime.sessionFile
       ? summary ?? pinnedSessions.find((entry) => entry.path === runtime.sessionFile) ?? null
       : null;
-    updateRuntimeSidebarRow(record, runtime, title, cwd, paneForRuntime.get(runtime.id), folderView, snapshot);
-    (runtime.sessionFile && pinnedPaths.has(runtime.sessionFile) ? pinnedRows : otherRows).push(record);
+    updateRuntimeSidebarRow(record, runtime, title, cwd, snapshot);
+    loadedRows.push(record);
   }
   for (const session of recent) {
     const key = `session:${session.path}`;
     activeKeys.add(key);
     const record = sidebarRows.get(key) ?? createSidebarRow("session");
     sidebarRows.set(key, record);
-    updateRecentSidebarRow(record, session, folderView);
+    updateRecentSidebarRow(record, session);
     (pinnedPaths.has(session.path) ? pinnedRows : otherRows).push(record);
   }
   for (const [key, record] of sidebarRows) {
@@ -1901,7 +1867,7 @@ function renderSidebar(): void {
     sidebarRows.delete(key);
   }
 
-  const rows = [...pinnedRows, ...otherRows];
+  const rows = [...loadedRows, ...pinnedRows, ...otherRows];
   const desiredTopLevel: HTMLElement[] = [];
   if (rows.length === 0) {
     if (!sidebarEmpty) {
@@ -1928,7 +1894,22 @@ function renderSidebar(): void {
       desiredTopLevel.push(folder.element);
     }
   } else {
-    desiredTopLevel.push(...rows.map((row) => row.element));
+    for (const [label, sectionRows] of [
+      ["Loaded", loadedRows],
+      ["Pinned", pinnedRows],
+      ["Recent", otherRows],
+    ] as const) {
+      if (sectionRows.length === 0) continue;
+      let heading = sidebarHeadings.get(label);
+      if (!heading) {
+        heading = document.createElement("h2");
+        heading.className = "session-section-heading";
+        sidebarHeadings.set(label, heading);
+      }
+      const text = label === "Loaded" ? `${label} · ${sectionRows.length}` : label;
+      if (heading.textContent !== text) heading.textContent = text;
+      desiredTopLevel.push(heading, ...sectionRows.map((row) => row.element));
+    }
   }
   for (const [cwd, folder] of sidebarFolders) {
     if (rowsByFolder.has(cwd)) continue;

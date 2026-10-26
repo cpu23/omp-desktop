@@ -1,13 +1,10 @@
 /**
- * Sidebar collapse + resize, self-initialising on import.
+ * Sidebar resize and view, self-initialising on import.
  *
- * The controls are static in index.html: #sidebar-collapse (in the search row),
- * #sidebar-resizer (role="separator" between the sidebar and the panes) and
- * #sidebar-expand (the strip shown only while collapsed). State is one record
- * under omp-desktop.sidebar.v1 — width, collapse, view and expanded folders —
- * so preferences survive a reload. Width is applied as the --sidebar-w
- * variable that #sidebar's flex-basis reads, so the panes refit through normal
- * flex layout.
+ * The resizer is static in index.html. State is one record under
+ * omp-desktop.sidebar.v1 — width, view and expanded folders — so preferences
+ * survive a reload. Width is applied as the --sidebar-w variable that #sidebar's
+ * flex-basis reads, so the panes refit through normal flex layout.
  *
  * The width is clamped to MIN_WIDTH..MAX_WIDTH and against the viewport, so a
  * stored width cannot swallow a narrow window. Only user-driven changes
@@ -25,7 +22,7 @@ const PANE_RESERVE = 320;
 const KEY_STEP = 16;
 const KEY_STEP_LARGE = 64;
 
-type SidebarState = { width: number; collapsed: boolean; view: "sessions" | "folders"; expandedFolders: string[] };
+type SidebarState = { width: number; view: "sessions" | "folders"; expandedFolders: string[] };
 
 let view: SidebarState["view"] = "sessions";
 let expandedFolders = new Set<string>();
@@ -48,11 +45,11 @@ export function toggleSidebarFolder(cwd: string): void {
 /** Set by init(); null only in the instant before the controls are wired. */
 let applyExternalState: ((state: SidebarState) => void) | null = null;
 
-/** Set by the client so a user-driven width/collapse change reaches the durable mirror. */
+/** Set by the client so user-driven sidebar changes reach the durable mirror. */
 let notifyStateChange: (() => void) | null = null;
 
 /**
- * Registers the client's hook for user-driven sidebar changes (collapse, resize,
+ * Registers the client's hook for user-driven sidebar changes (resize,
  * keyboard/double-click width). Adoption via applySidebarState notifies too, so
  * one save path covers both.
  */
@@ -95,14 +92,13 @@ function parseSidebarState(value: unknown): SidebarState {
       width: typeof record.width === "number" && Number.isFinite(record.width)
         ? Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, record.width))
         : DEFAULT_WIDTH,
-      collapsed: record.collapsed === true,
       view: record.view === "folders" ? "folders" : "sessions",
       expandedFolders: Array.isArray(record.expandedFolders)
         ? record.expandedFolders.filter((cwd): cwd is string => typeof cwd === "string")
         : [],
     };
   }
-  return { width: DEFAULT_WIDTH, collapsed: false, view: "sessions", expandedFolders: [] };
+  return { width: DEFAULT_WIDTH, view: "sessions", expandedFolders: [] };
 }
 
 function readState(): SidebarState {
@@ -117,17 +113,14 @@ function readState(): SidebarState {
 function init(): void {
   const sidebar = document.getElementById("sidebar");
   const resizer = document.getElementById("sidebar-resizer");
-  const collapse = document.getElementById("sidebar-collapse");
-  const expand = document.getElementById("sidebar-expand");
-  if (!sidebar || !resizer || !collapse || !expand) {
-    console.warn("sidebar: collapse/resize controls missing from index.html");
+  if (!sidebar || !resizer) {
+    console.warn("sidebar: resize controls missing from index.html");
     return;
   }
-  const status = document.getElementById("status");
 
   const stored = readState();
   let width = stored.width;
-  let collapsed = stored.collapsed;
+
   view = stored.view;
   expandedFolders = new Set(stored.expandedFolders);
 
@@ -135,7 +128,7 @@ function init(): void {
   const settingsOpen = document.getElementById("sidebar-settings-open")!;
   const settingsBack = document.getElementById("sidebar-settings-back")!;
   const search = document.getElementById("search")!;
-  const newSession = document.getElementById("sidebar-new-session")!;
+  const newSession = document.getElementById("new-session")!;
   const list = document.getElementById("session-list")!;
   const viewButtons = document.querySelectorAll<HTMLButtonElement>("[data-sidebar-view]");
 
@@ -149,7 +142,7 @@ function init(): void {
     settings.hidden = !show;
     search.hidden = show;
     settingsOpen.hidden = show;
-    collapse?.toggleAttribute("hidden", show);
+
     newSession.hidden = show;
     list.hidden = show;
     settingsOpen.setAttribute("aria-expanded", String(show));
@@ -179,11 +172,11 @@ function init(): void {
 
   function saveState(): void {
     try {
-      localStorage.setItem(STORE_KEY, JSON.stringify({ width, collapsed, view, expandedFolders: [...expandedFolders] } satisfies SidebarState));
+      localStorage.setItem(STORE_KEY, JSON.stringify({ width, view, expandedFolders: [...expandedFolders] } satisfies SidebarState));
     } catch {
       // Storage denied: the sidebar still works for this page life.
     }
-    // A settled width/collapse change is workspace state: let the client mirror it.
+    // User-driven sidebar changes are workspace state: let the client mirror them.
     notifyStateChange?.();
   }
   savePreferences = saveState;
@@ -207,26 +200,6 @@ function init(): void {
     render();
     if (persist) saveState();
   }
-
-  const applyCollapsed = (): void => {
-    sidebar.hidden = collapsed;
-    resizer.hidden = collapsed;
-    expand.hidden = !collapsed;
-    const expanded = String(!collapsed);
-    collapse.setAttribute("aria-expanded", expanded);
-    expand.setAttribute("aria-expanded", expanded);
-  };
-
-  const setCollapsed = (next: boolean): void => {
-    collapsed = next;
-    applyCollapsed();
-    // Hand focus to the control that is still on screen.
-    (collapsed ? expand : collapse).focus();
-    saveState();
-  };
-
-  collapse.addEventListener("click", () => setCollapsed(true));
-  expand.addEventListener("click", () => setCollapsed(false));
 
   // Drag: pointer capture keeps the move/up events on the resizer even when the
   // pointer leaves it, so no window-level listeners are needed.
@@ -286,31 +259,17 @@ function init(): void {
   // A window resize can move the clamp ceiling; re-render, do not persist.
   window.addEventListener("resize", render);
 
-  // Collapsed, the status line is off screen, so mirror a failure kind onto the
-  // expand strip (colour only; the rule lives in styles.css).
-  if (status) {
-    const mirrorStatus = (): void => {
-      if (status.dataset.kind === "warn") expand.dataset.kind = "warn";
-      else delete expand.dataset.kind;
-    };
-    new MutationObserver(mirrorStatus).observe(status, { attributes: true, attributeFilter: ["data-kind"] });
-    mirrorStatus();
-  }
-
   applyExternalState = (state) => {
     width = clampWidth(state.width);
-    collapsed = state.collapsed === true;
     view = state.view;
     expandedFolders = new Set(state.expandedFolders);
     renderView();
     saveState();
     render();
-    applyCollapsed();
   };
 
   render();
   renderView();
-  applyCollapsed();
 }
 
 init();
