@@ -145,6 +145,21 @@ select:focus-visible {
 
 .space-tab-group .space-tab {
   padding-right: 32px;
+  touch-action: none;
+  cursor: grab;
+}
+
+.space-tab.space-reorder-source {
+  opacity: 0.5;
+  cursor: grabbing;
+}
+
+.space-insert-before {
+  box-shadow: inset 2px 0 var(--text);
+}
+
+.space-insert-after {
+  box-shadow: inset -2px 0 var(--text);
 }
 
 .space-close {
