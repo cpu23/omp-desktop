@@ -978,7 +978,8 @@ body.session-dragging * {
   flex: 0 0 22px;
 }
 
-.row .pin svg {
+.row .pin svg,
+.pane-header .pin svg {
   width: 14px;
   height: 14px;
   fill: none;
@@ -988,7 +989,8 @@ body.session-dragging * {
   stroke-linejoin: round;
 }
 
-.row .pin[aria-pressed="true"] svg path:first-child {
+.row .pin[aria-pressed="true"] svg path:first-child,
+.pane-header .pin[aria-pressed="true"] svg path:first-child {
   fill: currentColor;
 }
 
@@ -1005,7 +1007,8 @@ body.session-dragging * {
   opacity: 1;
 }
 
-.row .pin[aria-pressed="true"] {
+.row .pin[aria-pressed="true"],
+.pane-header .pin[aria-pressed="true"] {
   color: var(--accent);
 }
 
@@ -1013,7 +1016,8 @@ body.session-dragging * {
   color: var(--text);
 }
 
-.row .pin:disabled {
+.row .pin:disabled,
+.pane-header .pin:disabled {
   color: var(--dim);
   cursor: default;
 }
@@ -1103,23 +1107,67 @@ body.session-dragging * {
 }
 
 .pane-header {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 8px;
-  height: 30px;
+  height: 52px;
   flex: 0 0 auto;
-  padding: 0 6px 0 10px;
-  background: rgba(10, 11, 13, 0.95);
-  border-bottom: 1px solid var(--line);
-  font: 12px var(--mono);
+  padding: 6px 8px;
+  background: var(--panel);
+  border: 0;
+  font: 400 12px/18px var(--mono);
   user-select: none;
   cursor: grab;
+}
+
+.pane-labels {
+  display: grid;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.pane-directory {
+  min-height: 16px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font: 10px/16px var(--mono);
+}
+
+.pane-header:hover,
+.pane-header:focus-within {
+  background: var(--panel-soft);
+}
+
+.pane-actions {
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  display: flex;
+  gap: 3px;
+  background: var(--panel-soft);
+  opacity: 0;
+  pointer-events: none;
+}
+
+.pane-header:hover .pane-actions,
+.pane-header:focus-within .pane-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.pane-header:hover .pane-directory,
+.pane-header:focus-within .pane-directory {
+  padding-right: 52px;
 }
 
 .pane-title {
   flex: 0 1 auto;
   min-width: 0;
-  font-weight: 700;
+  font-weight: 400;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1133,9 +1181,6 @@ body.session-dragging * {
   white-space: nowrap;
 }
 
-.pane-spacer {
-  flex: 1;
-}
 
 .pane-header button {
   display: inline-grid;
@@ -1143,15 +1188,12 @@ body.session-dragging * {
   width: 22px;
   height: 22px;
   padding: 0;
-  background: var(--panel-raised);
+  background: transparent;
   color: var(--muted);
-  border: 1px solid var(--line);
-  border-radius: 6px;
+  border: 0;
   cursor: pointer;
   font: 11px var(--mono);
-  transition:
-    border-color 0.15s ease,
-    color 0.15s ease;
+  transition: color 0.15s ease;
 }
 
 .pane-menu {
@@ -1190,8 +1232,11 @@ body.session-dragging * {
 }
 
 .pane-header button:hover {
-  border-color: var(--effort-accent);
   color: var(--text);
+}
+
+.pane-header .pane-close:hover {
+  color: var(--danger);
 }
 
 .pane-body {

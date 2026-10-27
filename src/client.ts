@@ -542,6 +542,8 @@ class Pane {
   #jumpLatest: HTMLButtonElement;
   #titleEl: HTMLElement;
   #stateEl: HTMLElement;
+  #directoryEl: HTMLElement;
+  #pin: HTMLButtonElement;
   #observer: ResizeObserver;
   #resizeTimer: number | undefined;
   #replaying = false;
@@ -565,16 +567,25 @@ class Pane {
     this.#titleEl.className = "pane-title";
     this.#stateEl = document.createElement("span");
     this.#stateEl.className = "pane-state";
-    const spacer = document.createElement("span");
-    spacer.className = "pane-spacer";
+    this.#directoryEl = document.createElement("span");
+    this.#directoryEl.className = "pane-directory";
+    const labels = document.createElement("div");
+    labels.className = "pane-labels";
+    labels.append(this.#directoryEl, this.#titleEl);
+    const actions = document.createElement("div");
+    actions.className = "pane-actions";
+    this.#pin = pinButton(() => this.binding.sessionFile ? sessionSummary(this.binding.sessionFile) ?? null : null);
     const close = document.createElement("button");
     close.textContent = "✕";
     close.title = "Close pane (shortcut editable in Settings)";
+    close.className = "pane-close";
+    close.setAttribute("aria-label", "Close pane");
     close.addEventListener("click", (event) => {
       event.stopPropagation();
       closePane(this.id);
     });
-    header.append(this.#titleEl, this.#stateEl, spacer, close);
+    actions.append(close, this.#pin);
+    header.append(labels, this.#stateEl, actions);
 
     this.#body = document.createElement("div");
     this.#body.className = "pane-body";
@@ -633,7 +644,7 @@ class Pane {
     rendererWarning.title = "GPU renderer unavailable: box and block glyphs may have seams";
     const showRendererWarning = () => {
       this.el.dataset.renderer = "dom";
-      if (!rendererWarning.isConnected) header.insertBefore(rendererWarning, spacer);
+      if (!rendererWarning.isConnected) header.insertBefore(rendererWarning, actions);
     };
     if (shouldUseDomFallbackForSoftwareWebgl()) {
       showRendererWarning();
@@ -1054,8 +1065,13 @@ class Pane {
   }
 
   renderHeader(): void {
-    const title = this.binding.title ?? "no session";
     const sessionFile = this.binding.sessionFile ?? "";
+    const session = sessionFile ? sessionSummary(sessionFile) ?? null : null;
+    const runtime = runtimes.find((entry) => entry.id === this.binding.runtimeId);
+    const title = session?.title || this.binding.title || "no session";
+    const directory = (session?.cwd ?? runtime?.cwd ?? "").replace(/^\/home\/[^/]+/, "~");
+    if (this.#directoryEl.textContent !== directory) this.#directoryEl.textContent = directory;
+    syncPinButton(this.#pin, session);
     if (this.#titleEl.textContent !== title) this.#titleEl.textContent = title;
     if (this.#titleEl.title !== sessionFile) this.#titleEl.title = sessionFile;
     if (this.binding.runtimeId && this.#stateEl.textContent !== "") this.#stateEl.textContent = "";
@@ -1663,17 +1679,16 @@ function acknowledgeCompletion(runtimeId: string | null): boolean {
 }
 
 
-/** Updates the existing pin control without replacing its focused row node. */
-function syncPinButton(record: SidebarRowRecord): void {
-  const session = record.snapshot;
+/** Update pin state in place so either surface retains keyboard focus. */
+function syncPinButton(button: HTMLButtonElement, session: SessionSummaryLike | null): void {
   const pinned = session !== null && pinnedSessions.some((entry) => entry.path === session.path);
   const title = session ? `${pinned ? "Unpin" : "Pin"} chat` : "Waiting for session file";
-  if (record.pin.disabled !== (session === null)) record.pin.disabled = session === null;
-  if (record.pin.getAttribute("aria-pressed") !== String(pinned)) {
-    record.pin.setAttribute("aria-pressed", String(pinned));
+  if (button.disabled !== (session === null)) button.disabled = session === null;
+  if (button.getAttribute("aria-pressed") !== String(pinned)) {
+    button.setAttribute("aria-pressed", String(pinned));
   }
-  if (record.pin.title !== title) record.pin.title = title;
-  if (record.pin.getAttribute("aria-label") !== title) record.pin.setAttribute("aria-label", title);
+  if (button.title !== title) button.title = title;
+  if (button.getAttribute("aria-label") !== title) button.setAttribute("aria-label", title);
 }
 
 function createSidebarRow(kind: "runtime" | "session"): SidebarRowRecord {
@@ -1785,7 +1800,7 @@ function updateRuntimeSidebarRow(
   const sub = cwd.replace(/^\/home\/[^/]+/, "~") || "/";
   updateSidebarRowSub(record, `runtime\u0000${sub}`, sub);
   record.dragPayload.runtimeId = runtime.id;
-  syncPinButton(record);
+  syncPinButton(record.pin, record.snapshot);
 }
 
 function updateRecentSidebarRow(
@@ -1805,7 +1820,7 @@ function updateRecentSidebarRow(
   record.dragPayload.path = session.path;
   record.dragPayload.cwd = session.cwd;
   record.dragPayload.title = session.title;
-  syncPinButton(record);
+  syncPinButton(record.pin, record.snapshot);
 }
 
 function reconcileChildren(container: HTMLElement, desired: HTMLElement[]): void {
@@ -1870,6 +1885,7 @@ function renderSidebar(): void {
     return;
   }
   renderPending = false;
+  for (const pane of panes.values()) pane.renderHeader();
 
   const query = searchEl.value.trim().toLowerCase();
   const folderView = sidebarFolderView();
