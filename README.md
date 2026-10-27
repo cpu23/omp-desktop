@@ -37,6 +37,7 @@ menu; the daemon above must remain running.
 ## Unreleased
 
 - Use compact, borderless sidebar rows grouped exclusively into Loaded (with count), Pinned, then Recent by last activity; reveal pin/stop controls on hover or keyboard focus. Start sessions with **+** beside search; remove sidebar collapse and the live-count footer.
+- Click Loaded, Pinned, or Recent to collapse or expand that section; labels also support keyboard activation. Keep the sidebar scrollbar gutter stable and directory hover clipping layout-neutral.
 - Remove split-pane and sidebar gutters and duplicate outlines; use shared 1px separators with wider invisible resize targets.
 - Preserve compact single-line pane headers, remove their bottom border, and match only the hover/focus close and pin icons to the sidebar controls, with synchronized pins.
 - Organize settings into Appearance, Notifications, Sessions, and Keyboard shortcuts, with grouped shortcut editors. Replace numbered pane-focus bindings with one configurable toggle that expands the selected pane and restores its split layout.
