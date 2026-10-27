@@ -38,7 +38,7 @@ menu; the daemon above must remain running.
 
 - Use compact, borderless sidebar rows grouped exclusively into Loaded (with count), Pinned, then Recent by last activity; reveal pin/stop controls on hover or keyboard focus. Start sessions with **+** beside search; remove sidebar collapse and the live-count footer.
 - Remove split-pane and sidebar gutters and duplicate outlines; use shared 1px separators with wider invisible resize targets.
-- Match pane headers to sidebar rows with two-line directory/title labels, no bottom border, and hover/focus-only close and pin actions synchronized with sidebar pins.
+- Preserve compact single-line pane headers, remove their bottom border, and match only the hover/focus close and pin icons to the sidebar controls, with synchronized pins.
 - Reorder workspace tabs by dragging, with insertion indicators and persisted ordering.
 - Ship minified, gzip-compressed, fingerprinted assets without inline source maps; replace browser TTF delivery with WOFF2.
 - Drive working indicators with transform animations instead of per-frame JavaScript or changing glyph layout.

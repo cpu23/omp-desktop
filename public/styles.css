@@ -1107,48 +1107,24 @@ body.session-dragging * {
 }
 
 .pane-header {
-  position: relative;
   display: flex;
   align-items: center;
   gap: 8px;
-  height: 52px;
+  height: 30px;
   flex: 0 0 auto;
-  padding: 6px 8px;
-  background: var(--panel);
+  padding: 0 6px 0 10px;
+  background: rgba(10, 11, 13, 0.95);
   border: 0;
-  font: 400 12px/18px var(--mono);
+  font: 12px var(--mono);
   user-select: none;
   cursor: grab;
 }
 
-.pane-labels {
-  display: grid;
-  gap: 2px;
-  flex: 1;
-  min-width: 0;
-}
-
-.pane-directory {
-  min-height: 16px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--muted);
-  font: 10px/16px var(--mono);
-}
-
-.pane-header:hover,
-.pane-header:focus-within {
-  background: var(--panel-soft);
-}
-
 .pane-actions {
-  position: absolute;
-  top: 4px;
-  right: 6px;
   display: flex;
   gap: 3px;
-  background: var(--panel-soft);
+  flex: 0 0 auto;
+  margin-left: auto;
   opacity: 0;
   pointer-events: none;
 }
@@ -1159,15 +1135,11 @@ body.session-dragging * {
   pointer-events: auto;
 }
 
-.pane-header:hover .pane-directory,
-.pane-header:focus-within .pane-directory {
-  padding-right: 52px;
-}
 
 .pane-title {
   flex: 0 1 auto;
   min-width: 0;
-  font-weight: 400;
+  font-weight: 700;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

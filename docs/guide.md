@@ -171,8 +171,8 @@ not Pinned or Recent. The Loaded heading includes its count; Recent is ordered b
 newest first. Rows show the directory and title, with an unread-completion dot when attention is needed.
 Hover or focus within a row to reveal pin and stop controls. Start a session with **+** beside search.
 The sidebar stays open and remains resizable; settings retain the optional folder view.
-Pane title bars use the same two-line directory/title treatment without a bottom border. Hover or focus a
-title-bar control to reveal close and pin actions. Pinning or unpinning updates both the title bar and sidebar;
+Pane title bars retain their compact single-line layout without a bottom border. Only the close and pin icons
+match the sidebar controls; they appear on hover or keyboard focus. Pinning updates both surfaces;
 closing a pane only detaches its view and does not stop the session.
 
 The sidebar supports search, pins and opt-in completion notifications. Working/completion indicators and

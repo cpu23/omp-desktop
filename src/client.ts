@@ -542,7 +542,6 @@ class Pane {
   #jumpLatest: HTMLButtonElement;
   #titleEl: HTMLElement;
   #stateEl: HTMLElement;
-  #directoryEl: HTMLElement;
   #pin: HTMLButtonElement;
   #observer: ResizeObserver;
   #resizeTimer: number | undefined;
@@ -567,11 +566,6 @@ class Pane {
     this.#titleEl.className = "pane-title";
     this.#stateEl = document.createElement("span");
     this.#stateEl.className = "pane-state";
-    this.#directoryEl = document.createElement("span");
-    this.#directoryEl.className = "pane-directory";
-    const labels = document.createElement("div");
-    labels.className = "pane-labels";
-    labels.append(this.#directoryEl, this.#titleEl);
     const actions = document.createElement("div");
     actions.className = "pane-actions";
     this.#pin = pinButton(() => this.binding.sessionFile ? sessionSummary(this.binding.sessionFile) ?? null : null);
@@ -585,7 +579,7 @@ class Pane {
       closePane(this.id);
     });
     actions.append(close, this.#pin);
-    header.append(labels, this.#stateEl, actions);
+    header.append(this.#titleEl, this.#stateEl, actions);
 
     this.#body = document.createElement("div");
     this.#body.className = "pane-body";
@@ -1067,10 +1061,7 @@ class Pane {
   renderHeader(): void {
     const sessionFile = this.binding.sessionFile ?? "";
     const session = sessionFile ? sessionSummary(sessionFile) ?? null : null;
-    const runtime = runtimes.find((entry) => entry.id === this.binding.runtimeId);
-    const title = session?.title || this.binding.title || "no session";
-    const directory = (session?.cwd ?? runtime?.cwd ?? "").replace(/^\/home\/[^/]+/, "~");
-    if (this.#directoryEl.textContent !== directory) this.#directoryEl.textContent = directory;
+    const title = this.binding.title ?? "no session";
     syncPinButton(this.#pin, session);
     if (this.#titleEl.textContent !== title) this.#titleEl.textContent = title;
     if (this.#titleEl.title !== sessionFile) this.#titleEl.title = sessionFile;
