@@ -36,6 +36,7 @@ menu; the daemon above must remain running.
 
 ## Unreleased
 
+- Use the installed OMP application logo for native completion notifications instead of the generic system icon.
 - Use compact, borderless sidebar rows grouped exclusively into Loaded (with count), Pinned, then Recent by last activity; reveal pin/stop controls on hover or keyboard focus. Start sessions with **+** beside search; remove sidebar collapse and the live-count footer.
 - Click Loaded, Pinned, or Recent to collapse or expand that section; labels also support keyboard activation. Keep the sidebar scrollbar gutter stable and directory hover clipping layout-neutral.
 - Remove split-pane and sidebar gutters and duplicate outlines; use shared 1px separators with wider invisible resize targets.
