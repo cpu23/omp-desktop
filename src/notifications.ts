@@ -87,7 +87,7 @@ export class CompletionNotifications {
         // The plugin's sendNotification wrapper returns void. Await the native
         // command so permission/IPC failures reach the Settings status instead.
         await invoke("plugin:notification|notify", {
-          options: { title, body: "A response finished.", extra: { runtimeId } },
+          options: { title, body: "A response finished.", icon: "sh.omp.desktop", extra: { runtimeId } },
         });
       } else {
         const notification = new Notification(title, { body: "A response finished." });

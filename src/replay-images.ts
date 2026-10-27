@@ -10,7 +10,6 @@ const CSI = `${ESC}[`;
 const CURSOR_LEFT = `${CSI}1D`;
 const MAX_SIDECAR_BYTES = 128 * 1024 * 1024;
 const OSC_INLINE_FILE_PREFIXES = [`${ESC}]1337;File=`, "\x9d1337;File="];
-const SIXEL_IMAGE_PREFIXES = [`${ESC}Pq`, "\x90q"];
 const MAX_IMAGE_PREFIX_LENGTH = 12;
 const MAX_IMAGE_HEADER_LENGTH = 1024;
 const CONTROL_START = /[\x1b\x9b\x9d\x90\x98\x9e\x9f]/;
@@ -265,20 +264,35 @@ class VtSequenceScanner {
 
   #inspectImagePrefix(part: string): void {
     if (!this.imagePrefixEligible) return;
-    const prefixOptions = this.kind === "osc" ? OSC_INLINE_FILE_PREFIXES : SIXEL_IMAGE_PREFIXES;
-    const prefixLength = this.kind === "osc" ? MAX_IMAGE_PREFIX_LENGTH : 3;
+    if (this.kind === "dcs") {
+      const prefix = this.imagePrefix + part.slice(0, MAX_IMAGE_HEADER_LENGTH + 1 - this.imagePrefix.length);
+      const start = prefix.startsWith(`${ESC}P`) ? 2 : 1;
+      for (let index = start; index < prefix.length; index += 1) {
+        const code = prefix.charCodeAt(index);
+        if (code >= 0x40 && code <= 0x7e) {
+          this.imageCandidate = prefix[index] === "q";
+          this.imagePrefix = "";
+          this.imagePrefixEligible = false;
+          return;
+        }
+      }
+      if (prefix.length > MAX_IMAGE_HEADER_LENGTH) {
+        this.#overflowPending();
+        return;
+      }
+      this.imagePrefix = prefix;
+      return;
+    }
+    const prefixOptions = OSC_INLINE_FILE_PREFIXES;
+    const prefixLength = MAX_IMAGE_PREFIX_LENGTH;
     const prefix = this.imagePrefix + part.slice(0, Math.max(0, prefixLength - this.imagePrefix.length));
     for (const imagePrefix of prefixOptions) {
       if (prefix.startsWith(imagePrefix)) {
         const prefixPartLength = imagePrefix.length - this.imagePrefix.length;
         this.imagePrefix = "";
         this.imagePrefixEligible = false;
-        if (this.kind === "dcs") {
-          this.imageCandidate = true;
-        } else {
-          this.imageHeaderPending = true;
-          this.#inspectImageHeader(part.slice(prefixPartLength));
-        }
+        this.imageHeaderPending = true;
+        this.#inspectImageHeader(part.slice(prefixPartLength));
         return;
       }
     }

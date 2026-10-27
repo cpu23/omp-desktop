@@ -289,6 +289,31 @@ describe("terminal replay snapshots", () => {
     }
   });
 
+  for (const introduction of ["\x1bP0;1;0q", "\x900;1;0q"]) {
+    test(`budgets parameterized Sixel across split headers ${JSON.stringify(introduction)}`, async () => {
+      const resources = new RuntimeResourceBudget({
+        imageBytesPerRuntime: 32,
+        imageBytesTotal: 32,
+      }, 1);
+      const lease = resources.createLease(40, 8);
+      const replay = new TerminalReplay(40, 8, lease);
+      try {
+        for (const character of introduction) await append(replay, character);
+        await append(replay, "SIXEL-PAYLOAD");
+        expect((await snapshot(replay)).data).toContain("SIXEL-PAYLOAD");
+        await append(replay, "?".repeat(32));
+        expect((await snapshot(replay)).data).not.toContain("SIXEL-PAYLOAD");
+        await append(replay, "\x1b\\after");
+        expect((await replay.screenSnapshot()).screen).toContain("after");
+        expect(lease.reserveImage(32)).toBe(true);
+        lease.releaseImage(32);
+      } finally {
+        replay.dispose();
+        lease.release();
+      }
+    });
+  }
+
   test("new attachments reflect scrollback trimmed by another runtime's grant", async () => {
     const resources = new RuntimeResourceBudget({
       replayRowsPerRuntime: 4,
