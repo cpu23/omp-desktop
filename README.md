@@ -37,6 +37,7 @@ menu; the daemon above must remain running.
 ## Unreleased
 
 - Use compact, borderless sidebar rows grouped exclusively into Loaded (with count), Pinned, then Recent by last activity; reveal pin/stop controls on hover or keyboard focus. Start sessions with **+** beside search; remove sidebar collapse and the live-count footer.
+- Remove split-pane gutters and duplicate outlines; use one shared 1px separator with a wider invisible resize target.
 - Reorder workspace tabs by dragging, with insertion indicators and persisted ordering.
 - Ship minified, gzip-compressed, fingerprinted assets without inline source maps; replace browser TTF delivery with WOFF2.
 - Drive working indicators with transform animations instead of per-frame JavaScript or changing glyph layout.

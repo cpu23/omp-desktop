@@ -1031,14 +1031,27 @@ body.session-dragging * {
   min-height: 0;
 }
 
-/* Split divider: the only gutter between sibling panes, so the gap the
-   container used to provide now lives here and doubles as the resize handle. */
+/* One shared line separates panes. The invisible hit area overlaps their edges
+   so resizing stays easy without reserving a visible gutter. */
 .divider {
-  flex: 0 0 6px;
+  flex: 0 0 1px;
   position: relative;
   z-index: 2;
-  background: transparent;
+  background: var(--line);
   transition: background 90ms linear;
+}
+
+.divider::after {
+  content: "";
+  position: absolute;
+}
+
+.divider-split-row::after {
+  inset: 0 -3px;
+}
+
+.divider-split-col::after {
+  inset: -3px 0;
 }
 
 .divider-split-row {
@@ -1071,15 +1084,15 @@ body.session-dragging * {
   min-width: 0;
   min-height: 0;
   background: var(--panel);
-  border: 1px solid var(--line);
+  border: 0;
   overflow: hidden;
-  transition: border-color 0.16s ease;
 }
 
 /* The drop target stays neutral (white) and nothing else: no tint or halo marks
    a pane that merely holds focus, so a pane looks identical whatever has it. */
 .pane.drop {
-  border-color: var(--text);
+  outline: 1px solid var(--text);
+  outline-offset: -1px;
 }
 
 .pane-header {

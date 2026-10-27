@@ -69,7 +69,8 @@ WebGL, hardware acceleration and DMABUF settings are not changed by this prefere
 
 Create spaces with **+** in the top bar. Each space has its own layout (up to four panes); drag a pane header or
 a sidebar session onto another space's tab to move/open it there. Right-click a pane to split the layout:
-1×1 becomes side-by-side, then 2×2. Dividers can be resized. In a 2×2 grid, closing one pane leaves an empty
+1×1 becomes side-by-side, then 2×2. Panes meet at a single 1px separator with no gutter or duplicate borders;
+drag on or just beside the separator to resize. In a 2×2 grid, closing one pane leaves an empty
 slot; closing another occupied pane collapses the grid. A new pane starts a new session; clicking a sidebar
 session attaches it to the focused pane.
 
