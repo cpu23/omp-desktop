@@ -1320,6 +1320,23 @@ body.session-dragging * {
   background: var(--bg);
 }
 
+.pane-starting {
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  display: grid;
+  place-items: center;
+  background: var(--bg);
+  color: var(--muted);
+  font: 12px var(--mono);
+}
+
+.pane-starting[hidden] { display: none; }
+
+.pane-body[aria-busy="true"] .term-host {
+  visibility: hidden;
+}
+
 .pane-jump-latest {
   position: absolute;
   right: 18px;

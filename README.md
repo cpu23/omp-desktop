@@ -38,6 +38,9 @@ menu; the daemon above must remain running.
 
 ## Sessions and settings
 
+- Panes show **Starting session…** while a new session initializes, hiding transient startup protocol text.
+  Existing sessions reappear after replay; startup exits and disconnects uncover their output immediately.
+
 - **Loaded → Pinned → Recent:** each session appears only in its highest applicable section. Recent is ordered by
   last conversation activity. Click a section label to collapse or expand it.
 - Rows show the directory and title; secondary pin/stop controls appear on hover or keyboard focus.

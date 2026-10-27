@@ -541,6 +541,9 @@ class Pane {
   #body: HTMLElement;
   #host: HTMLElement;
   #placeholder: HTMLElement;
+  #starting: HTMLElement;
+  #startupTimer: number | undefined;
+  #startupFrame = false;
   #placeholderKey = "";
   #jumpLatest: HTMLButtonElement;
   #titleEl: HTMLElement;
@@ -591,6 +594,12 @@ class Pane {
     this.#placeholder = document.createElement("div");
     this.#placeholder.className = "pane-placeholder";
     this.#body.append(this.#placeholder, this.#host);
+    this.#starting = document.createElement("div");
+    this.#starting.className = "pane-starting";
+    this.#starting.setAttribute("role", "status");
+    this.#starting.textContent = "Starting session…";
+    this.#starting.hidden = true;
+    this.#body.append(this.#starting);
     this.#jumpLatest = document.createElement("button");
     this.#jumpLatest.className = "pane-jump-latest";
     this.#jumpLatest.innerHTML = '<svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="m6 6 6 6 6-6M6 12l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
@@ -663,6 +672,14 @@ class Pane {
       }
     }
     loadImageAddon(this.term);
+    // OMP clears the screen before replacing its startup protocol with the TUI.
+    this.term.parser.registerCsiHandler({ final: "J" }, (params) => {
+      if (!this.#replaying && params[0] === 2) this.#startupFrame = true;
+      return false;
+    });
+    this.term.onWriteParsed(() => {
+      if (this.#startupFrame && !this.#replaying) this.#finishStartup();
+    });
     this.term.loadAddon(new WebLinksAddon(openTerminalLink));
     this.term.onData((data) => {
       const socket = this.ws;
@@ -883,11 +900,25 @@ class Pane {
     renderSidebar();
   }
 
+  #finishStartup(): void {
+    const wasStarting = !this.#starting.hidden;
+    window.clearTimeout(this.#startupTimer);
+    this.#startupTimer = undefined;
+    this.#startupFrame = false;
+    this.#starting.hidden = true;
+    this.#body.removeAttribute("aria-busy");
+    this.#host.inert = false;
+    if (wasStarting && this.ws?.readyState === WebSocket.OPEN && layout.focused === this.id && this.visible) {
+      this.term.focus();
+    }
+  }
+
   detach(): void {
     this.retry = Number.POSITIVE_INFINITY;
     const socket = this.ws;
     this.ws = null;
     this.#replaying = false;
+    this.#finishStartup();
     socket?.close();
   }
 
@@ -908,11 +939,18 @@ class Pane {
     socket.binaryType = "arraybuffer";
     this.ws = socket;
     this.#replaying = true;
+    this.#starting.hidden = false;
+    this.#body.setAttribute("aria-busy", "true");
+    this.#host.inert = true;
+    // Failed/non-OMP startups must not leave diagnostic output covered forever.
+    this.#startupTimer = window.setTimeout(() => this.#finishStartup(), 10_000);
+    let starting = true;
     let replayBytes = 0;
     const finishReplay = () => {
       if (this.ws !== socket) return;
       this.#replaying = false;
       this.refreshAfterAttach();
+      if (!starting || this.#startupFrame) this.#finishStartup();
     };
     socket.onopen = () => {
       if (this.ws !== socket) return;
@@ -932,6 +970,10 @@ class Pane {
       if (typeof event.data === "string") {
         const message = parseServerMessage(event.data);
         if (message?.type === "hello") {
+          const startedAt = message.runtime.startedAt;
+          // Established sessions need only finish replay; newly started ones
+          // may still be negotiating the terminal fallback behind the cover.
+          starting = !startedAt || Date.now() - Date.parse(startedAt) < 3000;
           // TUI replay contains absolute cursor moves and may disable wrapping.
           // Parse it at the producer's size before fitting the restored pane.
           if (this.term.cols !== message.runtime.cols || this.term.rows !== message.runtime.rows) {
@@ -955,6 +997,7 @@ class Pane {
     };
     socket.onclose = () => {
       if (this.ws !== socket) return;
+      this.#finishStartup();
       this.ws = null;
       if (this.retry < 5) {
         this.retry += 1;
@@ -981,6 +1024,7 @@ class Pane {
       // placeholder's manual resume both need.
       save();
     } else if (msg.type === "exit") {
+      this.#finishStartup();
       this.#stateEl.textContent = `exited ${msg.exitCode ?? "?"}`;
       // A process that ended is finished, not restarted; only a daemon-wide
       // shutdown defers the pane's claim to be live to the next daemon start.
