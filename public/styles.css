@@ -242,7 +242,6 @@ select:focus-visible {
   display: flex;
   flex-direction: column;
   background: var(--panel);
-  border-right: 1px solid var(--line);
   padding: 10px 10px 8px;
   overflow: hidden;
 }
@@ -691,11 +690,19 @@ select:focus-visible {
 /* Sidebar resize handle: the panes' divider pattern, applied to the sidebar
    edge. Keyboard users get it as a separator (arrow keys / Home / End). */
 .sidebar-resizer {
-  flex: 0 0 6px;
-  background: transparent;
+  flex: 0 0 1px;
+  position: relative;
+  z-index: 3;
+  background: var(--line);
   cursor: col-resize;
   touch-action: none;
   transition: background 90ms linear;
+}
+
+.sidebar-resizer::after {
+  content: "";
+  position: absolute;
+  inset: 0 -3px;
 }
 
 .sidebar-resizer:hover,
