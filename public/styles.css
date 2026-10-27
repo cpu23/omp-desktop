@@ -449,6 +449,14 @@ select:focus-visible {
   text-transform: uppercase;
 }
 
+.session-section-heading:not(:first-child)::before {
+  content: "";
+  display: block;
+  height: 1px;
+  margin: 0 8px 10px;
+  background: var(--line);
+}
+
 .session-section-heading:hover {
   color: var(--text);
 }

@@ -42,7 +42,7 @@ menu; the daemon above must remain running.
   Existing sessions reappear after replay; startup exits and disconnects uncover their output immediately.
 
 - **Loaded → Pinned → Recent:** each session appears only in its highest applicable section. Recent is ordered by
-  last conversation activity. Click a section label to collapse or expand it.
+  last conversation activity. Thin, inset dividers separate the groups. Click a section label to collapse or expand it.
 - Rows show the directory and title; secondary pin/stop controls appear on hover or keyboard focus.
 - Press **Ctrl+Shift+E** (macOS browser: **⌘⇧E**) to cycle split layouts. Press **Ctrl+Shift+F** (**⌘⇧F**) to
   expand the selected pane; press again to restore the split without restarting its session.
