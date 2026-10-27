@@ -69,7 +69,8 @@ WebGL, hardware acceleration and DMABUF settings are not changed by this prefere
 
 Create spaces with **+** in the top bar. Each space has its own layout (up to four panes); drag a pane header or
 a sidebar session onto another space's tab to move/open it there. Right-click a pane to split the layout:
-1×1 becomes side-by-side, then 2×2. Dividers can be resized. In a 2×2 grid, closing one pane leaves an empty
+1×1 becomes side-by-side, then 2×2. Panes meet at a single 1px separator with no gutter or duplicate borders;
+drag on or just beside the separator to resize. In a 2×2 grid, closing one pane leaves an empty
 slot; closing another occupied pane collapses the grid. A new pane starts a new session; clicking a sidebar
 session attaches it to the focused pane.
 
@@ -164,10 +165,23 @@ fall back to upload; other pathless files are ignored. Paths containing control 
 
 ### Sidebar, settings and shortcuts
 
-The sidebar lists live and saved sessions; it supports search, pins, session/folder views, and opt-in completion
-notifications. Working/completion indicators and per-session accents come from the optional extension, not
-terminal output. Notifications default to off, require OS/browser permission, and are not replayed when reopening
-the app. Browsers deliver web notifications while the page is open; the native shell uses OS notifications.
+The session view groups compact, borderless two-line rows into **Loaded**, **Pinned**, then **Recent**.
+Each session appears only in its highest applicable section: a loaded, pinned session appears under Loaded,
+not Pinned or Recent. The Loaded heading includes its count; Recent is ordered by last conversation activity,
+newest first. Rows show the directory and title, with an unread-completion dot when attention is needed.
+Hover or focus within a row to reveal pin and stop controls. Start a session with **+** beside search.
+The sidebar stays open and remains resizable; settings retain the optional folder view.
+Pane title bars retain their compact single-line layout without a bottom border. Only the close and pin icons
+match the sidebar controls; they appear on hover or keyboard focus. Pinning updates both surfaces;
+closing a pane only detaches its view and does not stop the session.
+
+Settings separates **Appearance**, **Notifications**, **Sessions**, and **Keyboard shortcuts**. Shortcut editors
+are grouped into Panes, Spaces, and Terminal text; expand a group to edit its bindings, then save.
+
+The sidebar supports search, pins and opt-in completion notifications. Working/completion indicators and
+per-session accents come from the optional extension, not terminal output. Notifications default to off,
+require OS/browser permission, and are not replayed when reopening the app. Browsers deliver web notifications
+while the page is open; the native shell uses OS notifications.
 Working sessions show a spinner immediately before the shimmering session title, with no separate “Working…” label.
 The Motion setting still controls animation; long titles truncate without squeezing the subtitle.
 The spinner and title shimmer use transform animations, a fixed glyph strip and a counter-translated gradient mask:
@@ -201,10 +215,16 @@ Default shortcuts:
 | Reset font | `Ctrl+0`, `Meta+0` |
 | Split layout | `Ctrl+Shift+E`, `Meta+Shift+E` |
 | Close focused pane | `Ctrl+Shift+X`, `Meta+Shift+X` |
+| Toggle selected pane focus | `Ctrl+Shift+F`, `Meta+Shift+F` |
 
 Edit shortcuts under sidebar **Settings → Keyboard shortcuts**. Use commas for sequence presses and semicolons
 for alternative bindings (for example, `Ctrl+K, Ctrl+1`). The first press must include Ctrl, Meta, Alt or Shift;
 sequences time out after one second. Bindings are stored in the local browser/app profile.
+
+Toggle pane focus expands the selected terminal to fill the workspace; press the same shortcut again to restore
+the split layout and its divider ratios. Other sessions keep running with their existing processes. This
+temporary presentation does not change the saved layout; switching spaces, changing the layout, or reloading
+returns to the split view. A single-pane space is unchanged by the toggle.
 
 ## Configuration
 

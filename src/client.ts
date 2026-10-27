@@ -110,6 +110,8 @@ const panes = new Map<string, Pane>();
 const spaces = new Map<string, StoredLayout>();
 let layout: StoredLayout = { tree: { kind: "leaf", pane: "p1" }, panes: {}, focused: "p1" };
 let activeSpaceId = "s1";
+/** Temporary presentation only; never replace or persist the split tree. */
+let expandedPaneId: string | null = null;
 spaces.set(activeSpaceId, layout);
 let spaceSeq = 1;
 /** True after local restoration or the initial compatible daemon reconciliation. */
@@ -195,6 +197,7 @@ type SidebarFolderRecord = {
 
 const sidebarRows = new Map<string, SidebarRowRecord>();
 const sidebarFolders = new Map<string, SidebarFolderRecord>();
+const sidebarHeadings = new Map<string, HTMLElement>();
 let sidebarFolderSeq = 0;
 let sidebarEmpty: HTMLElement | null = null;
 
@@ -402,7 +405,7 @@ async function refreshRuntimes(options: { restore?: boolean } = {}): Promise<boo
   // One pass per pane clears vanished bindings (keeping a resume claim only when
   // the daemon restarted) and reattaches runtimes that are still alive.
   for (const pane of panes.values()) pane.syncFromRuntimes();
-  setStatus(`${runtimes.length} live`, "ok");
+  setStatus("", "ok");
   if (generationChanged && options.restore !== false) await reconcileWorkspaceState();
   if (options.restore !== false && stateGate === "pending") return true;
   // Reopen panes whose session came back after boot; the boot path passes
@@ -541,6 +544,7 @@ class Pane {
   #jumpLatest: HTMLButtonElement;
   #titleEl: HTMLElement;
   #stateEl: HTMLElement;
+  #pin: HTMLButtonElement;
   #observer: ResizeObserver;
   #resizeTimer: number | undefined;
   #replaying = false;
@@ -564,16 +568,20 @@ class Pane {
     this.#titleEl.className = "pane-title";
     this.#stateEl = document.createElement("span");
     this.#stateEl.className = "pane-state";
-    const spacer = document.createElement("span");
-    spacer.className = "pane-spacer";
+    const actions = document.createElement("div");
+    actions.className = "pane-actions";
+    this.#pin = pinButton(() => this.binding.sessionFile ? sessionSummary(this.binding.sessionFile) ?? null : null);
     const close = document.createElement("button");
     close.textContent = "✕";
     close.title = "Close pane (shortcut editable in Settings)";
+    close.className = "pane-close";
+    close.setAttribute("aria-label", "Close pane");
     close.addEventListener("click", (event) => {
       event.stopPropagation();
       closePane(this.id);
     });
-    header.append(this.#titleEl, this.#stateEl, spacer, close);
+    actions.append(close, this.#pin);
+    header.append(this.#titleEl, this.#stateEl, actions);
 
     this.#body = document.createElement("div");
     this.#body.className = "pane-body";
@@ -632,7 +640,7 @@ class Pane {
     rendererWarning.title = "GPU renderer unavailable: box and block glyphs may have seams";
     const showRendererWarning = () => {
       this.el.dataset.renderer = "dom";
-      if (!rendererWarning.isConnected) header.insertBefore(rendererWarning, spacer);
+      if (!rendererWarning.isConnected) header.insertBefore(rendererWarning, actions);
     };
     if (shouldUseDomFallbackForSoftwareWebgl()) {
       showRendererWarning();
@@ -796,6 +804,10 @@ class Pane {
       layout.focused = this.id;
       renderSidebar();
       save();
+    }
+    if (expandedPaneId && expandedPaneId !== this.id) {
+      expandedPaneId = this.id;
+      renderLayout(true);
     }
     this.term.focus();
   }
@@ -1053,8 +1065,10 @@ class Pane {
   }
 
   renderHeader(): void {
-    const title = this.binding.title ?? "no session";
     const sessionFile = this.binding.sessionFile ?? "";
+    const session = sessionFile ? sessionSummary(sessionFile) ?? null : null;
+    const title = this.binding.title ?? "no session";
+    syncPinButton(this.#pin, session);
     if (this.#titleEl.textContent !== title) this.#titleEl.textContent = title;
     if (this.#titleEl.title !== sessionFile) this.#titleEl.title = sessionFile;
     if (this.binding.runtimeId && this.#stateEl.textContent !== "") this.#stateEl.textContent = "";
@@ -1259,6 +1273,7 @@ function closePane(paneId: string): void {
   if (ids.length === 4 && pane.binding.keepEmpty) return;
   if (ids.length <= 1 || (ids.length === 4 && !alreadyClosed)) {
     pane.bind({ ...emptyBinding(), keepEmpty: true });
+    if (expandedPaneId) renderLayout();
     return;
   }
   const removed = ids.length === 4 && alreadyClosed ? [alreadyClosed, paneId] : [paneId];
@@ -1549,9 +1564,18 @@ function swapPanes(aId: string, bId: string): void {
   b.bind(binding);
 }
 
-function renderLayout(): void {
+function togglePaneFocus(): void {
+  const pane = focusedPane();
+  if (!pane || leaves().length < 2) return;
+  expandedPaneId = expandedPaneId ? null : pane.id;
+  renderLayout(true);
+  pane.focus();
+}
+
+function renderLayout(preservePaneFocus = false): void {
   closePaneMenu();
-  const tree = layout.tree;
+  if (!preservePaneFocus) expandedPaneId = null;
+  const tree: LayoutNode = expandedPaneId ? { kind: "leaf", pane: expandedPaneId } : layout.tree;
   const ids = leaves(tree);
   for (const pane of panes.values()) pane.markNeedsRepaint();
   panesEl.replaceChildren(buildNode(tree));
@@ -1643,17 +1667,6 @@ function startResize(
 
 // ---------------------------------------------------------------- sidebar
 
-function sessionRelative(iso: string): string {
-  const then = new Date(iso).getTime();
-  if (!Number.isFinite(then)) return "";
-  const minutes = Math.round((Date.now() - then) / 60000);
-  if (minutes < 1) return "now";
-  if (minutes < 60) return `${minutes}m`;
-  const hours = Math.round(minutes / 60);
-  if (hours < 24) return `${hours}h`;
-  const days = Math.round(hours / 24);
-  return days < 30 ? `${days}d` : `${Math.round(days / 30)}mo`;
-}
 
 /** Mobile's fallback for a session whose accent the extension cannot resolve. */
 const ACCENT_FALLBACK = "#808080";
@@ -1673,17 +1686,16 @@ function acknowledgeCompletion(runtimeId: string | null): boolean {
 }
 
 
-/** Updates the existing pin control without replacing its focused row node. */
-function syncPinButton(record: SidebarRowRecord): void {
-  const session = record.snapshot;
+/** Update pin state in place so either surface retains keyboard focus. */
+function syncPinButton(button: HTMLButtonElement, session: SessionSummaryLike | null): void {
   const pinned = session !== null && pinnedSessions.some((entry) => entry.path === session.path);
   const title = session ? `${pinned ? "Unpin" : "Pin"} chat` : "Waiting for session file";
-  if (record.pin.disabled !== (session === null)) record.pin.disabled = session === null;
-  if (record.pin.getAttribute("aria-pressed") !== String(pinned)) {
-    record.pin.setAttribute("aria-pressed", String(pinned));
+  if (button.disabled !== (session === null)) button.disabled = session === null;
+  if (button.getAttribute("aria-pressed") !== String(pinned)) {
+    button.setAttribute("aria-pressed", String(pinned));
   }
-  if (record.pin.title !== title) record.pin.title = title;
-  if (record.pin.getAttribute("aria-label") !== title) record.pin.setAttribute("aria-label", title);
+  if (button.title !== title) button.title = title;
+  if (button.getAttribute("aria-label") !== title) button.setAttribute("aria-label", title);
 }
 
 function createSidebarRow(kind: "runtime" | "session"): SidebarRowRecord {
@@ -1768,8 +1780,6 @@ function updateRuntimeSidebarRow(
   runtime: RuntimeInfo,
   title: string,
   cwd: string,
-  ownerId: string | undefined,
-  folderView: boolean,
   snapshot: SessionSummaryLike | null,
 ): void {
   record.runtime = runtime;
@@ -1794,16 +1804,15 @@ function updateRuntimeSidebarRow(
         : "none"
     : "none";
   updateSidebarRowName(record, title, indicator);
-  const sub = ownerId ? ownerId.replace("p", "pane ") : folderView ? "" : cwd.replace(/^\/home\/[^/]+/, "~");
+  const sub = cwd.replace(/^\/home\/[^/]+/, "~") || "/";
   updateSidebarRowSub(record, `runtime\u0000${sub}`, sub);
   record.dragPayload.runtimeId = runtime.id;
-  syncPinButton(record);
+  syncPinButton(record.pin, record.snapshot);
 }
 
 function updateRecentSidebarRow(
   record: SidebarRowRecord,
   session: SessionSummaryLike,
-  folderView: boolean,
 ): void {
   record.runtime = null;
   record.session = session;
@@ -1813,28 +1822,12 @@ function updateRecentSidebarRow(
   const rowTitle = `${session.cwd}\n${session.path}`;
   if (record.element.title !== rowTitle) record.element.title = rowTitle;
   updateSidebarRowName(record, session.title || session.cwd, "none");
-  const relative = sessionRelative(session.updatedAt);
-  const cwd = session.cwd.split("/").filter(Boolean).pop() ?? "/";
-  const subKey = `session\u0000${relative}\u0000${folderView ? "" : cwd}`;
-  if (record.subKey !== subKey) {
-    record.subKey = subKey;
-    record.sub.replaceChildren();
-    const time = document.createElement("span");
-    time.className = "time";
-    time.textContent = relative;
-    record.sub.append(time);
-    if (!folderView) {
-      const cwdEl = document.createElement("span");
-      cwdEl.className = "cwd";
-      cwdEl.textContent = cwd;
-      record.sub.append(cwdEl);
-    }
-    record.sub.hidden = false;
-  }
+  const cwd = session.cwd.replace(/^\/home\/[^/]+/, "~") || "/";
+  updateSidebarRowSub(record, `session\u0000${cwd}`, cwd);
   record.dragPayload.path = session.path;
   record.dragPayload.cwd = session.cwd;
   record.dragPayload.title = session.title;
-  syncPinButton(record);
+  syncPinButton(record.pin, record.snapshot);
 }
 
 function reconcileChildren(container: HTMLElement, desired: HTMLElement[]): void {
@@ -1899,6 +1892,7 @@ function renderSidebar(): void {
     return;
   }
   renderPending = false;
+  for (const pane of panes.values()) pane.renderHeader();
 
   const query = searchEl.value.trim().toLowerCase();
   const folderView = sidebarFolderView();
@@ -1921,11 +1915,6 @@ function renderSidebar(): void {
   });
   if (pinsChanged) savePins();
   const pinnedPaths = new Set(pinnedSessions.map((session) => session.path));
-  const paneForRuntime = new Map<string, string>();
-  for (const pane of panes.values()) {
-    const runtimeId = pane.binding.runtimeId;
-    if (runtimeId && !paneForRuntime.has(runtimeId)) paneForRuntime.set(runtimeId, pane.id);
-  }
   const liveRuntimes = query
     ? runtimes.filter((runtime) => {
       const summary = runtime.sessionFile ? sessionSummary(runtime.sessionFile) : undefined;
@@ -1936,10 +1925,10 @@ function renderSidebar(): void {
   for (const session of sessions) candidates.set(session.path, session);
   const recent = [...candidates.values()].filter((session) =>
     !liveFiles.has(session.path) &&
-    (!query || sessionByPath.has(session.path) ||
-      `${session.title} ${session.cwd}`.toLowerCase().includes(query)),
-  );
+    (!query || `${session.title} ${session.cwd}`.toLowerCase().includes(query)),
+  ).sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt) || a.path.localeCompare(b.path));
 
+  const loadedRows: SidebarRowRecord[] = [];
   const pinnedRows: SidebarRowRecord[] = [];
   const otherRows: SidebarRowRecord[] = [];
   const activeKeys = new Set<string>();
@@ -1956,15 +1945,15 @@ function renderSidebar(): void {
     const snapshot = runtime.sessionFile
       ? summary ?? pinnedSessions.find((entry) => entry.path === runtime.sessionFile) ?? null
       : null;
-    updateRuntimeSidebarRow(record, runtime, title, cwd, paneForRuntime.get(runtime.id), folderView, snapshot);
-    (runtime.sessionFile && pinnedPaths.has(runtime.sessionFile) ? pinnedRows : otherRows).push(record);
+    updateRuntimeSidebarRow(record, runtime, title, cwd, snapshot);
+    loadedRows.push(record);
   }
   for (const session of recent) {
     const key = `session:${session.path}`;
     activeKeys.add(key);
     const record = sidebarRows.get(key) ?? createSidebarRow("session");
     sidebarRows.set(key, record);
-    updateRecentSidebarRow(record, session, folderView);
+    updateRecentSidebarRow(record, session);
     (pinnedPaths.has(session.path) ? pinnedRows : otherRows).push(record);
   }
   for (const [key, record] of sidebarRows) {
@@ -1973,7 +1962,7 @@ function renderSidebar(): void {
     sidebarRows.delete(key);
   }
 
-  const rows = [...pinnedRows, ...otherRows];
+  const rows = [...loadedRows, ...pinnedRows, ...otherRows];
   const desiredTopLevel: HTMLElement[] = [];
   if (rows.length === 0) {
     if (!sidebarEmpty) {
@@ -2000,7 +1989,22 @@ function renderSidebar(): void {
       desiredTopLevel.push(folder.element);
     }
   } else {
-    desiredTopLevel.push(...rows.map((row) => row.element));
+    for (const [label, sectionRows] of [
+      ["Loaded", loadedRows],
+      ["Pinned", pinnedRows],
+      ["Recent", otherRows],
+    ] as const) {
+      if (sectionRows.length === 0) continue;
+      let heading = sidebarHeadings.get(label);
+      if (!heading) {
+        heading = document.createElement("h2");
+        heading.className = "session-section-heading";
+        sidebarHeadings.set(label, heading);
+      }
+      const text = label === "Loaded" ? `${label} · ${sectionRows.length}` : label;
+      if (heading.textContent !== text) heading.textContent = text;
+      desiredTopLevel.push(heading, ...sectionRows.map((row) => row.element));
+    }
   }
   for (const [cwd, folder] of sidebarFolders) {
     if (rowsByFolder.has(cwd)) continue;
@@ -2558,10 +2562,8 @@ initializeHotkeys((action) => {
   else if (action === "fontReset") setCellSize(CELL_SIZE);
   else if (action === "splitLayout") splitLayout();
   else if (action === "closePane") closePane(layout.focused ?? "");
-  else if (action.startsWith("focusPane")) {
-    const paneId = leaves()[Number(action.slice("focusPane".length)) - 1];
-    if (paneId) panes.get(paneId)?.focus();
-  } else if (action.startsWith("selectSpace")) {
+  else if (action === "togglePaneFocus") togglePaneFocus();
+  else if (action.startsWith("selectSpace")) {
     const spaceId = [...spaces.keys()][Number(action.slice("selectSpace".length)) - 1];
     if (spaceId) switchSpace(spaceId);
   }

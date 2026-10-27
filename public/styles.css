@@ -1,9 +1,5 @@
-/* Styling mirrors omp-mobile (omp-mobile/public/styles.css): same OLED palette,
-   same mono chrome, same card/button/input treatments. Deliberate deviations,
-   both about density rather than looks: control heights are scaled for a mouse
-   (mobile sizes exist for fingers) and the sidebar row card drops mobile's
-   hover lift so dense lists do not shimmer. Tokens below are copied verbatim
-   from the mobile stylesheet and should be updated together with it. */
+/* Shared OLED palette and mono chrome with omp-mobile. Desktop session rows
+   are compact and borderless; section spacing provides the visual hierarchy. */
 
 /* Mobile's UI/terminal font, vendored for the same reason as the nerd face
    below: the look must not depend on what the host has installed. */
@@ -246,7 +242,6 @@ select:focus-visible {
   display: flex;
   flex-direction: column;
   background: var(--panel);
-  border-right: 1px solid var(--line);
   padding: 10px 10px 8px;
   overflow: hidden;
 }
@@ -259,8 +254,7 @@ select:focus-visible {
   padding: 0 0 8px;
 }
 
-/* Search and its collapse button share a row; the input keeps the block width
-   minus the button. */
+/* Search, new-session and settings controls share one compact row. */
 .side-search {
   display: flex;
   gap: 6px;
@@ -300,6 +294,7 @@ select:focus-visible {
 
 .side-settings {
   flex: 1 1 auto;
+  min-width: 0;
   min-height: 0;
   overflow-y: auto;
 }
@@ -307,15 +302,33 @@ select:focus-visible {
 .settings-heading {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 8px;
+  padding: 0 0 8px;
+  border-bottom: 1px solid var(--line-muted);
 }
 
 .settings-heading .side-action {
-  width: auto;
+  display: grid;
+  place-items: center;
+  flex: 0 0 26px;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+}
+
+.settings-heading .side-action:hover {
+  background: var(--panel-soft);
+  color: var(--text);
 }
 
 .settings-heading h2 {
-  font: 700 13px var(--mono);
+  margin: 0;
+  color: var(--text);
+  font: 700 16px/1.25 var(--mono);
 }
 
 .sidebar-toggle:focus-visible,
@@ -412,12 +425,25 @@ select:focus-visible {
 .side-list {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 0;
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
   padding: 0 0 10px;
+}
+
+.session-section-heading {
+  flex: 0 0 auto;
+  margin: 14px 8px 5px;
+  color: var(--muted);
+  font: 700 10px/18px var(--mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.session-section-heading:first-child {
+  margin-top: 4px;
 }
 
 .side-list::-webkit-scrollbar {
@@ -433,15 +459,16 @@ select:focus-visible {
   background: var(--dim);
 }
 
-/* Status moved here when the app header was removed: the sidebar bottom keeps
-   connection failures visible. Long messages truncate instead of widening the
-   sidebar; warn recolours the line (and, via sidebar.ts, the collapsed-state
-   expand control) so a daemon failure is not silently hidden. */
+/* Keep connection failures visible without a routine live-count footer. */
 .side-status {
   flex: 0 0 auto;
   padding: 8px 2px 0;
   border-top: 1px solid var(--line);
   overflow: hidden;
+}
+
+.side-status:has(.status[data-kind="ok"]) {
+  display: none;
 }
 
 .status {
@@ -457,28 +484,33 @@ select:focus-visible {
   color: var(--warn);
 }
 
-/* Sidebar settings choices. Motion is bound by src/working-indicator.ts;
-   System defers to the platform reduced-motion signal. */
+/* Settings uses light section separators and label-first controls, so the
+   hierarchy stays clear without turning each preference into a card. */
 .motion-control {
   display: flex;
-  align-items: center;
-  flex-wrap: wrap;
+  flex-direction: column;
+  align-items: stretch;
   gap: 4px;
-  padding: 6px 0 2px;
 }
 
 .motion-label {
   color: var(--muted);
-  font: 10px/18px var(--mono);
+  font: 11px/1.4 var(--mono);
+}
+
+.settings-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
 }
 
 .motion-control button {
-  padding: 3px 7px;
+  padding: 4px 8px;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: var(--panel-raised);
   color: var(--dim);
-  font: 600 10px/12px var(--mono);
+  font: 600 10px/1.3 var(--mono);
   letter-spacing: 0.04em;
   text-transform: uppercase;
   cursor: pointer;
@@ -502,44 +534,72 @@ select:focus-visible {
   outline-offset: 1px;
 }
 
-/* Session limit control (Settings → Session limit), wired by
-   src/runtime-limit.ts. It borrows the other settings rows' shape: a small
-   heading, one-line help, an input row, and a status line under it. The restart
-   block only appears when the daemon reports the saved limit cannot apply yet,
-   so it is boxed and warn-coloured to stand out from the passive rows. */
-.runtime-limit {
+.settings-group {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding-top: 12px;
+  gap: 7px;
+  min-width: 0;
+  padding-top: 10px;
+  border-top: 1px solid var(--line-muted);
 }
 
-.runtime-limit h3 {
-  margin: 0;
-  font: 700 12px var(--mono);
+.settings-heading + .settings-group {
+  border-top: 0;
 }
 
-.runtime-limit-help {
+.settings-group + .settings-group {
+  margin-top: 16px;
+}
+
+.settings-group > h3 {
+  margin: 0 0 1px;
+  color: var(--text);
+  font: 700 11px/1.4 var(--mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.settings-status,
+.runtime-limit-help,
+.shortcut-help,
+.shortcut-message {
   margin: 0;
   color: var(--muted);
   font: 10px/1.5 var(--mono);
 }
 
-.runtime-limit-row {
+.runtime-limit {
   display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.runtime-limit-help,
+.shortcut-help {
+  color: var(--dim);
+}
+
+.runtime-limit-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  gap: 4px;
+  gap: 5px 6px;
+}
+
+.runtime-limit-row label {
+  grid-column: 1 / -1;
 }
 
 .runtime-limit-row input {
   width: 100%;
   min-width: 0;
-  padding: 5px 7px;
+  padding: 6px 8px;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: var(--bg);
   color: var(--text);
-  font: 10px var(--mono);
+  font: 11px var(--mono);
 }
 
 .runtime-limit-row input:focus {
@@ -550,12 +610,12 @@ select:focus-visible {
 .runtime-limit-row button,
 .runtime-limit-restart button {
   flex: 0 0 auto;
-  padding: 5px 7px;
+  padding: 6px 9px;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: var(--panel-raised);
   color: var(--muted);
-  font: 10px var(--mono);
+  font: 10px/1.3 var(--mono);
   cursor: pointer;
   transition:
     border-color 0.15s ease,
@@ -578,10 +638,10 @@ select:focus-visible {
 .runtime-limit-restart {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding: 8px;
-  border: 1px solid var(--warn);
-  border-radius: 8px;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 2px 0 2px 8px;
+  border-left: 2px solid var(--warn);
 }
 
 .runtime-limit-restart[hidden] {
@@ -589,7 +649,6 @@ select:focus-visible {
 }
 
 .runtime-limit-restart button {
-  align-self: flex-start;
   border-color: var(--warn);
   color: var(--warn);
 }
@@ -601,22 +660,7 @@ select:focus-visible {
 }
 
 .shortcut-settings {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding-top: 12px;
-}
-
-.shortcut-settings h3 {
-  margin: 0;
-  font: 700 12px var(--mono);
-}
-
-.shortcut-help,
-.shortcut-message {
-  margin: 0;
-  color: var(--muted);
-  font: 10px/1.5 var(--mono);
+  gap: 7px;
 }
 
 .shortcut-message[data-kind="warn"] {
@@ -626,13 +670,48 @@ select:focus-visible {
 #shortcut-list {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
+  min-width: 0;
+}
+.shortcut-group {
+  min-width: 0;
+}
+
+.shortcut-group > summary {
+  padding: 2px 0;
+  color: var(--text);
+  font: 700 10px/1.4 var(--mono);
+  cursor: pointer;
+}
+
+.shortcut-group > summary::marker {
+  color: var(--accent);
+}
+
+.shortcut-group > summary:hover {
+  color: var(--accent);
+}
+
+.shortcut-group > summary:focus-visible {
+  outline: 1px solid var(--effort-accent);
+  outline-offset: 2px;
+}
+
+.shortcut-group-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  margin: 3px 0 0 5px;
+  padding-left: 8px;
+  border-left: 1px solid var(--line-muted);
 }
 
 .shortcut-row {
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 4px;
+  min-width: 0;
 }
 
 .shortcut-row label {
@@ -644,28 +723,31 @@ select:focus-visible {
 .shortcut-actions {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: 5px;
+  min-width: 0;
 }
 
 .shortcut-editor input {
+  flex: 1 1 auto;
   width: 100%;
   min-width: 0;
-  padding: 5px 7px;
+  padding: 6px 8px;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: var(--bg);
+  color: var(--text);
   font: 10px var(--mono);
 }
 
 .shortcut-editor button,
 .shortcut-actions button {
   flex: 0 0 auto;
-  padding: 5px 7px;
+  padding: 6px 8px;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: var(--panel-raised);
   color: var(--muted);
-  font: 10px var(--mono);
+  font: 10px/1.3 var(--mono);
   cursor: pointer;
 }
 
@@ -676,17 +758,36 @@ select:focus-visible {
 }
 
 .shortcut-actions {
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.shortcut-actions button {
+  min-width: 0;
+  min-height: 30px;
+  padding: 5px;
+  line-height: 1.3;
+  text-align: center;
+  white-space: normal;
 }
 
 /* Sidebar resize handle: the panes' divider pattern, applied to the sidebar
    edge. Keyboard users get it as a separator (arrow keys / Home / End). */
 .sidebar-resizer {
-  flex: 0 0 6px;
-  background: transparent;
+  flex: 0 0 1px;
+  position: relative;
+  z-index: 3;
+  background: var(--line);
   cursor: col-resize;
   touch-action: none;
   transition: background 90ms linear;
+}
+
+.sidebar-resizer::after {
+  content: "";
+  position: absolute;
+  inset: 0 -3px;
 }
 
 .sidebar-resizer:hover,
@@ -741,76 +842,29 @@ body.session-dragging * {
   will-change: transform;
 }
 
-/* Collapsed state: the sidebar and its resizer are hidden and this strip is the
-   only way back in. Full height, so the hit area is the whole edge. */
-.sidebar-expand {
-  flex: 0 0 16px;
-  display: inline-grid;
-  place-items: center;
-  padding: 0;
-  background: var(--panel);
-  color: var(--muted);
-  border: 0;
-  border-right: 1px solid var(--line);
-  cursor: pointer;
-  font: 12px/1 var(--mono);
-  transition:
-    background-color 0.15s ease,
-    color 0.15s ease;
-}
 
-.sidebar-expand:hover {
-  background: var(--panel-raised);
-  color: var(--text);
-}
-
-.sidebar-expand[data-kind="warn"] {
-  color: var(--warn);
-}
-
-.sidebar-expand[hidden] {
-  display: none;
-}
-
-/* Loaded sessions have a grey surface; alive processes also keep their session
-   accent edge. Saved rows are outlined on the sidebar colour. */
 .row {
   position: relative;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  grid-template-areas:
-    "name name"
-    "sub actions";
-  align-items: center;
-  column-gap: 7px;
-  row-gap: 3px;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: "sub" "name";
+  align-content: center;
+  gap: 2px;
+  flex: 0 0 52px;
+  height: 52px;
   width: 100%;
-  text-align: left;
-  padding: 7px 9px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 5px;
   background: transparent;
+  text-align: left;
   cursor: pointer;
   user-select: none;
-  transition: border-color 0.16s ease;
 }
 
-.row.loaded {
-  background: var(--panel-raised);
-}
-
-.row:hover {
-  border-color: var(--dim);
-}
-
-/* After .row:hover on purpose: same specificity, so the live edge keeps the
-   session colour while the other sides dim on hover. padding-left is one less
-   than the base so the 2px edge does not shift the content. The colour is the
-   mobile extension's resolved session accent; a session whose accent cannot be
-   resolved (or has no extension state at all) falls back to mobile's grey. */
-.row.live {
-  border-left: 2px solid var(--row-accent, #808080);
-  padding-left: 8px;
+.row:hover,
+.row:focus-within {
+  background: var(--panel-soft);
 }
 
 .row .name {
@@ -820,9 +874,9 @@ body.session-dragging * {
   justify-content: space-between;
   gap: 7px;
   min-width: 0;
-  min-height: 22px;
+  min-height: 18px;
   overflow: hidden;
-  font: 700 12px var(--mono);
+  font: 400 12px/18px var(--mono);
 }
 
 .row .name .title {
@@ -954,33 +1008,38 @@ body.session-dragging * {
 
 .row .sub {
   grid-area: sub;
-  display: flex;
-  align-items: baseline;
-  gap: 6px;
-  min-width: 0;
-  color: var(--dim);
-  font: 10px var(--mono);
-}
-
-.row .sub .cwd {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  color: var(--muted);
+  font: 10px/16px var(--mono);
 }
 
-/* Actions share the metadata line, leaving the full title width available. */
+/* Secondary controls only overlay the directory on hover or keyboard focus. */
 .row-actions {
-  grid-area: actions;
-  display: grid;
-  grid-template-columns: 22px 22px;
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  display: flex;
   align-items: center;
   gap: 3px;
+  background: var(--panel-soft);
+  opacity: 0;
+  pointer-events: none;
 }
 
-.row .sub {
-  overflow: hidden;
+.row:hover .row-actions,
+.row:focus-within .row-actions {
+  opacity: 1;
+  pointer-events: auto;
 }
+
+.row:hover .sub,
+.row:focus-within .sub {
+  padding-right: 52px;
+}
+
 
 .row .pin,
 .row .kill {
@@ -997,8 +1056,6 @@ body.session-dragging * {
 }
 
 .row .pin {
-  grid-column: 2;
-  grid-row: 1;
   display: inline-grid;
   place-items: center;
   width: 22px;
@@ -1006,7 +1063,8 @@ body.session-dragging * {
   flex: 0 0 22px;
 }
 
-.row .pin svg {
+.row .pin svg,
+.pane-header .pin svg {
   width: 14px;
   height: 14px;
   fill: none;
@@ -1016,13 +1074,12 @@ body.session-dragging * {
   stroke-linejoin: round;
 }
 
-.row .pin[aria-pressed="true"] svg path:first-child {
+.row .pin[aria-pressed="true"] svg path:first-child,
+.pane-header .pin[aria-pressed="true"] svg path:first-child {
   fill: currentColor;
 }
 
 .row .kill {
-  grid-column: 1;
-  grid-row: 1;
   width: 22px;
   height: 22px;
   font-size: 12px;
@@ -1035,8 +1092,8 @@ body.session-dragging * {
   opacity: 1;
 }
 
-.row .pin[aria-pressed="true"] {
-  opacity: 1;
+.row .pin[aria-pressed="true"],
+.pane-header .pin[aria-pressed="true"] {
   color: var(--accent);
 }
 
@@ -1044,7 +1101,8 @@ body.session-dragging * {
   color: var(--text);
 }
 
-.row .pin:disabled {
+.row .pin:disabled,
+.pane-header .pin:disabled {
   color: var(--dim);
   cursor: default;
 }
@@ -1069,14 +1127,27 @@ body.session-dragging * {
   min-height: 0;
 }
 
-/* Split divider: the only gutter between sibling panes, so the gap the
-   container used to provide now lives here and doubles as the resize handle. */
+/* One shared line separates panes. The invisible hit area overlaps their edges
+   so resizing stays easy without reserving a visible gutter. */
 .divider {
-  flex: 0 0 6px;
+  flex: 0 0 1px;
   position: relative;
   z-index: 2;
-  background: transparent;
+  background: var(--line);
   transition: background 90ms linear;
+}
+
+.divider::after {
+  content: "";
+  position: absolute;
+}
+
+.divider-split-row::after {
+  inset: 0 -3px;
+}
+
+.divider-split-col::after {
+  inset: -3px 0;
 }
 
 .divider-split-row {
@@ -1109,15 +1180,15 @@ body.session-dragging * {
   min-width: 0;
   min-height: 0;
   background: var(--panel);
-  border: 1px solid var(--line);
+  border: 0;
   overflow: hidden;
-  transition: border-color 0.16s ease;
 }
 
 /* The drop target stays neutral (white) and nothing else: no tint or halo marks
    a pane that merely holds focus, so a pane looks identical whatever has it. */
 .pane.drop {
-  border-color: var(--text);
+  outline: 1px solid var(--text);
+  outline-offset: -1px;
 }
 
 .pane-header {
@@ -1128,11 +1199,27 @@ body.session-dragging * {
   flex: 0 0 auto;
   padding: 0 6px 0 10px;
   background: rgba(10, 11, 13, 0.95);
-  border-bottom: 1px solid var(--line);
+  border: 0;
   font: 12px var(--mono);
   user-select: none;
   cursor: grab;
 }
+
+.pane-actions {
+  display: flex;
+  gap: 3px;
+  flex: 0 0 auto;
+  margin-left: auto;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.pane-header:hover .pane-actions,
+.pane-header:focus-within .pane-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
 
 .pane-title {
   flex: 0 1 auto;
@@ -1151,9 +1238,6 @@ body.session-dragging * {
   white-space: nowrap;
 }
 
-.pane-spacer {
-  flex: 1;
-}
 
 .pane-header button {
   display: inline-grid;
@@ -1161,15 +1245,12 @@ body.session-dragging * {
   width: 22px;
   height: 22px;
   padding: 0;
-  background: var(--panel-raised);
+  background: transparent;
   color: var(--muted);
-  border: 1px solid var(--line);
-  border-radius: 6px;
+  border: 0;
   cursor: pointer;
   font: 11px var(--mono);
-  transition:
-    border-color 0.15s ease,
-    color 0.15s ease;
+  transition: color 0.15s ease;
 }
 
 .pane-menu {
@@ -1208,8 +1289,11 @@ body.session-dragging * {
 }
 
 .pane-header button:hover {
-  border-color: var(--effort-accent);
   color: var(--text);
+}
+
+.pane-header .pane-close:hover {
+  color: var(--danger);
 }
 
 .pane-body {

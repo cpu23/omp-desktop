@@ -11,10 +11,7 @@ export const HOTKEY_ACTIONS = [
   { id: "fontReset", label: "Reset font size", defaultValue: "Ctrl+0; Meta+0" },
   { id: "splitLayout", label: "Split layout", defaultValue: "Ctrl+Shift+E; Meta+Shift+E" },
   { id: "closePane", label: "Close focused pane", defaultValue: "Ctrl+Shift+X; Meta+Shift+X" },
-  { id: "focusPane1", label: "Focus pane 1", defaultValue: "" },
-  { id: "focusPane2", label: "Focus pane 2", defaultValue: "" },
-  { id: "focusPane3", label: "Focus pane 3", defaultValue: "" },
-  { id: "focusPane4", label: "Focus pane 4", defaultValue: "" },
+  { id: "togglePaneFocus", label: "Toggle pane focus", defaultValue: "Ctrl+Shift+F; Meta+Shift+F" },
   { id: "selectSpace1", label: "Select space 1", defaultValue: "Alt+1" },
   { id: "selectSpace2", label: "Select space 2", defaultValue: "Alt+2" },
   { id: "selectSpace3", label: "Select space 3", defaultValue: "Alt+3" },
@@ -395,6 +392,19 @@ export function initializeHotkeys(runAction: (action: HotkeyAction) => void): vo
   };
 
   if (list) {
+    const groups = new Map<string, HTMLElement>();
+    for (const label of ["Panes", "Spaces", "Terminal text"]) {
+      const group = document.createElement("details");
+      group.className = "shortcut-group";
+      group.open = label === "Panes";
+      const heading = document.createElement("summary");
+      heading.textContent = label;
+      const rows = document.createElement("div");
+      rows.className = "shortcut-group-rows";
+      group.append(heading, rows);
+      list.append(group);
+      groups.set(label, rows);
+    }
     for (const { id, label } of HOTKEY_ACTIONS) {
       const row = document.createElement("div");
       row.className = "shortcut-row";
@@ -422,7 +432,8 @@ export function initializeHotkeys(runAction: (action: HotkeyAction) => void): vo
       });
       editor.append(input, clear);
       row.append(labelElement, editor);
-      list.append(row);
+      const group = id.startsWith("font") ? "Terminal text" : id.startsWith("selectSpace") ? "Spaces" : "Panes";
+      groups.get(group)!.append(row);
       inputs.set(id, input);
     }
   }
@@ -442,7 +453,6 @@ export function initializeHotkeys(runAction: (action: HotkeyAction) => void): vo
     persist({ ...DEFAULT_SHORTCUTS });
   });
   if (loaded.invalidStored) say("Saved shortcuts were invalid; defaults are active. Review and save to replace them.", "warn");
-  else say("Use Ctrl, Meta, Alt, or Shift on the first key. Separate sequence presses with commas; use semicolons for alternatives.");
 
   const capture = (event: KeyboardEvent): void => {
     if (isEditableTarget(event.target) || event.isComposing || event.keyCode === 229 ||

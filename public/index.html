@@ -10,115 +10,123 @@
   <body>
     <!-- Space tabs sit above the pane workspace. #status remains in the sidebar
          so connection failures stay visible, and #build stays in the DOM (hidden)
-         for the client's bundle-reload check. The resizer and collapsed-state
-         expand control are wired by src/sidebar.ts; motion settings are wired
-         by src/working-indicator.ts; the session limit is wired by
-         src/runtime-limit.ts. -->
+         for the client's bundle-reload check. The resizer is wired by
+         src/sidebar.ts; motion settings are wired by src/working-indicator.ts;
+         the session limit is wired by src/runtime-limit.ts. -->
     <div id="app">
       <aside id="sidebar">
         <div class="side-block side-search">
           <input id="search" type="search" placeholder="search sessions…" autocomplete="off" spellcheck="false" />
+          <button id="new-session" class="sidebar-toggle" type="button" title="Start a new omp session in the focused pane" aria-label="Start a new omp session in the focused pane">+</button>
           <button id="sidebar-settings-open" class="sidebar-toggle" type="button" title="Sidebar settings" aria-label="Sidebar settings" aria-controls="sidebar-settings" aria-expanded="false">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68h.08a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09A1.65 1.65 0 0 0 15 4.6a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.32 9v.08a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09A1.65 1.65 0 0 0 19.4 15Z" />
               <circle cx="12" cy="12" r="3" />
             </svg>
           </button>
-          <button
-            id="sidebar-collapse"
-            class="sidebar-toggle"
-            type="button"
-            title="Collapse sidebar"
-            aria-expanded="true"
-            aria-controls="sidebar"
-          >
-            «
-          </button>
-        </div>
-        <div id="sidebar-new-session" class="side-block">
-          <button id="new-session" class="side-action" title="Start a new omp session in the focused pane">
-            + new session
-          </button>
         </div>
         <div id="session-list" class="side-list"></div>
         <section id="sidebar-settings" class="side-settings" aria-label="Sidebar settings" hidden>
-          <div class="side-block settings-heading">
-            <button id="sidebar-settings-back" class="side-action" type="button">← Back</button>
+          <header class="settings-heading">
+            <button
+              id="sidebar-settings-back"
+              class="side-action settings-back"
+              type="button"
+              title="Back to the sidebar"
+              aria-label="Back to the sidebar"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+                <path d="M19 12H5m7 7-7-7 7-7" />
+              </svg>
+            </button>
             <h2>Settings</h2>
-          </div>
-          <div class="motion-control" role="group" aria-label="Sidebar view">
-            <span class="motion-label">View</span>
-            <button type="button" data-sidebar-view="sessions">Sessions</button>
-            <button type="button" data-sidebar-view="folders">Folders</button>
-          </div>
-          <div class="motion-control" role="group" aria-label="Working indicator motion">
-            <span class="motion-label">Motion</span>
-            <button
-              type="button"
-              data-motion="system"
-              title="Follow the system reduced-motion setting"
-            >
-              System
-            </button>
-            <button type="button" data-motion="animate" title="Always animate the working indicator">
-              On
-            </button>
-            <button type="button" data-motion="reduce" title="Freeze the working indicator">
-              Off
-            </button>
-          </div>
-          <div class="motion-control" role="group" aria-label="Completion notifications">
-            <span class="motion-label">Completions</span>
-            <button
-              id="notifications-toggle"
-              type="button"
-              aria-pressed="false"
-              title="Enable or disable completion notifications"
-            >
-              Off
-            </button>
-          </div>
-          <span id="notifications-status" class="motion-label" role="status" aria-live="polite">
-            Completion notifications are off.
-          </span>
-          <div class="runtime-limit" role="group" aria-label="Session limit">
-            <h3>Session limit</h3>
-            <p id="runtime-limit-help" class="runtime-limit-help">
-              How many omp sessions the daemon may run at once (16 by default). The daemon owns this
-              limit; a change that cannot apply to the running daemon needs a restart.
-            </p>
-            <div class="runtime-limit-row">
-              <label class="motion-label" for="runtime-limit-input">Max sessions</label>
-              <input
-                id="runtime-limit-input"
-                type="number"
-                inputmode="numeric"
-                min="1"
-                step="1"
-                value="16"
-                autocomplete="off"
-                aria-describedby="runtime-limit-help"
-              />
-              <button id="runtime-limit-save" type="button">Save</button>
+          </header>
+          <section class="settings-group" aria-labelledby="settings-appearance-heading">
+            <h3 id="settings-appearance-heading">Appearance</h3>
+            <div class="motion-control" role="group" aria-label="Sidebar view">
+              <span class="motion-label">Session view</span>
+              <div class="settings-options">
+                <button type="button" data-sidebar-view="sessions">Sessions</button>
+                <button type="button" data-sidebar-view="folders">Folders</button>
+              </div>
             </div>
-            <span id="runtime-limit-status" class="shortcut-message" role="status" aria-live="polite"></span>
-            <div id="runtime-limit-restart" class="runtime-limit-restart" hidden>
-              <p id="runtime-limit-restart-warning" class="runtime-limit-warn">
-                Restart to apply the saved limit. Restarting stops every running session: in-progress work and
-                unsaved input are lost. Sessions with a saved transcript resume automatically afterwards; their
-                running processes are not preserved.
+            <div class="motion-control" role="group" aria-label="Working indicator motion">
+              <span class="motion-label">Motion</span>
+              <div class="settings-options">
+                <button
+                  type="button"
+                  data-motion="system"
+                  title="Follow the system reduced-motion setting"
+                >
+                  System
+                </button>
+                <button type="button" data-motion="animate" title="Always animate the working indicator">
+                  On
+                </button>
+                <button type="button" data-motion="reduce" title="Freeze the working indicator">
+                  Off
+                </button>
+              </div>
+            </div>
+          </section>
+          <section class="settings-group" aria-labelledby="settings-notifications-heading">
+            <h3 id="settings-notifications-heading">Notifications</h3>
+            <div class="motion-control" role="group" aria-label="Completion notifications">
+              <span class="motion-label">When a session completes</span>
+              <div class="settings-options">
+                <button
+                  id="notifications-toggle"
+                  type="button"
+                  aria-pressed="false"
+                  title="Enable or disable completion notifications"
+                >
+                  Off
+                </button>
+              </div>
+            </div>
+            <span id="notifications-status" class="settings-status" role="status" aria-live="polite">
+              Completion notifications are off.
+            </span>
+          </section>
+          <section class="settings-group" aria-labelledby="settings-sessions-heading">
+            <h3 id="settings-sessions-heading">Sessions</h3>
+            <div class="runtime-limit" role="group" aria-label="Session limit">
+              <p id="runtime-limit-help" class="runtime-limit-help">
+                Maximum concurrent omp sessions (16 by default). Some changes require a daemon restart.
               </p>
-              <button
-                id="runtime-limit-restart-button"
-                type="button"
-                aria-describedby="runtime-limit-restart-warning"
-              >
-                Restart now
-              </button>
+              <div class="runtime-limit-row">
+                <label class="motion-label" for="runtime-limit-input">Max running sessions</label>
+                <input
+                  id="runtime-limit-input"
+                  type="number"
+                  inputmode="numeric"
+                  min="1"
+                  step="1"
+                  value="16"
+                  autocomplete="off"
+                  aria-describedby="runtime-limit-help"
+                />
+                <button id="runtime-limit-save" type="button">Save</button>
+              </div>
+              <span id="runtime-limit-status" class="shortcut-message" role="status" aria-live="polite"></span>
+              <div id="runtime-limit-restart" class="runtime-limit-restart" hidden>
+                <p id="runtime-limit-restart-warning" class="runtime-limit-warn">
+                  Restart to apply the saved limit. Restarting stops every running session: in-progress work and
+                  unsaved input are lost. Sessions with a saved transcript resume automatically afterwards; their
+                  running processes are not preserved.
+                </p>
+                <button
+                  id="runtime-limit-restart-button"
+                  type="button"
+                  aria-describedby="runtime-limit-restart-warning"
+                >
+                  Restart now
+                </button>
+              </div>
             </div>
-          </div>
-          <div class="shortcut-settings">
-            <h3>Keyboard shortcuts</h3>
+          </section>
+          <section class="settings-group shortcut-settings" aria-labelledby="settings-shortcuts-heading">
+            <h3 id="settings-shortcuts-heading">Keyboard shortcuts</h3>
             <p class="shortcut-help">
               Use Ctrl, Meta, Alt, or Shift on the first key. Separate sequence presses with commas and alternatives with semicolons.
             </p>
@@ -128,7 +136,7 @@
               <button id="shortcut-reset" type="button">Reset defaults</button>
             </div>
             <p id="shortcut-message" class="shortcut-message" role="status" aria-live="polite"></p>
-          </div>
+          </section>
         </section>
         <div class="side-status">
           <span id="status" class="status" data-kind="idle">connecting…</span>
@@ -147,17 +155,6 @@
         tabindex="0"
         title="Drag to resize · double-click to reset"
       ></div>
-      <button
-        id="sidebar-expand"
-        class="sidebar-expand"
-        type="button"
-        title="Expand sidebar"
-        aria-expanded="false"
-        aria-controls="sidebar"
-        hidden
-      >
-        »
-      </button>
       <section id="workspace">
         <nav class="space-bar" aria-label="Browser spaces">
           <div id="space-tabs" role="tablist" aria-label="Spaces"></div>
