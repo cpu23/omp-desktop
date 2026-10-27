@@ -7,6 +7,8 @@ stop its session.
 ![OMP Desktop with compact session groups and a two-pane workspace](docs/images/workspace-v0.1.4.png)
 
 Captured at **3840 × 2160** using illustrative sample sessions in an isolated workspace.
+These captures use the supported DOM renderer with WebGL disabled in the capture browser; terminal text was
+inspected at native pixel size for baseline alignment and legibility.
 
 ## Requirements
 
