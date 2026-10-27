@@ -26,7 +26,7 @@ describe("desktop shortcut settings", () => {
     const validation = validateShortcutBindings({
       splitLayout: "Ctrl+K",
       closePane: "Ctrl+K",
-      focusPane1: "",
+      togglePaneFocus: "",
     });
     expect(validation.errors).toHaveLength(1);
   });

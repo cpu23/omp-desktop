@@ -175,6 +175,9 @@ Pane title bars retain their compact single-line layout without a bottom border.
 match the sidebar controls; they appear on hover or keyboard focus. Pinning updates both surfaces;
 closing a pane only detaches its view and does not stop the session.
 
+Settings separates **Appearance**, **Notifications**, **Sessions**, and **Keyboard shortcuts**. Shortcut editors
+are grouped into Panes, Spaces, and Terminal text; expand a group to edit its bindings, then save.
+
 The sidebar supports search, pins and opt-in completion notifications. Working/completion indicators and
 per-session accents come from the optional extension, not terminal output. Notifications default to off,
 require OS/browser permission, and are not replayed when reopening the app. Browsers deliver web notifications
@@ -212,10 +215,16 @@ Default shortcuts:
 | Reset font | `Ctrl+0`, `Meta+0` |
 | Split layout | `Ctrl+Shift+E`, `Meta+Shift+E` |
 | Close focused pane | `Ctrl+Shift+X`, `Meta+Shift+X` |
+| Toggle selected pane focus | `Ctrl+Shift+F`, `Meta+Shift+F` |
 
 Edit shortcuts under sidebar **Settings → Keyboard shortcuts**. Use commas for sequence presses and semicolons
 for alternative bindings (for example, `Ctrl+K, Ctrl+1`). The first press must include Ctrl, Meta, Alt or Shift;
 sequences time out after one second. Bindings are stored in the local browser/app profile.
+
+Toggle pane focus expands the selected terminal to fill the workspace; press the same shortcut again to restore
+the split layout and its divider ratios. Other sessions keep running with their existing processes. This
+temporary presentation does not change the saved layout; switching spaces, changing the layout, or reloading
+returns to the split view. A single-pane space is unchanged by the toggle.
 
 ## Configuration
 

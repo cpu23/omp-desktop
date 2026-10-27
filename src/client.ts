@@ -110,6 +110,8 @@ const panes = new Map<string, Pane>();
 const spaces = new Map<string, StoredLayout>();
 let layout: StoredLayout = { tree: { kind: "leaf", pane: "p1" }, panes: {}, focused: "p1" };
 let activeSpaceId = "s1";
+/** Temporary presentation only; never replace or persist the split tree. */
+let expandedPaneId: string | null = null;
 spaces.set(activeSpaceId, layout);
 let spaceSeq = 1;
 /** True after local restoration or the initial compatible daemon reconciliation. */
@@ -803,6 +805,10 @@ class Pane {
       renderSidebar();
       save();
     }
+    if (expandedPaneId && expandedPaneId !== this.id) {
+      expandedPaneId = this.id;
+      renderLayout(true);
+    }
     this.term.focus();
   }
 
@@ -1267,6 +1273,7 @@ function closePane(paneId: string): void {
   if (ids.length === 4 && pane.binding.keepEmpty) return;
   if (ids.length <= 1 || (ids.length === 4 && !alreadyClosed)) {
     pane.bind({ ...emptyBinding(), keepEmpty: true });
+    if (expandedPaneId) renderLayout();
     return;
   }
   const removed = ids.length === 4 && alreadyClosed ? [alreadyClosed, paneId] : [paneId];
@@ -1557,9 +1564,18 @@ function swapPanes(aId: string, bId: string): void {
   b.bind(binding);
 }
 
-function renderLayout(): void {
+function togglePaneFocus(): void {
+  const pane = focusedPane();
+  if (!pane || leaves().length < 2) return;
+  expandedPaneId = expandedPaneId ? null : pane.id;
+  renderLayout(true);
+  pane.focus();
+}
+
+function renderLayout(preservePaneFocus = false): void {
   closePaneMenu();
-  const tree = layout.tree;
+  if (!preservePaneFocus) expandedPaneId = null;
+  const tree: LayoutNode = expandedPaneId ? { kind: "leaf", pane: expandedPaneId } : layout.tree;
   const ids = leaves(tree);
   for (const pane of panes.values()) pane.markNeedsRepaint();
   panesEl.replaceChildren(buildNode(tree));
@@ -2546,10 +2562,8 @@ initializeHotkeys((action) => {
   else if (action === "fontReset") setCellSize(CELL_SIZE);
   else if (action === "splitLayout") splitLayout();
   else if (action === "closePane") closePane(layout.focused ?? "");
-  else if (action.startsWith("focusPane")) {
-    const paneId = leaves()[Number(action.slice("focusPane".length)) - 1];
-    if (paneId) panes.get(paneId)?.focus();
-  } else if (action.startsWith("selectSpace")) {
+  else if (action === "togglePaneFocus") togglePaneFocus();
+  else if (action.startsWith("selectSpace")) {
     const spaceId = [...spaces.keys()][Number(action.slice("selectSpace".length)) - 1];
     if (spaceId) switchSpace(spaceId);
   }
