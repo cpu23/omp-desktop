@@ -1926,7 +1926,7 @@ function renderSidebar(): void {
   for (const session of sessions) candidates.set(session.path, session);
   const recent = [...candidates.values()].filter((session) =>
     !liveFiles.has(session.path) &&
-    (!query || `${session.title} ${session.cwd}`.toLowerCase().includes(query)),
+    (!query || sessionByPath.has(session.path) || `${session.title} ${session.cwd}`.toLowerCase().includes(query)),
   ).sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt) || a.path.localeCompare(b.path));
 
   const loadedRows: SidebarRowRecord[] = [];

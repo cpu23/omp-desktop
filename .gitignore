@@ -55,4 +55,6 @@ secrets/
 /scripts/render-demo.ts
 /scripts/launch-film/
 /docs/media/
-/docs/images/
+/docs/images/*
+!/docs/images/workspace-v0.1.4.png
+!/docs/images/settings-v0.1.4.png
