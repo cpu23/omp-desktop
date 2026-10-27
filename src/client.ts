@@ -198,6 +198,7 @@ type SidebarFolderRecord = {
 const sidebarRows = new Map<string, SidebarRowRecord>();
 const sidebarFolders = new Map<string, SidebarFolderRecord>();
 const sidebarHeadings = new Map<string, HTMLElement>();
+const collapsedSidebarSections = new Set<string>();
 let sidebarFolderSeq = 0;
 let sidebarEmpty: HTMLElement | null = null;
 
@@ -1997,13 +1998,22 @@ function renderSidebar(): void {
       if (sectionRows.length === 0) continue;
       let heading = sidebarHeadings.get(label);
       if (!heading) {
-        heading = document.createElement("h2");
+        heading = document.createElement("button");
         heading.className = "session-section-heading";
+        heading.setAttribute("type", "button");
+        heading.addEventListener("click", () => {
+          if (collapsedSidebarSections.has(label)) collapsedSidebarSections.delete(label);
+          else collapsedSidebarSections.add(label);
+          renderSidebar();
+        });
         sidebarHeadings.set(label, heading);
       }
-      const text = label === "Loaded" ? `${label} · ${sectionRows.length}` : label;
+      const expanded = !collapsedSidebarSections.has(label);
+      const text = `${expanded ? "▾" : "▸"} ${label === "Loaded" ? `${label} · ${sectionRows.length}` : label}`;
       if (heading.textContent !== text) heading.textContent = text;
-      desiredTopLevel.push(heading, ...sectionRows.map((row) => row.element));
+      heading.setAttribute("aria-expanded", String(expanded));
+      desiredTopLevel.push(heading);
+      if (expanded) desiredTopLevel.push(...sectionRows.map((row) => row.element));
     }
   }
   for (const [cwd, folder] of sidebarFolders) {
