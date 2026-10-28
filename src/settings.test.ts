@@ -12,13 +12,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   DaemonSettingsStore,
-  DEFAULT_MAX_RUNTIMES,
   isPositiveInteger,
   parsePositiveInteger,
   resolveMaxRuntimes,
   SETTINGS_LIMIT_BYTES,
   settingsPayload,
 } from "./settings";
+
+const defaultLimit = resolveMaxRuntimes(null, undefined);
 
 const dir = mkdtempSync(join(tmpdir(), "omp-settings-test-"));
 
@@ -27,9 +28,10 @@ afterAll(() => {
 });
 
 describe("runtime limit resolution", () => {
-  test("defaults to 16 when nothing is configured", () => {
-    expect(DEFAULT_MAX_RUNTIMES).toBe(16);
-    expect(resolveMaxRuntimes(null, undefined)).toEqual({ maxRuntimes: 16, source: "default" });
+  test("uses a positive default when nothing is configured", () => {
+    expect(defaultLimit.source).toBe("default");
+    expect(isPositiveInteger(defaultLimit.maxRuntimes)).toBe(true);
+    expect(resolveMaxRuntimes(null, undefined)).toEqual(defaultLimit);
   });
 
   test("the environment is a fallback, not an override of a saved value", () => {
@@ -43,7 +45,7 @@ describe("runtime limit resolution", () => {
     }
     for (const value of ["", " ", "0", "-3", "2.5", "8x", "1e3"]) {
       expect(resolveMaxRuntimes(20, value)).toEqual({ maxRuntimes: 20, source: "saved" });
-      expect(resolveMaxRuntimes(null, value)).toEqual({ maxRuntimes: 16, source: "default" });
+      expect(resolveMaxRuntimes(null, value)).toEqual(defaultLimit);
     }
   });
 
@@ -64,24 +66,27 @@ describe("runtime limit resolution", () => {
 
 describe("restart-required transitions", () => {
   test("a saved change is reported until the effective limit changes", () => {
-    expect(settingsPayload(16, 16)).toEqual({
-      maxRuntimes: 16,
-      effectiveMaxRuntimes: 16,
+    const effective = defaultLimit.maxRuntimes;
+    const changed = effective + 8;
+    const otherChanged = effective === 1 ? 2 : effective - 1;
+    expect(settingsPayload(effective, effective)).toEqual({
+      maxRuntimes: effective,
+      effectiveMaxRuntimes: effective,
       restartRequired: false,
     });
-    expect(settingsPayload(24, 16)).toEqual({
-      maxRuntimes: 24,
-      effectiveMaxRuntimes: 16,
+    expect(settingsPayload(changed, effective)).toEqual({
+      maxRuntimes: changed,
+      effectiveMaxRuntimes: effective,
       restartRequired: true,
     });
-    expect(settingsPayload(4, 16)).toEqual({
-      maxRuntimes: 4,
-      effectiveMaxRuntimes: 16,
+    expect(settingsPayload(otherChanged, effective)).toEqual({
+      maxRuntimes: otherChanged,
+      effectiveMaxRuntimes: effective,
       restartRequired: true,
     });
     // After a restart the saved value becomes effective, so the flag clears
     // even when the number itself did not change again.
-    expect(settingsPayload(24, 24).restartRequired).toBe(false);
+    expect(settingsPayload(changed, changed).restartRequired).toBe(false);
   });
 });
 

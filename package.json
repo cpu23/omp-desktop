@@ -9,12 +9,12 @@
   "scripts": {
     "start": "bun run src/daemon.ts",
     "dev": "bun --watch run src/daemon.ts",
-    "app": "tauri dev",
-    "app:build": "tauri build --no-bundle",
+    "app": "bun run scripts/app.ts dev",
+    "app:build": "bun run scripts/app.ts build",
     "app:install": "bun run app:build && bun run scripts/install-app.ts",
-    "app:webkit:build": "bun run scripts/build-webkit.ts",
     "smoke": "bun run scripts/smoke.ts",
     "smoke:images": "bun run scripts/image-smoke.ts",
+    "smoke:native": "bun scripts/native-smoke.ts",
     "release:check": "bun run scripts/release-check.ts",
     "test": "bun test",
     "check": "bunx tsc --noEmit -p tsconfig.json"

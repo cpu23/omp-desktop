@@ -1,15 +1,16 @@
 # OMP Desktop
 
-Use [OMP](https://omp.sh) coding sessions in a browser or optional native Linux window. Organize chats into
-spaces with up to four terminal panes; switch between live and saved sessions. Closing a pane or window does not
-stop its session.
+Use [OMP](https://omp.sh) coding sessions in a browser or native desktop window. Linux uses a GTK4/WebKitGTK 6
+shell; macOS and Windows retain Tauri. Organize chats into spaces with up to four terminal panes; switch between
+live and saved sessions. Closing a pane or window does not stop its session.
 
 ![OMP Desktop with compact session groups and a two-pane workspace](docs/images/workspace-v0.1.4.png)
 
 ## Requirements
 
 - Bun 1.3+, Git and OMP 18.x on `PATH`; run `omp` once to complete provider setup.
-- Linux is required for the native window. The browser client needs a host that supports Bun and PTYs.
+- Linux native builds additionally require Rust 1.92+, pkg-config, a C toolchain, and GTK4/WebKitGTK 6 development
+  packages; see the [native setup guide](docs/guide.md#native-linux-app). Native macOS/Windows builds use Tauri.
 
 ## Quick setup
 
@@ -21,9 +22,9 @@ git clone https://github.com/cpu23/omp-desktop.git && cd omp-desktop && bun inst
 
 Open <http://127.0.0.1:4180> and select **+** beside the session search. Keep the terminal running.
 
-For a native window, install [Rust](https://rustup.rs) and the [Linux build packages](docs/guide.md#native-linux-app),
-then run `bun run app:install` from `omp-desktop/` in another terminal. Open **OMP Desktop** from the application
-menu; the daemon above must remain running.
+For a native Linux window, install [Rust 1.92+](https://rustup.rs) and the [system GTK4/WebKitGTK 6 development
+packages](docs/guide.md#native-linux-app), then run `bun run app:install` from `omp-desktop/`. Open **OMP Desktop**
+from your application menu; the daemon above must remain running.
 
 > The desktop API has no authentication. Keep it on loopback. Setup does not change your OMP configuration.
 
@@ -56,6 +57,14 @@ menu; the daemon above must remain running.
 
 </details>
 
+## Unreleased
+
+- Replace the Linux GTK3/Tauri shell with a GTK4/WebKitGTK 6 shell using system packages, while retaining Tauri
+  on macOS and Windows.
+- Require Rust 1.92+, GTK 4.14+, and WebKitGTK 6.0 2.44+ development APIs to build the Linux shell; no private
+  WebKit runtime builder or prefix is supported.
+
+
 ## v0.1.4
 
 - Use the installed OMP application logo for native completion notifications instead of the generic system icon.
@@ -76,10 +85,9 @@ menu; the daemon above must remain running.
 
 ## CI and local checks
 
-GitHub Actions runs on pull requests, pushes to `main`, and manual dispatch. Its Ubuntu Linux jobs install the
-locked Bun dependencies, run the TypeScript check and existing tests, smoke-test the daemon APIs in a disposable
-home/state directory, and build the native Tauri app. The daemon smoke does not need OMP, provider credentials,
-or any sibling checkout.
+GitHub Actions runs the locked Bun install, typecheck and behavioral tests, then builds/tests and exercises the
+GTK4/WebKitGTK 6 Linux shell with an isolated daemon and WebKitWebDriver. macOS and Windows jobs retain coverage
+for the Tauri shell. The daemon fixture does not need OMP, provider credentials, or any sibling checkout.
 
 Run the same JavaScript checks locally:
 
@@ -90,14 +98,24 @@ bun test
 bun run scripts/daemon-smoke.ts
 ```
 
-The broader `bun run smoke` additionally exercises the OMP PTY integration and requires OMP 18.x on `PATH`.
-For a native Linux build, install Rust stable and the [Linux packages listed in the guide](docs/guide.md#native-linux-app),
-then run:
+The broader `bun run smoke` exercises the OMP PTY integration and requires OMP 18.x on `PATH`. For a native Linux
+build, install Rust 1.92+ and the [system packages listed in the guide](docs/guide.md#native-linux-app), then run:
 
 ```sh
-cargo build --manifest-path src-tauri/Cargo.toml --locked --release
 bun run app:build
 ```
+
+`bun run smoke:native` exercises the real GTK4 shell against isolated daemons and profiles. Its full `--images` run
+uses WebDriver for navigation and DOM inspection, and real `xdotool` OS events on a private Xvfb display for
+keyboard/pointer scenarios; no JavaScript click or keyboard-event fallback is used. Notification permission, delivery,
+click-to-focus, deduplication, UI Off behavior, profile persistence, and same-application activation run in the normal
+production binary through AT-SPI inspection and real X11 events, not a controlled automation session. `--input-only`
+runs the focused real-PTY input/ACK check. `--notification-only` isolates the normal-mode notification and persistence
+scenarios. `--images-only --require-gpu` is a separate current-display WebKit/WebGL image check; run it on Wayland for
+Wayland rendering evidence. It does not test keyboard or pointer input. X11 Xvfb input and Wayland rendering are
+separate coverage levels; real file-manager drag-and-drop remains distinct manual hardware coverage. Some WebKitGTK
+builds mask the WebGL renderer label as “Apple GPU”; the smoke does not treat that label alone as hardware evidence and
+corroborates masked NVIDIA rendering with the owned WebKit process's driver mappings/device descriptors and `nvidia-smi` process data.
 
 ## Releases and links
 

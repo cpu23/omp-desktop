@@ -1,11 +1,8 @@
 // Connection page for the omp-desktop shell.
 //
-// This page is served locally by Tauri (tauri://localhost). The only native
-// call it makes is the narrowly scoped `connect` command (src/shell.rs): that
-// verifies the daemon through GET /api/build, starts the omp-desktopd systemd
-// user unit when nothing is listening, and then navigates this window to the
-// daemon origin, where the existing web client runs same-origin. The remote
-// daemon page has no access to any of this.
+// The Linux shell serves this embedded page as omp://bootstrap/index.html and
+// exposes only the reply-capable ompDesktopConnect bridge here. Tauri retains
+// its narrowly scoped `connect` command on macOS and Windows.
 (function () {
   "use strict";
 
@@ -15,11 +12,16 @@
   var running = false;
 
   function invoke(command) {
-    var internals = window.__TAURI_INTERNALS__;
-    if (!internals || typeof internals.invoke !== "function") {
-      return Promise.reject(new Error("Tauri IPC is unavailable on this page"));
+    var webkit = window.webkit;
+    var handler = webkit && webkit.messageHandlers && webkit.messageHandlers.ompDesktopConnect;
+    if (handler && typeof handler.postMessage === "function") {
+      return handler.postMessage(command);
     }
-    return internals.invoke(command);
+    var internals = window.__TAURI_INTERNALS__;
+    if (internals && typeof internals.invoke === "function") {
+      return internals.invoke(command);
+    }
+    return Promise.reject(new Error("Native connection bridge is unavailable on this page"));
   }
 
   function describe(error) {
@@ -27,6 +29,15 @@
       return error.message;
     }
     return String(error);
+  }
+
+  function showFailure(error) {
+    statusEl.textContent = "Cannot reach the omp-desktop daemon.";
+    detailEl.textContent = describe(error);
+    detailEl.hidden = false;
+    retryEl.disabled = false;
+    retryEl.hidden = false;
+    running = false;
   }
 
   function connect() {
@@ -48,19 +59,17 @@
         running = false;
       },
       function (error) {
-        statusEl.textContent = "Cannot reach the omp-desktop daemon.";
-        detailEl.textContent = describe(error);
-        detailEl.hidden = false;
-        retryEl.disabled = false;
-        retryEl.hidden = false;
-        running = false;
+        showFailure(error);
       }
     );
   }
 
   retryEl.addEventListener("click", connect);
 
-  if (document.readyState === "loading") {
+  var recoveryError = window.__OMP_DESKTOP_RECOVERY_ERROR__;
+  if (typeof recoveryError === "string" && recoveryError.length > 0) {
+    showFailure(recoveryError);
+  } else if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", connect);
   } else {
     connect();

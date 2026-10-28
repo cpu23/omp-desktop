@@ -15,9 +15,9 @@ type NativeFileDrop = {
 };
 
 /**
- * Wires browser file drops and the Tauri native drop event to one pane. Native
- * drops are hit-tested at their window position so each path goes to its target
- * pane, even though Tauri does not deliver the OS drop as a DOM `drop` event.
+ * Wires browser file drops and the native shell event to one pane. Native drops
+ * are hit-tested at their CSS viewport position so each path goes to its target
+ * pane, even though the shell does not deliver the OS drop as a DOM `drop` event.
  */
 export function wireFileDrop(element: HTMLElement, options: FileDropOptions): () => void {
   const onNativeDrop = (event: Event): void => {
@@ -26,8 +26,7 @@ export function wireFileDrop(element: HTMLElement, options: FileDropOptions): ()
     const paths = safePaths(detail.paths);
     if (paths.length === 0) return;
 
-    const scale = window.devicePixelRatio || 1;
-    const target = document.elementFromPoint(detail.x / scale, detail.y / scale);
+    const target = document.elementFromPoint(detail.x, detail.y);
     if (target && element.contains(target)) options.onPaths(paths);
   };
 

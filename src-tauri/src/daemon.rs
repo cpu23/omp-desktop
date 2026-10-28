@@ -1,4 +1,4 @@
-//! Shell-side connection logic for the bundled connection page.
+//! Shell-side daemon connection logic.
 //!
 //! The shell never proxies the daemon. Once the daemon answers, the main window
 //! navigates to its origin and the existing web client talks to it directly
@@ -12,7 +12,7 @@ use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use tauri::Url;
+use url::Url;
 
 /// Must match the daemon default (`OMP_DESKTOP_PORT` in `src/daemon.ts`).
 pub const DEFAULT_PORT: u16 = 4180;
@@ -42,25 +42,23 @@ pub fn daemon_url(port: u16) -> Url {
     Url::parse(&format!("http://127.0.0.1:{port}/")).expect("loopback URL is always valid")
 }
 
-/// The bundled connection page. On Linux Tauri serves `frontendDist` from the
-/// `tauri://localhost` custom protocol; `tauri.localhost` is the Windows form
-/// and is accepted so the policy stays correct if this shell is ever ported.
+/// The bundled connection page used by the retained Tauri shells.
+#[cfg(not(target_os = "linux"))]
 pub fn is_bootstrap_url(url: &Url) -> bool {
     (url.scheme() == "tauri" && url.host_str() == Some("localhost"))
         || (matches!(url.scheme(), "http" | "https") && url.host_str() == Some("tauri.localhost"))
 }
-
-/// The daemon origin: loopback IPv4 on the configured port, nothing else.
+#[cfg(not(target_os = "linux"))]
 pub fn is_daemon_url(url: &Url, port: u16) -> bool {
     url.scheme() == "http"
         && url.host_str() == Some("127.0.0.1")
         && url.port_or_known_default() == Some(port)
 }
-
+#[cfg(not(target_os = "linux"))]
 pub fn is_shell_url(url: &Url, port: u16) -> bool {
     is_bootstrap_url(url) || is_daemon_url(url, port)
 }
-
+#[cfg(not(target_os = "linux"))]
 pub fn is_web_url(url: &Url) -> bool {
     matches!(url.scheme(), "http" | "https")
 }
@@ -120,6 +118,7 @@ pub fn connect_blocking(port: u16) -> Result<String, String> {
     ))
 }
 
+#[derive(Debug)]
 enum ProbeError {
     /// Nothing is listening (or the connection failed before a response).
     Unreachable(String),
@@ -243,5 +242,176 @@ fn run_bounded(program: &str, args: &[&str], timeout: Duration) -> Result<Output
             return Err(format!("{program} did not finish within {}s", timeout.as_secs()));
         }
         thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::net::TcpListener;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn response_server(response: Vec<u8>) -> u16 {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind test HTTP server");
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept probe");
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(&response);
+        });
+        port
+    }
+
+    fn http_response(status: &str, body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn loopback_probe_accepts_the_daemon_build_response() {
+        let port = response_server(http_response("200 OK", r#"{"build":"abc1234"}"#));
+        assert_eq!(probe_build(port).unwrap(), "abc1234");
+    }
+
+    #[test]
+    fn loopback_probe_rejects_malformed_non_daemon_and_oversized_responses() {
+        for response in [
+            http_response("200 OK", "{not-json"),
+            http_response("503 Service Unavailable", r#"{"build":"abc1234"}"#),
+            http_response("200 OK", &format!(r#"{{"build":"{}"}}"#, "a".repeat(16_500))),
+        ] {
+            let port = response_server(response);
+            assert!(matches!(probe_build(port), Err(ProbeError::NotDaemon(_))));
+        }
+    }
+
+    #[test]
+    fn loopback_probe_bounds_a_peer_that_never_sends_a_response() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind test HTTP server");
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept probe");
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            thread::sleep(PROBE_READ_TIMEOUT + Duration::from_millis(250));
+        });
+
+        assert!(matches!(probe_build(port), Err(ProbeError::Unreachable(_))));
+        server.join().expect("timeout server exits");
+    }
+
+    #[test]
+    fn occupied_non_daemon_endpoint_is_not_replaced_by_the_service() {
+        let port = response_server(http_response("404 Not Found", "not a daemon"));
+        let error = connect_blocking(port).unwrap_err();
+        assert!(error.contains("was not started because the port is taken"));
+    }
+
+    #[cfg(unix)]
+    mod service_start_tests {
+        use super::*;
+        use std::ffi::OsString;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Mutex;
+
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+        struct FixtureDirectory(PathBuf);
+
+        impl FixtureDirectory {
+            fn new() -> Self {
+                let serial = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir().join(format!(
+                    "omp-desktop-daemon-test-{}-{serial}",
+                    std::process::id()
+                ));
+                fs::create_dir_all(&path).expect("create fixture directory");
+                Self(path)
+            }
+        }
+
+        impl Drop for FixtureDirectory {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        struct EnvironmentGuard {
+            name: &'static str,
+            previous: Option<OsString>,
+        }
+
+        impl EnvironmentGuard {
+            fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+                let previous = std::env::var_os(name);
+                std::env::set_var(name, value);
+                Self { name, previous }
+            }
+        }
+
+        impl Drop for EnvironmentGuard {
+            fn drop(&mut self) {
+                if let Some(value) = self.previous.take() {
+                    std::env::set_var(self.name, value);
+                } else {
+                    std::env::remove_var(self.name);
+                }
+            }
+        }
+
+        fn install_systemctl(directory: &Path) {
+            let bin = directory.join("bin");
+            fs::create_dir_all(&bin).expect("create fixture bin directory");
+            let executable = bin.join("systemctl");
+            fs::write(
+                &executable,
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$OMP_FIXTURE_SYSTEMCTL_LOG\"\nexit 0\n",
+            )
+            .expect("write fixture systemctl");
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+                .expect("make fixture systemctl executable");
+        }
+
+        #[test]
+        fn service_start_invokes_the_systemctl_user_unit_command() {
+            let _lock = ENV_LOCK.lock().expect("environment test lock");
+            let directory = FixtureDirectory::new();
+            let log = directory.0.join("systemctl.log");
+            install_systemctl(&directory.0);
+            let path = directory.0.join("bin");
+            let _path = EnvironmentGuard::set("PATH", path.as_os_str());
+            let _log = EnvironmentGuard::set("OMP_FIXTURE_SYSTEMCTL_LOG", log.as_os_str());
+
+            start_systemd_unit().expect("fixture service start succeeds");
+            assert_eq!(
+                fs::read_to_string(&log).expect("fixture wrote its invocation"),
+                "--user start omp-desktopd\n"
+            );
+        }
+
+        #[test]
+        fn unreachable_custom_port_never_invokes_the_service_starter() {
+            let _lock = ENV_LOCK.lock().expect("environment test lock");
+            let directory = FixtureDirectory::new();
+            let log = directory.0.join("systemctl.log");
+            install_systemctl(&directory.0);
+            let path = directory.0.join("bin");
+            let _path = EnvironmentGuard::set("PATH", path.as_os_str());
+            let _log = EnvironmentGuard::set("OMP_FIXTURE_SYSTEMCTL_LOG", log.as_os_str());
+
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve custom port");
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            let error = connect_blocking(port).unwrap_err();
+            assert!(error.contains("custom ports do not start omp-desktopd"));
+            assert!(!log.exists(), "systemctl must not be run for an unreachable custom port");
+        }
     }
 }

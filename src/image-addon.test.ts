@@ -15,11 +15,8 @@ function fixture(rows = 10) {
   const term = new HeadlessTerminal({ cols: 20, rows, scrollback: 10, allowProposedApi: true });
   Object.assign(term, { onRender: () => ({ dispose() {} }) });
   const addon = loadImageAddon(term as unknown as Terminal);
-  const storage = (addon as unknown as { _storage: {
-    addImage(image: unknown): void;
-    _images: Map<number, { marker: { isDisposed: boolean; line: number }; orig: unknown }>;
-    reset(): void;
-  } })._storage;
+  const addonInternals = addon as unknown as { _storage: { addImage(image: unknown): void } };
+  const storage = addonInternals._storage;
   return { term, addon, storage };
 }
 
@@ -27,29 +24,33 @@ for (const action of ["reset", "dispose"] as const) {
   test(`closes a bitmap when ${action} precedes deferred marker reconciliation`, async () => {
     const previousWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
     const previousBitmap = Object.getOwnPropertyDescriptor(globalThis, "ImageBitmap");
-    Object.defineProperty(globalThis, "window", { configurable: true, value: { ImageBitmap: Bitmap } });
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        ImageBitmap: Bitmap,
+        document: { createElement: () => ({ getContext: () => ({ drawImage() {} }) }) },
+      },
+    });
     Object.defineProperty(globalThis, "ImageBitmap", { configurable: true, value: Bitmap });
     const { term, addon, storage } = fixture();
     try {
       const image = new Bitmap();
       storage.addImage(image);
-      expect(storage._images.size).toBe(1);
-      const marker = storage._images.values().next().value!.marker;
+      expect(addon.getImageAtBufferCell(0, 0)).toBeTruthy();
       let ran = false;
       const handler = term.parser.registerCsiHandler({ final: "z" }, () => {
         // This runs inside the same parser batch, before onWriteParsed.
-        expect(marker.isDisposed).toBe(true);
-        expect(storage._images.size).toBe(1);
-        if (action === "reset") storage.reset();
+        expect(addon.getImageAtBufferCell(0, 0)).toBeTruthy();
+        if (action === "reset") addon.reset();
         else addon.dispose();
         ran = true;
         return true;
       });
       await new Promise<void>(resolve => term.write("\x1b[3;1H\x1b[M\x1b[z", resolve));
       expect(ran).toBe(true);
-      expect(storage._images.size).toBe(0);
+      expect(addon.getImageAtBufferCell(0, 0)).toBeUndefined();
       expect(image.closed).toBe(1);
-      storage.reset();
+      addon.reset();
       addon.dispose();
       expect(image.closed).toBe(1);
       handler.dispose();
@@ -67,25 +68,35 @@ for (const action of ["reset", "dispose"] as const) {
 test("releases a bitmap when text overwrites every image tile", async () => {
   const previousWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
   const previousBitmap = Object.getOwnPropertyDescriptor(globalThis, "ImageBitmap");
-  Object.defineProperty(globalThis, "window", { configurable: true, value: { ImageBitmap: Bitmap } });
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: {
+      ImageBitmap: Bitmap,
+      document: { createElement: () => ({ getContext: () => ({ drawImage() {} }) }) },
+    },
+  });
   Object.defineProperty(globalThis, "ImageBitmap", { configurable: true, value: Bitmap });
   const { term, addon, storage } = fixture();
   try {
     const image = new Bitmap();
     storage.addImage(image);
-    const marker = storage._images.values().next().value!.marker;
-    expect(marker.isDisposed).toBe(false);
+    expect(addon.getImageAtBufferCell(0, 0)).toBeTruthy();
+    expect(addon.getImageAtBufferCell(0, 1)).toBeTruthy();
+    expect(addon.getImageAtBufferCell(0, 2)).toBeTruthy();
 
     await new Promise<void>(resolve => term.write("\x1b[3;1Hghi", resolve));
-    expect(storage._images.size).toBe(1);
+    expect(addon.getImageAtBufferCell(0, 0)).toBeTruthy();
+    expect(addon.getImageAtBufferCell(0, 1)).toBeTruthy();
+    expect(addon.getImageAtBufferCell(0, 2)).toBeUndefined();
     expect(image.closed).toBe(0);
 
     await new Promise<void>(resolve => term.write("\x1b[1;1Habc\x1b[2;1Hdef", resolve));
 
-    expect(marker.isDisposed).toBe(true);
-    expect(storage._images.size).toBe(0);
+    expect(addon.getImageAtBufferCell(0, 0)).toBeUndefined();
+    expect(addon.getImageAtBufferCell(0, 1)).toBeUndefined();
+    expect(addon.getImageAtBufferCell(0, 2)).toBeUndefined();
     expect(image.closed).toBe(1);
-    storage.reset();
+    addon.reset();
     addon.dispose();
     expect(image.closed).toBe(1);
   } finally {
@@ -101,7 +112,13 @@ test("releases a bitmap when text overwrites every image tile", async () => {
 test("retains image pixels in scrollback after its visible tiles are overwritten", async () => {
   const previousWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
   const previousBitmap = Object.getOwnPropertyDescriptor(globalThis, "ImageBitmap");
-  Object.defineProperty(globalThis, "window", { configurable: true, value: { ImageBitmap: Bitmap } });
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: {
+      ImageBitmap: Bitmap,
+      document: { createElement: () => ({ getContext: () => ({ drawImage() {} }) }) },
+    },
+  });
   Object.defineProperty(globalThis, "ImageBitmap", { configurable: true, value: Bitmap });
   const { term, addon, storage } = fixture();
   try {
@@ -110,16 +127,14 @@ test("retains image pixels in scrollback after its visible tiles are overwritten
     storage.addImage(image);
 
     await new Promise<void>(resolve => term.write("\n\n\n\n\n\n\n\n", resolve));
-    const marker = storage._images.values().next().value!.marker;
-    // Verify that the image marker remains in the viewport while its first row is in scrollback.
-    const terminalInternals = term as unknown as { _core: { buffers: { normal: { ybase: number } } } };
-    const normal = terminalInternals._core.buffers.normal;
-    expect(normal.ybase).toBeGreaterThan(8);
-    expect(marker.line).toBeGreaterThanOrEqual(normal.ybase);
+    expect(term.buffer.active.viewportY).toBeGreaterThan(8);
+    expect(addon.getImageAtBufferCell(0, 8)).toBeTruthy();
     await new Promise<void>(resolve => term.write("\x1b[1;1Habc\x1b[2;1Hdef", resolve));
 
-    expect(storage._images.size).toBe(1);
+    expect(addon.getImageAtBufferCell(0, 8)).toBeTruthy();
     expect(image.closed).toBe(0);
+    addon.dispose();
+    expect(image.closed).toBe(1);
   } finally {
     addon.dispose();
     term.dispose();
@@ -133,7 +148,13 @@ test("retains image pixels in scrollback after its visible tiles are overwritten
 test("reclaims overwritten images before cache eviction within one parser write", async () => {
   const previousWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
   const previousBitmap = Object.getOwnPropertyDescriptor(globalThis, "ImageBitmap");
-  Object.defineProperty(globalThis, "window", { configurable: true, value: { ImageBitmap: Bitmap } });
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: {
+      ImageBitmap: Bitmap,
+      document: { createElement: () => ({ getContext: () => ({ drawImage() {} }) }) },
+    },
+  });
   Object.defineProperty(globalThis, "ImageBitmap", { configurable: true, value: Bitmap });
   const { term, addon, storage } = fixture(25);
   const transientImages: Bitmap[] = [];
@@ -156,12 +177,16 @@ test("reclaims overwritten images before cache eviction within one parser write"
     }
     await new Promise<void>(resolve => term.write(data, resolve));
 
-    expect(storage._images.size).toBe(2);
+    expect(addon.getImageAtBufferCell(0, 0)).toBeTruthy();
+    expect(addon.getImageAtBufferCell(0, 13)).toBeTruthy();
     expect(staticImage.closed).toBe(0);
-    expect(transientImages[transientImages.length - 1]!.closed).toBe(0);
-    expect([...storage._images.values()].some(spec => spec.orig === staticImage)).toBe(true);
-    expect([...storage._images.values()].some(spec => spec.orig === transientImages[transientImages.length - 1])).toBe(true);
+    expect(transientImages.at(-1)?.closed).toBe(0);
     for (const image of transientImages.slice(0, -1)) expect(image.closed).toBe(1);
+
+    addon.dispose();
+    expect([staticImage, ...transientImages].map(image => image.closed)).toEqual(
+      Array.from({ length: transientImages.length + 1 }, () => 1),
+    );
   } finally {
     insertion.dispose();
     addon.dispose();

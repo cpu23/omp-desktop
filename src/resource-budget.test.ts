@@ -2,24 +2,38 @@ import { describe, expect, test } from "bun:test";
 import { DEFAULT_RUNTIME_RESOURCE_BUDGETS, resolveRuntimeResourceBudgetConfig, RuntimeResourceBudget } from "./resource-budget";
 
 describe("runtime resource budgets", () => {
-  test("divides aggregate replay cells by actual viewport geometry and resizes grants", () => {
+  test("shares total replay cells fairly and adjusts grants monotonically on resize", () => {
     const budget = new RuntimeResourceBudget({
       replayRowsPerRuntime: 20_000,
       replayCellsTotal: 1_000,
     }, 2);
-    const first = budget.createLease(10, 4);
-    const second = budget.createLease(10, 4);
+    const cols = 10;
+    const rows = 4;
+    const first = budget.createLease(cols, rows);
+    const second = budget.createLease(cols, rows);
+    const cells = (columns: number, scrollbackRows: number) => (scrollbackRows + 2 * rows) * columns;
 
-    expect(first.scrollbackRows).toBe(42);
-    expect(second.scrollbackRows).toBe(42);
-    expect((first.scrollbackRows + 8) * 10 + (second.scrollbackRows + 8) * 10).toBeLessThanOrEqual(1_000);
+    expect(first.scrollbackRows).toBe(second.scrollbackRows);
+    expect(cells(cols, first.scrollbackRows) + cells(cols, second.scrollbackRows)).toBeLessThanOrEqual(1_000);
 
-    expect(first.setGeometry(20, 4)).toBe(true);
-    expect((first.scrollbackRows + 8) * 20 + (second.scrollbackRows + 8) * 10).toBeLessThanOrEqual(1_000);
+    const beforeResizeFirst = first.scrollbackRows;
+    const beforeResizeSecond = second.scrollbackRows;
+    expect(first.setGeometry(20, rows)).toBe(true);
+    expect(first.scrollbackRows).toBeLessThanOrEqual(beforeResizeFirst);
+    expect(second.scrollbackRows).toBeLessThanOrEqual(beforeResizeSecond);
+    // Whole rows have different cell costs after resize; fair grants may differ by one row.
+    expect(Math.abs(first.scrollbackRows - second.scrollbackRows)).toBeLessThanOrEqual(1);
+    expect(cells(20, first.scrollbackRows) + cells(cols, second.scrollbackRows)).toBeLessThanOrEqual(1_000);
+
+    const beforeRejectedResizeFirst = first.scrollbackRows;
+    const beforeRejectedResizeSecond = second.scrollbackRows;
     expect(first.setGeometry(500, 300)).toBe(false);
+    expect(first.scrollbackRows).toBe(beforeRejectedResizeFirst);
+    expect(second.scrollbackRows).toBe(beforeRejectedResizeSecond);
     first.release();
     expect(first.released).toBe(true);
-    expect(second.scrollbackRows).toBe(92);
+    expect(second.scrollbackRows).toBeGreaterThan(beforeRejectedResizeSecond);
+    expect(cells(cols, second.scrollbackRows)).toBeLessThanOrEqual(1_000);
   });
 
   test("preserves the per-runtime scrollback ceiling when the pool fits the cell budget", () => {

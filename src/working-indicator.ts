@@ -1,3 +1,4 @@
+import { isNativeShell } from "./native-shell";
 /**
  * CSS-driven working indicators. Their cadence and shape mirror OMP's braille
  * spinner and 30-cell/s shimmer without per-frame JavaScript, geometry reads or
@@ -28,12 +29,12 @@ function storedMotion(): MotionPreference | null {
 }
 
 /**
- * Unset means On in the shell (functional animation, CLI parity) and System in
- * a browser. `__TAURI_INTERNALS__` is the shell's own global; the client page
- * is identical in both.
+ * Unset means On in native shells (functional animation, CLI parity) and
+ * System in a browser. `isNativeShell()` identifies the shell's capability;
+ * the client page is identical in both.
  */
 function defaultMotion(): MotionPreference {
-  return "__TAURI_INTERNALS__" in window ? "animate" : "system";
+  return isNativeShell() ? "animate" : "system";
 }
 
 let motionPreference = storedMotion() ?? defaultMotion();
