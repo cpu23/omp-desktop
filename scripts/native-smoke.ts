@@ -3,6 +3,7 @@
 import { access, chmod, mkdir, mkdtemp, readFile, readlink, readdir, rm, writeFile } from "node:fs/promises";
 import { createServer as createNetServer, type AddressInfo } from "node:net";
 import { createServer as createHttpServer } from "node:http";
+import { dlopen, FFIType, ptr } from "bun:ffi";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { isRecord } from "../src/guards";
@@ -946,7 +947,7 @@ async function runFrameProbe(
       return countOccurrences(normalizeScreenRows(current), `ACK:${sequence}`) === 1 ? current : false;
     });
     assert(countOccurrences(normalizeScreenRows(output), `ACK:${sequence}`) === 1, "The daemon screen omitted or duplicated the 120-character ACK.");
-    console.log(`ok - native WebDriver typed exactly ${sequence.length} known characters; exact PTY bytes and daemon /screen ACK match`);
+    console.log(`ok - native OS input typed exactly ${sequence.length} known characters; exact PTY bytes and daemon /screen ACK match`);
   }
 
   if (sendPaneLoad) {
@@ -1144,7 +1145,7 @@ async function testFirstSessionAndPaneWorkload(
   assert(countOccurrences(bytes, echo) === 1, "WebDriver key input was lost or duplicated in the PTY byte record.");
   const acknowledgementFrames = await captureTerminalScreenshots(driver, screenshotPath, "initial-input");
   console.log(
-    `ok - WebDriver entered native-echo-✓ through xterm; PTY bytes and daemon /screen ACK verified; immediate and 2s screenshots captured at ${acknowledgementFrames.immediate} and ${acknowledgementFrames.afterTwoSeconds}`,
+    `ok - native OS input entered native-echo-✓ through xterm; PTY bytes and daemon /screen ACK verified; immediate and 2s screenshots captured at ${acknowledgementFrames.immediate} and ${acknowledgementFrames.afterTwoSeconds}`,
   );
   assert(await fileExists(createdRecord), "The UI-created runtime did not get a fixture-owned input record.");
 
@@ -3022,6 +3023,52 @@ const debugNativeHandles = process.env.OMP_DESKTOP_NATIVE_DEBUG_HANDLES === "1";
 let smokeReturned = false;
 let beforeExitReported = false;
 
+function inspectLinuxSocketDescriptors(
+  fileDescriptors: Array<{ fd: string; target: string | null }>,
+): Array<Record<string, unknown>> {
+  if (process.platform !== "linux") return [];
+  const sockets = fileDescriptors.flatMap(({ fd, target }) => {
+    const match = target?.match(/^socket:\[(\d+)\]$/);
+    return match ? [{ fd: Number(fd), target, inode: match[1]! }] : [];
+  });
+  if (sockets.length === 0) return [];
+
+  const libc = dlopen("libc.so.6", {
+    getsockopt: {
+      args: [FFIType.i32, FFIType.i32, FFIType.i32, FFIType.ptr, FFIType.ptr],
+      returns: FFIType.i32,
+    },
+    getsockname: { args: [FFIType.i32, FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
+    getpeername: { args: [FFIType.i32, FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
+  });
+  try {
+    const option = (fd: number, name: number): number | null => {
+      const value = new Int32Array(1);
+      const length = new Uint32Array([value.byteLength]);
+      return libc.symbols.getsockopt(fd, 1, name, ptr(value), ptr(length)) === 0 ? value[0]! : null;
+    };
+    const address = (name: "getsockname" | "getpeername", fd: number): string | null => {
+      const bytes = new Uint8Array(128);
+      const length = new Uint32Array([bytes.byteLength]);
+      if (libc.symbols[name](fd, ptr(bytes), ptr(length)) !== 0) return null;
+      return Array.from(bytes.subarray(0, length[0]!), (byte) => byte.toString(16).padStart(2, "0")).join("");
+    };
+    return sockets.map(({ fd, target, inode }) => ({
+      fd,
+      target,
+      inode,
+      domain: option(fd, 39), // Linux SO_DOMAIN
+      type: option(fd, 3), // Linux SO_TYPE
+      protocol: option(fd, 38), // Linux SO_PROTOCOL
+      acceptingConnections: option(fd, 30), // Linux SO_ACCEPTCONN
+      localAddress: address("getsockname", fd),
+      peerAddress: address("getpeername", fd),
+    }));
+  } finally {
+    libc.close();
+  }
+}
+
 async function reportNativeProcessResources(label: string): Promise<void> {
   const fdEntries = await readdir("/proc/self/fd").catch(() => []);
   const fileDescriptors = await Promise.all(fdEntries.filter((entry) => /^\d+$/.test(entry)).map(async (fd) => ({
@@ -3067,6 +3114,7 @@ async function reportNativeProcessResources(label: string): Promise<void> {
     handles,
     fileDescriptors,
     matchingSockets,
+    socketDetails: inspectLinuxSocketDescriptors(fileDescriptors),
   })}`);
 }
 

@@ -75,8 +75,8 @@ jobs:
             libwebkitgtk-6.0-dev \
             openbox \
             python3-gi \
-            pkg-config \
             scrot \
+            strace \
             webkit2gtk-driver \
             wmctrl \
             x11-utils \
@@ -160,7 +160,7 @@ jobs:
           GSK_RENDERER: gl
           OMP_DESKTOP_NATIVE_DEBUG_HANDLES: "1"
           OMP_DESKTOP_NATIVE_SCREENSHOT: ${{ runner.temp }}/native-smoke.png
-        run: xvfb-run -a dbus-run-session -- bun run smoke:native -- --images
+        run: xvfb-run -a dbus-run-session -- strace -f -b execve -tt -yy -e trace=socket,socketpair,connect,bind,listen,accept,accept4,getsockopt,getsockname,getpeername,shutdown,close,close_range,dup,dup2,dup3,epoll_ctl,execve,exit_group -o "${RUNNER_TEMP}/native-socket.trace" bun scripts/native-smoke.ts --images
 
       - name: Upload native shell screenshot
         if: always()
@@ -168,6 +168,14 @@ jobs:
         with:
           name: native-shell-screenshot
           path: ${{ runner.temp }}/native-smoke*.png
+          if-no-files-found: ignore
+
+      - name: Upload native socket trace
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-socket-trace
+          path: ${{ runner.temp }}/native-socket.trace
           if-no-files-found: ignore
 
   native-macos:
