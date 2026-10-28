@@ -2951,8 +2951,46 @@ async function runNativeSmoke(): Promise<"full" | "images-only" | "policy-only" 
   return imagesOnly ? "images-only" : policyOnly ? "policy-only" : inputOnly ? "input-only" : notificationOnly ? "notification-only" : "full";
 }
 
+const debugNativeHandles = process.env.OMP_DESKTOP_NATIVE_DEBUG_HANDLES === "1";
+let smokeReturned = false;
+
+function reportNativeProcessResources(label: string, code?: number): void {
+  const getActiveHandles = Reflect.get(process, "_getActiveHandles");
+  const rawHandles = typeof getActiveHandles === "function"
+    ? (getActiveHandles as () => unknown[]).call(process)
+    : [];
+  const handles = rawHandles.map((handle: unknown) => {
+    const value = handle as {
+      constructor?: { name?: string };
+      fd?: unknown;
+      address?: () => unknown;
+    };
+    let address: unknown = null;
+    try {
+      address = value.address?.() ?? null;
+    } catch (error) {
+      address = String(error);
+    }
+    return { type: value.constructor?.name ?? "unknown", fd: value.fd ?? null, address };
+  });
+  console.log(`NATIVE PROCESS ${label} pid=${process.pid}${code === undefined ? "" : ` code=${code}`} ${JSON.stringify({
+    resources: process.getActiveResourcesInfo(),
+    handles,
+  })}`);
+}
+
+if (debugNativeHandles) {
+  process.on("beforeExit", (code) => {
+    if (smokeReturned) reportNativeProcessResources("beforeExit", code);
+  });
+  process.on("exit", (code) => {
+    if (smokeReturned) reportNativeProcessResources("exit", code);
+  });
+}
+
 try {
   const result = await runNativeSmoke();
+  smokeReturned = true;
   console.log(result === "images-only"
     ? "NATIVE IMAGE SMOKE PASSED (functional input scenarios not run)"
     : result === "policy-only"
@@ -2962,7 +3000,13 @@ try {
         : result === "notification-only"
           ? "NATIVE NORMAL-MODE NOTIFICATION AND PERSISTENCE SMOKE PASSED"
           : "NATIVE SMOKE PASSED");
+  if (debugNativeHandles) {
+    reportNativeProcessResources("main-return");
+    const diagnosticTimer = setTimeout(() => reportNativeProcessResources("unref-watchdog"), 2_000);
+    diagnosticTimer.unref();
+  }
 } catch (error) {
+  smokeReturned = true;
   console.error("NATIVE SMOKE FAILED", error);
   process.exitCode = 1;
 }

@@ -154,9 +154,11 @@ jobs:
         run: bun run app:build
 
       - name: Exercise the real GTK4 shell and DOM image assertions
+        timeout-minutes: 10
         env:
           GDK_BACKEND: x11
           GSK_RENDERER: gl
+          OMP_DESKTOP_NATIVE_DEBUG_HANDLES: "1"
           OMP_DESKTOP_NATIVE_SCREENSHOT: ${{ runner.temp }}/native-smoke.png
         run: xvfb-run -a dbus-run-session -- bun run smoke:native -- --images
 
