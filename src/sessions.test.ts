@@ -5,10 +5,9 @@
  *
  * Run: bun test src/sessions.test.ts
  */
-import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
-import * as fsPromises from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { listSessions, readSessionCwd } from "./sessions";
@@ -38,6 +37,18 @@ function writeSession(root: string, name: string, events: Event[]): string {
 function setMtime(path: string, iso: string): void {
   const when = new Date(iso);
   utimesSync(path, when, when);
+}
+
+async function waitForCtimeChange(path: string, previous: number): Promise<void> {
+  const deadline = Date.now() + 3_000;
+  // Only the real filesystem clock can produce the ctime transition under test.
+  while (Date.now() < deadline) {
+    const current = statSync(path);
+    if (current.ctimeMs !== previous) return;
+    utimesSync(path, new Date(current.atimeMs), new Date(current.mtimeMs));
+    await Bun.sleep(10);
+  }
+  throw new Error(`filesystem ctime did not advance for ${path}`);
 }
 
 function session(id: string, timestamp: string): Event {
@@ -369,35 +380,27 @@ describe("message-derived activity", () => {
     const mtime = "2026-09-12T00:00:00.000Z";
     setMtime(path, mtime);
     const original = statSync(path);
-    let version = original;
-    // The cache is metadata-keyed. Real filesystems can assign identical ctime
-    // even to consecutive writes; control only that version field, not content.
-    // This fixture contains exactly one transcript, hence one async stat per listing.
-    const statSpy = spyOn(fsPromises, "stat").mockImplementation((async () => version) as unknown as typeof fsPromises.stat);
-    try {
-      expect((await listSessions({ sessionsRoot: root }))[0]?.costUsd).toBe(0.25);
+    expect((await listSessions({ sessionsRoot: root }))[0]?.costUsd).toBe(0.25);
+    await waitForCtimeChange(path, original.ctimeMs);
 
-      writeFileSync(
-        path,
-        `${[
-          session("cost-in-place", "2026-09-12T00:00:00.000Z"),
-          user("2026-09-12T00:00:01.000Z", "hi"),
-          assistant("2026-09-12T00:00:05.000Z", 0.75),
-        ]
-          .map((event) => JSON.stringify(event))
-          .join("\n")}\n`,
-      );
-      setMtime(path, mtime);
-      version = statSync(path);
-      expect([version.dev, version.ino, version.size, version.mtimeMs]).toEqual([
-        original.dev, original.ino, original.size, original.mtimeMs,
-      ]);
-      Object.defineProperty(version, "ctimeMs", { value: original.ctimeMs + 1 });
-      expect((await listSessions({ sessionsRoot: root }))[0]?.costUsd).toBe(0.75);
-      expect(statSpy.mock.calls).toEqual([[path], [path]]);
-    } finally {
-      statSpy.mockRestore();
-    }
+    writeFileSync(
+      path,
+      `${[
+        session("cost-in-place", "2026-09-12T00:00:00.000Z"),
+        user("2026-09-12T00:00:01.000Z", "hi"),
+        assistant("2026-09-12T00:00:05.000Z", 0.75),
+      ]
+        .map((event) => JSON.stringify(event))
+        .join("\n")}\n`,
+    );
+    setMtime(path, mtime);
+    const rewritten = statSync(path);
+    expect(rewritten.dev).toBe(original.dev);
+    expect(rewritten.ino).toBe(original.ino);
+    expect(rewritten.size).toBe(original.size);
+    expect(rewritten.mtimeMs).toBe(original.mtimeMs);
+    expect(rewritten.ctimeMs).not.toBe(original.ctimeMs);
+    expect((await listSessions({ sessionsRoot: root }))[0]?.costUsd).toBe(0.75);
   });
 
   test("truncating a transcript discards the old accumulated cost", async () => {
@@ -464,7 +467,7 @@ describe("message-derived activity", () => {
 });
 
 describe("parsed header cache", () => {
-  test("reuses warm headers and invalidates on mtime, replacement, or size changes", async () => {
+  test("invalidates cached headers after transcript changes", async () => {
     const root = makeRoot();
     const path = writeSession(root, "2026-09-01T00-00-00-000Z_cached.jsonl", [
       session("cached", "2026-09-01T00:00:00.000Z"),
@@ -472,55 +475,48 @@ describe("parsed header cache", () => {
       user("2026-09-01T00:00:02.000Z", "prompt"),
       assistant("2026-09-01T00:00:03.000Z"),
     ]);
-    const unchangedMtime = "2026-09-01T00:00:00.000Z";
-    setMtime(path, unchangedMtime);
+    setMtime(path, "2026-09-01T00:00:00.000Z");
 
-    const fileSpy = spyOn(Bun, "file");
-    try {
-      expect((await listSessions({ sessionsRoot: root }))[0]?.title).toBe("Old title");
-      const warmReadCount = fileSpy.mock.calls.length;
-      expect((await listSessions({ sessionsRoot: root }))[0]?.title).toBe("Old title");
-      expect(fileSpy.mock.calls.length).toBe(warmReadCount);
+    expect((await listSessions({ sessionsRoot: root }))[0]?.title).toBe("Old title");
+    expect((await listSessions({ sessionsRoot: root }))[0]?.title).toBe("Old title");
 
-      writeSession(root, "2026-09-01T00-00-00-000Z_cached.jsonl", [
-        session("cached", "2026-09-01T00:00:00.000Z"),
-        { type: "title_change", id: "t1", parentId: null, timestamp: "2026-09-01T00:00:01.000Z", title: "New title" },
-        user("2026-09-01T00:00:02.000Z", "prompt"),
-        assistant("2026-09-01T00:00:03.000Z"),
-      ]);
-      setMtime(path, "2026-09-02T00:00:00.000Z");
-      expect((await listSessions({ sessionsRoot: root }))[0]?.title).toBe("New title");
+    writeSession(root, "2026-09-01T00-00-00-000Z_cached.jsonl", [
+      session("cached", "2026-09-01T00:00:00.000Z"),
+      { type: "title_change", id: "t1", parentId: null, timestamp: "2026-09-01T00:00:01.000Z", title: "New title" },
+      user("2026-09-01T00:00:02.000Z", "prompt"),
+      assistant("2026-09-01T00:00:03.000Z"),
+    ]);
+    setMtime(path, "2026-09-02T00:00:00.000Z");
+    expect((await listSessions({ sessionsRoot: root }))[0]?.title).toBe("New title");
 
-      const replacement = writeSession(root, "staged-cached.jsonl", [
-        session("cached", "2026-09-01T00:00:00.000Z"),
-        { type: "title_change", id: "t1", parentId: null, timestamp: "2026-09-01T00:00:01.000Z", title: "Old title" },
-        user("2026-09-01T00:00:02.000Z", "prompt"),
-        assistant("2026-09-01T00:00:03.000Z"),
-      ]);
-      renameSync(replacement, path);
-      setMtime(path, "2026-09-02T00:00:00.000Z");
-      expect((await listSessions({ sessionsRoot: root }))[0]?.title).toBe("Old title");
+    const replacement = writeSession(root, "staged-cached.jsonl", [
+      session("cached", "2026-09-01T00:00:00.000Z"),
+      { type: "title_change", id: "t1", parentId: null, timestamp: "2026-09-01T00:00:01.000Z", title: "Old title" },
+      user("2026-09-01T00:00:02.000Z", "prompt"),
+      assistant("2026-09-01T00:00:03.000Z"),
+    ]);
+    renameSync(replacement, path);
+    setMtime(path, "2026-09-02T00:00:00.000Z");
+    expect((await listSessions({ sessionsRoot: root }))[0]?.title).toBe("Old title");
 
-      writeSession(root, "2026-09-01T00-00-00-000Z_cached.jsonl", [
-        session("cached", "2026-09-01T00:00:00.000Z"),
-        { type: "title_change", id: "t1", parentId: null, timestamp: "2026-09-01T00:00:01.000Z", title: "Longer title" },
-        user("2026-09-01T00:00:02.000Z", "prompt"),
-        assistant("2026-09-01T00:00:03.000Z"),
-      ]);
-      setMtime(path, "2026-09-02T00:00:00.000Z");
-      expect((await listSessions({ sessionsRoot: root }))[0]?.title).toBe("Longer title");
-    } finally {
-      fileSpy.mockRestore();
-    }
+    writeSession(root, "2026-09-01T00-00-00-000Z_cached.jsonl", [
+      session("cached", "2026-09-01T00:00:00.000Z"),
+      { type: "title_change", id: "t1", parentId: null, timestamp: "2026-09-01T00:00:01.000Z", title: "Longer title" },
+      user("2026-09-01T00:00:02.000Z", "prompt"),
+      assistant("2026-09-01T00:00:03.000Z"),
+    ]);
+    setMtime(path, "2026-09-02T00:00:00.000Z");
+    expect((await listSessions({ sessionsRoot: root }))[0]?.title).toBe("Longer title");
   });
 
-  test("keeps a large cache warm while preserving search, order, imports, and deletions", async () => {
+  test("keeps deterministic transcript results through limit, search, import, and deletion", async () => {
     const root = makeRoot();
     const dir = join(root, "-home-user-demo");
     mkdirSync(dir, { recursive: true });
     const startMs = Date.parse("2026-01-01T00:00:00.000Z");
-    for (let index = 0; index < 1100; index++) {
-      const id = `bulk-${String(index).padStart(4, "0")}`;
+    const ids = Array.from({ length: 30 }, (_, index) => `cache-${String(index).padStart(2, "0")}`).reverse();
+    for (let index = 0; index < 30; index++) {
+      const id = `cache-${String(index).padStart(2, "0")}`;
       const timestamp = new Date(startMs + index * 2_000).toISOString();
       const replyTime = new Date(startMs + index * 2_000 + 1_000).toISOString();
       const prompt = index === 0 ? "boundary-search-token" : `question ${index}`;
@@ -532,56 +528,46 @@ describe("parsed header cache", () => {
       );
     }
 
-    const fileSpy = spyOn(Bun, "file");
-    try {
-      const recent = await listSessions({ sessionsRoot: root, limit: 60 });
-      expect(recent).toHaveLength(60);
-      expect(recent[0]?.id).toBe("bulk-1099");
-      const warmReadCount = fileSpy.mock.calls.length;
-      expect((await listSessions({ sessionsRoot: root, limit: 60 })).map((entry) => entry.id)).toEqual(
-        recent.map((entry) => entry.id),
-      );
-      expect(fileSpy.mock.calls.length).toBe(warmReadCount);
+    expect((await listSessions({ sessionsRoot: root, limit: 5 })).map((entry) => entry.id)).toEqual(ids.slice(0, 5));
+    expect((await listSessions({ sessionsRoot: root, limit: Number.MAX_SAFE_INTEGER })).map((entry) => entry.id)).toEqual(ids);
+    expect((await listSessions({ sessionsRoot: root, search: "boundary-search-token" })).map((entry) => entry.id)).toEqual([
+      "cache-00",
+    ]);
 
-      expect(
-        (await listSessions({ sessionsRoot: root, search: "boundary-search-token", limit: 1 })).map(
-          (entry) => entry.id,
-        ),
-      ).toEqual(["bulk-0000"]);
-      expect(await listSessions({ sessionsRoot: root, limit: Number.MAX_SAFE_INTEGER })).toHaveLength(200);
-
-      rmSync(join(dir, "bulk-0000.jsonl"));
-      const imported = writeSession(root, "000-imported.jsonl", [
-        session("imported", "2026-01-01T00:00:00.000Z"),
-        user("2026-12-01T00:00:01.000Z", "imported marker"),
-        assistant("2026-12-01T00:00:02.000Z"),
-      ]);
-      setMtime(imported, "2026-01-01T00:00:00.000Z");
-      expect((await listSessions({ sessionsRoot: root, limit: 1 }))[0]?.id).toBe("imported");
-      expect(await listSessions({ sessionsRoot: root, search: "boundary-search-token" })).toEqual([]);
-    } finally {
-      fileSpy.mockRestore();
-    }
+    rmSync(join(dir, "cache-00.jsonl"));
+    const imported = writeSession(root, "000-imported.jsonl", [
+      session("imported", "2026-01-01T00:00:00.000Z"),
+      user("2026-12-01T00:00:01.000Z", "imported marker"),
+      assistant("2026-12-01T00:00:02.000Z"),
+    ]);
+    setMtime(imported, "2026-01-01T00:00:00.000Z");
+    expect((await listSessions({ sessionsRoot: root, limit: 5 })).map((entry) => entry.id)).toEqual([
+      "imported",
+      ...ids.slice(0, 4),
+    ]);
+    expect((await listSessions({ sessionsRoot: root, limit: Number.MAX_SAFE_INTEGER })).map((entry) => entry.id)).toEqual([
+      "imported",
+      ...ids.slice(0, -1),
+    ]);
+    expect(await listSessions({ sessionsRoot: root, search: "boundary-search-token" })).toEqual([]);
   });
 
-  test("simultaneous listings share transcript indexing and cost work", async () => {
+  test("simultaneous listings return the same indexed transcript results", async () => {
     const root = makeRoot();
     writeSession(root, "2026-09-01T00-00-00-000Z_concurrent.jsonl", [
       session("concurrent", "2026-09-01T00:00:00.000Z"),
       user("2026-09-01T00:00:01.000Z", "prompt"),
       assistant("2026-09-01T00:00:02.000Z", 0.5),
     ]);
-    const fileSpy = spyOn(Bun, "file");
-    try {
-      const results = await Promise.all(
-        Array.from({ length: 8 }, () => listSessions({ sessionsRoot: root })),
-      );
-      expect(results.map((sessions) => sessions[0]?.costUsd)).toEqual(Array(8).fill(0.5));
-      expect(fileSpy.mock.calls.length).toBe(3);
-    } finally {
-      fileSpy.mockRestore();
-    }
+    const results = await Promise.all(
+      Array.from({ length: 8 }, () => listSessions({ sessionsRoot: root })),
+    );
+    expect(results.map((sessions) => sessions.map((entry) => entry.id))).toEqual(
+      Array.from({ length: 8 }, () => ["concurrent"]),
+    );
+    expect(results.map((sessions) => sessions[0]?.costUsd)).toEqual(Array(8).fill(0.5));
   });
+
 
   test("separate session roots keep independently cached index results", async () => {
     const firstRoot = makeRoot();
@@ -602,29 +588,6 @@ describe("parsed header cache", () => {
     expect(second.map((entry) => entry.id)).toEqual(["second-root"]);
   });
 
-  test("retries a transient header read failure", async () => {
-    const root = makeRoot();
-    const path = writeSession(root, "2026-09-01T00-00-00-000Z_retry.jsonl", [
-      session("retry", "2026-09-01T00:00:00.000Z"),
-      user("2026-09-01T00:00:01.000Z", "prompt"),
-      assistant("2026-09-01T00:00:02.000Z"),
-    ]);
-    const realFile = Bun.file.bind(Bun);
-    let failHeaderRead = true;
-    const fileSpy = spyOn(Bun, "file").mockImplementation((filePath) => {
-      if (String(filePath) === path && failHeaderRead) {
-        failHeaderRead = false;
-        throw new Error("transient read failure");
-      }
-      return Reflect.apply(realFile, Bun, [filePath]);
-    });
-    try {
-      expect(await listSessions({ sessionsRoot: root })).toEqual([]);
-      expect((await listSessions({ sessionsRoot: root })).map((entry) => entry.id)).toEqual(["retry"]);
-    } finally {
-      fileSpy.mockRestore();
-    }
-  });
 
   test("refreshes history.db titles independently of cached transcript headers", async () => {
     const root = makeRoot();

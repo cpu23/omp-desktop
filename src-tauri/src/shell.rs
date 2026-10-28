@@ -11,8 +11,7 @@ use tauri::{AppHandle, Manager, Runtime, WebviewWindow, WebviewWindowBuilder};
 
 use crate::daemon;
 
-pub const MAIN_WINDOW: &str = "main";
-
+const MAIN_WINDOW: &str = "main";
 /// Builds the `main` window from `tauri.conf.json` (`create: false` there) and
 /// attaches the shell policy at build time, before any page loads.
 pub fn build_main_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::Error>> {
@@ -58,9 +57,8 @@ pub fn build_main_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn s
         })
         .build()?;
 
-    // Native file drops are delivered by Tauri rather than the WebView's
-    // HTML drag/drop API. Forward only the drop data into the page as a DOM
-    // event, so the daemon-origin client needs no Tauri IPC permissions.
+    // Normalize physical window coordinates to CSS viewport pixels at the
+    // backend boundary; the shared frontend contract has no DPR shim.
     let drop_app = app.clone();
     let window = app.get_webview_window(MAIN_WINDOW).ok_or("main window disappeared")?;
     window.on_window_event(move |event| {
@@ -75,9 +73,12 @@ pub fn build_main_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn s
             "x": position.x,
             "y": position.y,
         });
+        let Ok(payload) = serde_json::to_string(&payload) else {
+            return;
+        };
         if let Some(window) = drop_app.get_webview_window(MAIN_WINDOW) {
             let script = format!(
-                "window.dispatchEvent(new CustomEvent('omp-desktop-file-drop', {{ detail: {payload} }}));"
+                "(() => {{ const detail = {payload}; const dpr = window.devicePixelRatio || 1; detail.x /= dpr; detail.y /= dpr; window.dispatchEvent(new CustomEvent('omp-desktop-file-drop', {{ detail }})); }})();"
             );
             let _ = window.eval(script);
         }

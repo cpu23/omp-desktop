@@ -1,31 +1,9 @@
-/**
- * End-to-end regression for the "only some sessions come back" bug: a daemon
- * restart must restore every session that was live — including sessions no pane
- * document mentions — while explicit stops and ordinary process exits stay
- * stopped, and a client resume that races the restore joins it instead of
- * spawning a duplicate process.
- *
- * The second test pins the case that made the loss look random: on a unit
- * teardown (systemctl stop/restart, logout, reboot) systemd SIGTERMs the daemon
- * and its PTY children at the same time, so a child's death is often seen before
- * the daemon's own shutdown runs. Killing a session from outside the daemon
- * reproduces exactly that ordering, deterministically.
- *
- * Both tests start real isolated daemons over a temp state directory and session
- * store, with a stand-in omp binary that exits when its PTY receives a line. Only
- * the daemon is exercised: no client document is involved, which is the point —
- * restoration is owned by the pool, not by a browser.
- */
 import { describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isRecord } from "./guards";
-
-const ROOT = join(import.meta.dir, "..");
-const PORT = Number(process.env.OMP_DESKTOP_RESTORE_TEST_PORT ?? 4319);
-const BASE = `http://127.0.0.1:${PORT}`;
-const WS_URL = `ws://127.0.0.1:${PORT}/ws/term`;
+import { startTestDaemon, writeTestTranscript, type TestDaemon } from "../scripts/fixtures/daemon";
 
 type RuntimeInfo = {
   id: string;
@@ -36,76 +14,39 @@ type RuntimeInfo = {
   status: string;
 };
 
-type Fixture = {
-  stateDir: string;
-  sessionsDir: string;
-  projectDir: string;
-  env: Record<string, string>;
-  cleanup: () => void;
-};
-
-async function startDaemon(env: Record<string, string>): Promise<Bun.Subprocess> {
-  const proc = Bun.spawn(["bun", "run", join(ROOT, "src", "daemon.ts")], {
-    env: { ...process.env, OMP_DESKTOP_PORT: String(PORT), ...env },
-    stdout: "ignore",
-    stderr: "pipe",
-  });
-  const deadline = Date.now() + 30_000;
-  while (Date.now() < deadline) {
-    try {
-      const res = await fetch(`${BASE}/api/build`);
-      if (res.ok) return proc;
-    } catch {
-      // not up yet
-    }
-    await Bun.sleep(100);
-  }
-  proc.kill();
-  const stderr = await new Response(proc.stderr).text();
-  throw new Error(`daemon failed to start: ${stderr.slice(0, 2000)}`);
-}
-
-async function stopDaemon(proc: Bun.Subprocess): Promise<void> {
-  proc.kill("SIGTERM");
-  await proc.exited;
-}
-
 function runtimeFrom(value: unknown): RuntimeInfo {
-  expect(isRecord(value)).toBe(true);
-  const record = value as Record<string, unknown>;
+  if (!isRecord(value)) throw new Error("runtime payload is not an object");
   return {
-    id: typeof record.id === "string" ? record.id : "",
-    alive: record.alive === true,
-    pid: typeof record.pid === "number" ? record.pid : null,
-    cwd: typeof record.cwd === "string" ? record.cwd : "",
-    sessionFile: typeof record.sessionFile === "string" ? record.sessionFile : null,
-    status: typeof record.status === "string" ? record.status : "",
+    id: typeof value.id === "string" ? value.id : "",
+    alive: value.alive === true,
+    pid: typeof value.pid === "number" ? value.pid : null,
+    cwd: typeof value.cwd === "string" ? value.cwd : "",
+    sessionFile: typeof value.sessionFile === "string" ? value.sessionFile : null,
+    status: typeof value.status === "string" ? value.status : "",
   };
 }
 
-async function runtimes(): Promise<RuntimeInfo[]> {
-  const res = await fetch(`${BASE}/api/runtimes`);
-  if (!res.ok) throw new Error(`GET /api/runtimes -> ${res.status}`);
-  const body: unknown = await res.json();
+async function runtimes(base: string): Promise<RuntimeInfo[]> {
+  const response = await fetch(`${base}/api/runtimes`);
+  if (!response.ok) throw new Error(`GET /api/runtimes -> ${response.status}`);
+  const body: unknown = await response.json();
   if (!isRecord(body) || !Array.isArray(body.runtimes)) throw new Error("bad runtimes payload");
   return body.runtimes.map(runtimeFrom);
 }
 
-async function createRuntime(request: Record<string, unknown>): Promise<RuntimeInfo> {
-  const res = await fetch(`${BASE}/api/runtimes`, {
+async function createRuntime(base: string, request: Record<string, unknown>): Promise<RuntimeInfo> {
+  const response = await fetch(`${base}/api/runtimes`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(request),
   });
-  if (!res.ok) throw new Error(`POST /api/runtimes ${JSON.stringify(request)} -> ${res.status}`);
-  const body: unknown = await res.json();
+  if (!response.ok) throw new Error(`POST /api/runtimes ${JSON.stringify(request)} -> ${response.status}`);
+  const body: unknown = await response.json();
   if (!isRecord(body)) throw new Error("bad create payload");
   return runtimeFrom(body.runtime);
 }
 
 async function waitFor(predicate: () => Promise<boolean> | boolean, label: string): Promise<void> {
-  // The daemon and its PTY children are real processes here; there is no fake
-  // timer that can drive a spawn or an exit, so poll the observable state.
   const deadline = Date.now() + 20_000;
   while (Date.now() < deadline) {
     if (await predicate()) return;
@@ -114,23 +55,23 @@ async function waitFor(predicate: () => Promise<boolean> | boolean, label: strin
   throw new Error(`timed out waiting for ${label}`);
 }
 
-/** Attach like a pane does and type one line, which ends the stand-in session. */
-async function exitThroughAttach(runtimeId: string): Promise<void> {
-  const ws = new WebSocket(`${WS_URL}?runtime=${encodeURIComponent(runtimeId)}`);
-  await new Promise<void>((resolve, reject) => {
-    ws.onopen = () => resolve();
-    ws.onerror = () => reject(new Error(`websocket to ${runtimeId} failed`));
-  });
-  ws.send(JSON.stringify({ type: "input", data: "quit\n" }));
-  ws.close();
-}
-
-/** Kill a PTY child the way a unit teardown does: SIGTERM from outside the daemon. */
-function killOutsideDaemon(pid: number): void {
+async function exitThroughAttach(base: string, runtimeId: string): Promise<void> {
+  const ws = new WebSocket(`ws://${new URL(base).host}/ws/term?runtime=${encodeURIComponent(runtimeId)}`);
   try {
-    process.kill(-pid, "SIGTERM");
-  } catch {
-    process.kill(pid, "SIGTERM");
+    await new Promise<void>((resolve, reject) => {
+      ws.onopen = () => resolve();
+      ws.onerror = () => reject(new Error(`websocket to ${runtimeId} failed`));
+    });
+    ws.send(JSON.stringify({ type: "input", data: "exit 0\n" }));
+    await waitFor(async () => !(await runtimes(base)).some((entry) => entry.id === runtimeId), "the fake OMP command to exit");
+  } finally {
+    await new Promise<void>((resolve) => {
+      if (ws.readyState === WebSocket.CLOSED) resolve();
+      else {
+        ws.onclose = () => resolve();
+        ws.close();
+      }
+    });
   }
 }
 
@@ -146,140 +87,185 @@ async function ledgerFiles(stateDir: string): Promise<string[]> {
   }
 }
 
-function fixtureDir(): Fixture {
-  const dir = mkdtempSync(join(tmpdir(), "omp-restore-test-"));
-  const stateDir = join(dir, "state");
-  const sessionsDir = join(dir, "sessions");
-  const projectDir = join(dir, "project");
-  mkdirSync(projectDir, { recursive: true });
-  const fakeOmp = join(dir, "fake-omp");
-  writeFileSync(fakeOmp, "#!/bin/sh\nprintf 'fake-omp-ready\\n'\nread line\nexit 0\n");
-  chmodSync(fakeOmp, 0o755);
-  return {
-    stateDir,
-    sessionsDir,
-    projectDir,
-    env: {
-      OMP_DESKTOP_OMP: fakeOmp,
-      OMP_DESKTOP_OMP_ARGS: "",
-      OMP_DESKTOP_OVERLAY: "",
-      OMP_DESKTOP_EXTENSION: "",
-      OMP_DESKTOP_CWD: dir,
-      OMP_DESKTOP_SESSIONS_DIR: sessionsDir,
-      OMP_DESKTOP_STATE_DIR: stateDir,
-      OMP_DESKTOP_PASTE_DIR: join(dir, "pastes"),
-      OMP_DESKTOP_MAX_RUNTIMES: "6",
-    },
-    cleanup: () => rmSync(dir, { recursive: true, force: true }),
-  };
+function killPtyGroup(pid: number): void {
+  try {
+    process.kill(-pid, "SIGTERM");
+  } catch {
+    process.kill(pid, "SIGTERM");
+  }
 }
 
-function fixtureTranscript(fixture: Fixture, suffix: string): string {
-  const root = join(fixture.sessionsDir, "-tmp-restore-fixture");
-  mkdirSync(root, { recursive: true });
-  const id = `01a10000-0000-7000-8000-0000000000${suffix}`;
-  const path = join(root, `2026-10-05T00-00-00-000Z_${id}.jsonl`);
-  writeFileSync(
-    path,
-    [
-      JSON.stringify({
-        type: "session",
-        version: 3,
-        id,
-        timestamp: "2026-10-05T00:00:00.000Z",
-        cwd: fixture.projectDir,
-      }),
-      JSON.stringify({ type: "message", role: "user", content: "restore regression fixture", timestamp: "2026-10-05T00:00:00.000Z" }),
-    ].join("\n") + "\n",
-  );
-  return path;
+async function ptyGroupExists(pid: number): Promise<boolean> {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch (inner) {
+        return (inner as NodeJS.ErrnoException).code !== "ESRCH";
+      }
+    }
+    return true;
+  }
 }
 
-describe("daemon pool restore across a restart", () => {
-  test("every live session is restored; explicit stops and exits are not", async () => {
-    const fixture = fixtureDir();
-    const { stateDir } = fixture;
-    const stopped = fixtureTranscript(fixture, "0a");
-    const exited = fixtureTranscript(fixture, "0b");
-    const kept = fixtureTranscript(fixture, "0c");
-    let daemon: Bun.Subprocess | null = null;
+async function terminatePtyGroups(pids: number[]): Promise<void> {
+  for (const pid of pids) {
     try {
-      daemon = await startDaemon(fixture.env);
-      const a = await createRuntime({ resume: stopped });
-      const b = await createRuntime({ resume: exited });
-      const c = await createRuntime({ resume: kept });
+      process.kill(-pid, "SIGTERM");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      try {
+        process.kill(pid, "SIGTERM");
+      } catch (inner) {
+        if ((inner as NodeJS.ErrnoException).code !== "ESRCH") throw inner;
+      }
+    }
+  }
+  const termDeadline = Date.now() + 20_000;
+  while (Date.now() < termDeadline && (await Promise.all(pids.map(ptyGroupExists))).some(Boolean)) {
+    await Bun.sleep(50);
+  }
+  const survivors: number[] = [];
+  for (const pid of pids) {
+    if (!(await ptyGroupExists(pid))) continue;
+    survivors.push(pid);
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch (inner) {
+        if ((inner as NodeJS.ErrnoException).code !== "ESRCH") throw inner;
+      }
+    }
+  }
+  const killDeadline = Date.now() + 5_000;
+  while (Date.now() < killDeadline && (await Promise.all(survivors.map(ptyGroupExists))).some(Boolean)) {
+    await Bun.sleep(50);
+  }
+  const alive: number[] = [];
+  for (const pid of survivors) if (await ptyGroupExists(pid)) alive.push(pid);
+  if (alive.length) throw new Error(`owned PTY groups survived SIGKILL: ${alive.join(", ")}`);
+}
+
+describe("daemon pool restore across restart", () => {
+  test("live sessions return; explicit stops and ordinary exits do not", async () => {
+    const daemon = await startTestDaemon();
+    try {
+      const projectDir = join(daemon.root, "project");
+      const stopped = await writeTestTranscript(daemon.root, "restore-stopped", { cwd: projectDir });
+      const exited = await writeTestTranscript(daemon.root, "restore-exited", { cwd: projectDir });
+      const kept = await writeTestTranscript(daemon.root, "restore-kept", { cwd: projectDir });
+      const a = await createRuntime(daemon.base, { resume: stopped });
+      const b = await createRuntime(daemon.base, { resume: exited });
+      const c = await createRuntime(daemon.base, { resume: kept });
       expect(a.sessionFile).toBe(stopped);
       expect(c.sessionFile).toBe(kept);
-      await waitFor(async () => (await runtimes()).length === 3, "three live sessions");
-      await waitFor(async () => (await ledgerFiles(stateDir)).length === 3, "three recorded sessions");
+      await waitFor(async () => (await runtimes(daemon.base)).length === 3, "three live sessions");
+      await waitFor(async () => (await ledgerFiles(join(daemon.root, "state"))).length === 3, "three recorded sessions");
 
-      // Explicit stop: the user's kill button.
-      const deleted = await fetch(`${BASE}/api/runtimes/${a.id}`, { method: "DELETE" });
+      const deleted = await fetch(`${daemon.base}/api/runtimes/${a.id}`, { method: "DELETE" });
       expect(deleted.ok).toBe(true);
-      // The stop is durable at once, not after the exit settle window.
-      await waitFor(async () => (await ledgerFiles(stateDir)).join() === [exited, kept].join(), "the ledger to drop the stopped session");
-      // Ordinary exit: omp quits inside its pane.
-      await exitThroughAttach(b.id);
-      await waitFor(async () => !(await runtimes()).some((entry) => entry.id === b.id), "the ordinary exit");
-      await waitFor(async () => (await ledgerFiles(stateDir)).join() === kept, "the settled ledger to hold only the live session");
-      await stopDaemon(daemon);
-      daemon = null;
-      // Shutdown preserved the snapshot: the session that was live at the end.
-      expect(await ledgerFiles(stateDir)).toEqual([kept]);
+      await waitFor(
+        async () => (await ledgerFiles(join(daemon.root, "state"))).sort().join() === [exited, kept].sort().join(),
+        "the ledger to drop the explicitly stopped session",
+      );
 
-      daemon = await startDaemon(fixture.env);
-      await waitFor(async () => (await runtimes()).some((entry) => entry.sessionFile === kept), "the kept session to come back");
-      const restored = await runtimes();
+      await exitThroughAttach(daemon.base, b.id);
+      await waitFor(async () => !(await runtimes(daemon.base)).some((entry) => entry.id === b.id), "ordinary process exit");
+      await waitFor(
+        async () => (await ledgerFiles(join(daemon.root, "state"))).join() === kept,
+        "the settled ledger to hold only the live session",
+      );
+      await daemon.restart();
+      expect(await ledgerFiles(join(daemon.root, "state"))).toEqual([kept]);
+      await waitFor(
+        async () => (await runtimes(daemon.base)).some((entry) => entry.sessionFile === kept),
+        "the kept session to return",
+      );
+      const restored = await runtimes(daemon.base);
       expect(restored).toHaveLength(1);
-      expect(restored[0].sessionFile).toBe(kept);
-      expect(restored[0].cwd).toBe(fixture.projectDir);
-      expect(restored[0].alive).toBe(true);
-      expect(restored.some((entry) => entry.sessionFile === stopped)).toBe(false);
-      expect(restored.some((entry) => entry.sessionFile === exited)).toBe(false);
+      expect(restored[0]!.sessionFile).toBe(kept);
+      expect(restored[0]!.cwd).toBe(projectDir);
+      expect(restored[0]!.alive).toBe(true);
+      expect(restored.some((entry) => entry.sessionFile === stopped || entry.sessionFile === exited)).toBe(false);
 
-      // A client resuming the same transcript must join the restored process,
-      // not start a second writer for it.
-      const raced = await createRuntime({ resume: kept });
-      expect(raced.id).toBe(restored[0].id);
-      expect((await runtimes()).filter((entry) => entry.sessionFile === kept)).toHaveLength(1);
+      const raced = await createRuntime(daemon.base, { resume: kept });
+      expect(raced.id).toBe(restored[0]!.id);
+      expect((await runtimes(daemon.base)).filter((entry) => entry.sessionFile === kept)).toHaveLength(1);
     } finally {
-      if (daemon) await stopDaemon(daemon);
-      fixture.cleanup();
+      await daemon.stop();
     }
   }, 90_000);
 
-  test("sessions killed with the host are restored, not written off", async () => {
-    const fixture = fixtureDir();
-    const { stateDir } = fixture;
-    const first = fixtureTranscript(fixture, "1a");
-    const second = fixtureTranscript(fixture, "1b");
-    let daemon: Bun.Subprocess | null = null;
+  test("a child killed during host teardown is retained in the committed ledger", async () => {
+    const daemon = await startTestDaemon();
     try {
-      daemon = await startDaemon(fixture.env);
-      const a = await createRuntime({ resume: first });
-      const b = await createRuntime({ resume: second });
-      await waitFor(async () => (await ledgerFiles(stateDir)).length === 2, "both sessions recorded");
-      const pid = a.pid;
-      if (pid === null) throw new Error("the resumed session has no pid");
+      const first = await writeTestTranscript(daemon.root, "external-kill-first");
+      const second = await writeTestTranscript(daemon.root, "external-kill-second");
+      const a = await createRuntime(daemon.base, { resume: first });
+      const b = await createRuntime(daemon.base, { resume: second });
+      await waitFor(async () => (await ledgerFiles(join(daemon.root, "state"))).length === 2, "both sessions recorded");
+      if (a.pid === null) throw new Error("resumed session did not start a PTY");
       expect(b.sessionFile).toBe(second);
 
-      // The teardown ordering that used to lose sessions: the child dies from a
-      // signal that came from outside the daemon, and the daemon observes the
-      // exit while it is still running. Its own SIGTERM follows immediately.
-      killOutsideDaemon(pid);
-      await waitFor(async () => !(await runtimes()).some((entry) => entry.id === a.id), "the daemon to see the external kill");
-      await stopDaemon(daemon);
-      daemon = null;
-      expect((await ledgerFiles(stateDir)).sort()).toEqual([first, second].sort());
-
-      daemon = await startDaemon(fixture.env);
-      await waitFor(async () => (await runtimes()).length === 2, "both sessions to come back");
-      const restored = await runtimes();
+      killPtyGroup(a.pid);
+      await waitFor(async () => !(await runtimes(daemon.base)).some((entry) => entry.id === a.id), "external PTY death");
+      await daemon.restart();
+      const restored = await runtimes(daemon.base);
+      expect(restored).toHaveLength(2);
       expect(restored.map((entry) => entry.sessionFile).sort()).toEqual([first, second].sort());
-      expect(restored.every((entry) => entry.alive && entry.cwd === fixture.projectDir)).toBe(true);
+      expect(restored.every((entry) => entry.alive)).toBe(true);
     } finally {
-      if (daemon) await stopDaemon(daemon);
-      fixture.cleanup();
+      await daemon.stop();
+    }
+  }, 90_000);
+
+  test("a committed ledger survives daemon-only death and omits missing transcripts on recovery", async () => {
+    const root = await mkdtemp(join(tmpdir(), "omp-restore-recovery-"));
+    let daemon = await startTestDaemon({ root });
+    let replacement: TestDaemon | null = null;
+    let pids: number[] = [];
+    try {
+      const projectDir = join(root, "project");
+      const first = await writeTestTranscript(root, "committed-ledger-first", { cwd: projectDir });
+      const second = await writeTestTranscript(root, "committed-ledger-second", { cwd: projectDir });
+      const missing = await writeTestTranscript(root, "committed-ledger-missing", { cwd: projectDir });
+      const entries = await Promise.all([first, second, missing].map((sessionFile) =>
+        createRuntime(daemon.base, { resume: sessionFile }),
+      ));
+      expect(entries.every((entry) => entry.pid !== null)).toBe(true);
+      await waitFor(async () => (await ledgerFiles(join(root, "state"))).length === 3, "three committed ledger entries");
+      await rm(missing);
+
+      pids = entries.map((entry) => entry.pid!).filter((pid) => Number.isInteger(pid));
+      daemon.proc.kill("SIGKILL");
+      await daemon.proc.exited;
+      await daemon.stop();
+
+      replacement = await startTestDaemon({ root });
+      await waitFor(async () => (await runtimes(replacement!.base)).length === 2, "the valid ledger entries to restore");
+      const restored = await runtimes(replacement.base);
+      expect(restored.map((entry) => entry.sessionFile).sort()).toEqual([first, second].sort());
+      expect(restored.every((entry) => entry.alive && entry.cwd === projectDir)).toBe(true);
+      expect(restored.some((entry) => entry.sessionFile === missing)).toBe(false);
+      await terminatePtyGroups(pids);
+    } finally {
+      try {
+        if (replacement) await replacement.stop();
+        else await daemon.stop();
+      } finally {
+        try {
+          if (pids.length > 0) await terminatePtyGroups(pids);
+        } finally {
+          await rm(root, { recursive: true, force: true });
+        }
+      }
     }
   }, 90_000);
 });

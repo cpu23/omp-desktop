@@ -14,6 +14,7 @@ import { repairWebglCanvasResize } from "./webgl-resize";
 import { shouldUseDomFallbackForSoftwareWebgl } from "./webgl-renderer";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { isRecord } from "./guards";
+import { isNativeShell } from "./native-shell";
 import { insertFilePaths, wireFileDrop } from "./file-drop";
 import { initializeHotkeys } from "./hotkeys";
 import { syncRuntimeLimit } from "./runtime-limit";
@@ -760,7 +761,7 @@ class Pane {
     // WebKitGTK can deliver an empty image paste event even though its async
     // Clipboard API has image/png. Ordinary text stays on xterm's paste path.
     const readNativeClipboard = !file && event.clipboardData?.types.length === 0 &&
-      "__TAURI_INTERNALS__" in window && typeof navigator.clipboard?.read === "function";
+      isNativeShell() && typeof navigator.clipboard?.read === "function";
     if (!file && !readNativeClipboard) return;
     event.preventDefault();
     event.stopPropagation();

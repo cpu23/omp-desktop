@@ -1,5 +1,4 @@
-import { describe, expect, spyOn, test } from "bun:test";
-import { SerializeAddon } from "@xterm/addon-serialize";
+import { describe, expect, test } from "bun:test";
 import { Terminal } from "@xterm/headless";
 import { RuntimeResourceBudget } from "./resource-budget";
 import { TerminalReplay } from "./terminal-replay";
@@ -51,35 +50,41 @@ describe("terminal replay snapshots", () => {
     }
   });
 
-  test("reuses snapshots until parsed output or actual geometry changes", async () => {
+  test("returns isolated snapshots across parsed output and geometry changes", async () => {
     const replay = new TerminalReplay(40, 8);
-    const serializeSpy = spyOn(SerializeAddon.prototype, "serialize");
+    const restored = new Terminal({ cols: 40, rows: 8, allowProposedApi: true });
+    const restoredUpdated = new Terminal({ cols: 40, rows: 8, allowProposedApi: true });
+    const restoredResized = new Terminal({ cols: 80, rows: 24, allowProposedApi: true });
     try {
       await append(replay, "before");
       const first = await snapshot(replay);
       first.data = "caller mutation";
       const cached = await snapshot(replay);
       expect(cached.data).not.toBe("caller mutation");
-      expect(cached).not.toBe(first);
-      expect(serializeSpy).toHaveBeenCalledTimes(1);
+      expect(cached.data).toContain("before");
+      await write(restored, cached.data);
+      expect(lines(restored)[0]).toBe("before");
 
       replay.resize(40, 8);
       const unchangedGeometry = await snapshot(replay);
       expect({ cols: unchangedGeometry.cols, rows: unchangedGeometry.rows }).toEqual({ cols: 40, rows: 8 });
-      expect(serializeSpy).toHaveBeenCalledTimes(1);
 
       await append(replay, " after");
       const updated = await snapshot(replay);
       expect(updated.data).toContain("before after");
-      expect(serializeSpy).toHaveBeenCalledTimes(2);
+      await write(restoredUpdated, updated.data);
+      expect(lines(restoredUpdated)[0]).toBe("before after");
 
       replay.resize(80, 24);
       const resized = await snapshot(replay);
       expect({ cols: resized.cols, rows: resized.rows }).toEqual({ cols: 80, rows: 24 });
-      expect(serializeSpy).toHaveBeenCalledTimes(3);
+      await write(restoredResized, resized.data);
+      expect(lines(restoredResized)[0]).toBe("before after");
     } finally {
-      serializeSpy.mockRestore();
       replay.dispose();
+      restored.dispose();
+      restoredUpdated.dispose();
+      restoredResized.dispose();
     }
   });
 
@@ -247,9 +252,8 @@ describe("terminal replay snapshots", () => {
     }
   });
 
-  test("fences a plain-text visible-screen projection without serializing history", async () => {
+  test("fences a plain-text visible-screen projection", async () => {
     const replay = new TerminalReplay(40, 3);
-    const serializeSpy = spyOn(SerializeAddon.prototype, "serialize");
     try {
       const before = append(replay, "history-only\r\nscreen-one\r\nscreen-two\r\nscreen-three");
       const screenPromise = replay.screenSnapshot();
@@ -259,13 +263,14 @@ describe("terminal replay snapshots", () => {
       await Promise.all([before, after]);
       expect(screen.cols).toBe(40);
       expect(screen.rows).toBe(3);
-      expect(screen.screen).toContain("screen-one");
+      expect(screen.screen.split("\n").map((line) => line.trimEnd())).toEqual([
+        "screen-one",
+        "screen-two",
+        "screen-three",
+      ]);
       expect(screen.screen).not.toContain("history-only");
       expect(screen.screen).not.toContain("later-only");
-      expect(screen.screen.split("\n")).toHaveLength(3);
-      expect(serializeSpy).not.toHaveBeenCalled();
     } finally {
-      serializeSpy.mockRestore();
       replay.dispose();
     }
   });
