@@ -345,6 +345,13 @@ bun run smoke:native -- --images
 The full runner uses isolated fixture daemons, profiles and a private D-Bus notification service. It needs
 `WebKitWebDriver`, `dbus-daemon`, Python 3 with PyGObject, AT-SPI (`at-spi2-core` and `gir1.2-atspi-2.0`), Xvfb,
 `xdotool`, `xprop` (`x11-utils`), `wmctrl`, `xclip`, `scrot`, and Openbox; Ubuntu CI installs the driver from `webkit2gtk-driver`.
+
+On Ubuntu 24.04, `bwrap: setting up uid map: Permission denied` can indicate AppArmor is blocking the user namespace
+required by WebKit's sandbox. See [Ubuntu bug 2144531](https://bugs.launchpad.net/ubuntu/+source/bubblewrap/+bug/2144531)
+for the narrow `/usr/bin/bwrap` AppArmor profile approach; merge the `userns` permission into an existing profile
+rather than replacing stricter rules. Keep the WebKit sandbox enabled and do not disable user-namespace restrictions
+globally. The application installer does not modify system AppArmor policy.
+
 `ENABLE_WEBDRIVER=OFF` is a WebKitGTK library build option that can leave `WebKitWebDriver` available for navigation and DOM
 inspection without native mouse/keyboard actions. The runner uses actual `xdotool` OS events for native input; no JavaScript
 click or keyboard fallback is used. The full input scenarios require X11 (provided by the fixture-owned Xvfb). The focused real-PTY input case is:

@@ -64,6 +64,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
+            apparmor \
             at-spi2-core \
             build-essential \
             dbus-x11 \
@@ -82,6 +83,42 @@ jobs:
             xclip \
             xdotool \
             xvfb
+
+      - name: Allow bubblewrap user namespaces for the WebKit sandbox
+        run: |
+          # WebKit requires user namespaces from bwrap on Ubuntu 24.04:
+          # https://bugs.launchpad.net/ubuntu/+source/bubblewrap/+bug/2144531
+          probe_bwrap() {
+            bwrap --unshare-user --unshare-pid --ro-bind / / /usr/bin/true
+          }
+          if probe_bwrap; then
+            echo "WebKit bubblewrap user/pid namespaces are available."
+          else
+            restriction="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || printf '0')"
+            if [ "$restriction" != "1" ]; then
+              echo "WebKit bubblewrap user namespaces are unavailable and Ubuntu AppArmor restriction is not enabled; refusing to weaken sandbox policy." >&2
+              exit 1
+            fi
+            if ! sudo test -r /sys/kernel/security/apparmor/profiles; then
+              echo "Cannot inspect loaded AppArmor profiles; refusing to replace or layer policy blindly." >&2
+              exit 1
+            fi
+            if [ -e /etc/apparmor.d/bwrap ] || sudo grep -R -Fq '/usr/bin/bwrap' /etc/apparmor.d || sudo grep -Eq '^bwrap \(' /sys/kernel/security/apparmor/profiles; then
+              echo "Existing bwrap AppArmor policy is preserved; it does not permit the WebKit sandbox prerequisite." >&2
+              exit 1
+            fi
+            sudo tee /etc/apparmor.d/bwrap >/dev/null <<'EOF'
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          profile bwrap /usr/bin/bwrap flags=(unconfined) {
+            userns,
+            include if exists <local/bwrap>
+          }
+          EOF
+            sudo apparmor_parser -a /etc/apparmor.d/bwrap
+            probe_bwrap
+          fi
 
       - name: Set up Rust 1.92
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
