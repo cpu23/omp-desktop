@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { isRecord } from "../src/guards";
 import { fakeOmpRecordPath, startTestDaemon, writeTestTranscript, type TestDaemon } from "./fixtures/daemon";
 import { runImageAssertions } from "./fixtures/image-assertions";
-import { WebDriver, type X11InputBackend } from "./fixtures/webdriver";
+import { WebDriver, type WebDriverElement, type X11InputBackend } from "./fixtures/webdriver";
 
 import { AccessibilityClient, walkAccessibilityTree, type AccessibilityNode } from "./fixtures/accessibility";
 const ROOT = resolve(import.meta.dir, "..");
@@ -645,6 +645,31 @@ async function activePaneBindings(driver: WebDriver, base: string): Promise<Arra
     return isRecord(binding) && typeof binding.runtimeId === "string" ? [{ paneId, runtimeId: binding.runtimeId }] : [];
   });
 }
+async function nativeInputDiagnostics(
+  driver: WebDriver,
+  base: string,
+  root: string,
+  target: { paneId: string; runtimeId: string },
+): Promise<string> {
+  const bindings = await activePaneBindings(driver, base).catch((error) => String(error));
+  const currentRuntimes = await runtimes(base).catch(() => []);
+  const records = await Promise.all(currentRuntimes.map(async (runtime) => {
+    const [bytes, output] = await Promise.all([
+      readRecord(root, runtime.id).then((record) => record.toString("utf8").slice(-512)).catch((error) => String(error)),
+      screen(base, runtime.id).catch((error) => String(error)),
+    ]);
+    return { runtimeId: runtime.id, bytes, screen: output.slice(-512) };
+  }));
+  const page = await driver.execute<unknown>(
+    `return { url: location.href, activePane: document.activeElement?.closest(".pane")?.dataset.pane ?? null,
+      panes: Array.from(document.querySelectorAll("#panes .pane"), pane => ({
+        paneId: pane.dataset.pane ?? "", textareas: pane.querySelectorAll("textarea.xterm-helper-textarea").length,
+        hasFocus: pane.contains(document.activeElement)
+      })) };`,
+  ).catch((error) => ({ error: String(error) }));
+  return JSON.stringify({ intendedPane: target, currentBindings: bindings, records, page });
+}
+
 async function waitForRuntimePaneReady(driver: WebDriver, base: string, runtimeId: string): Promise<void> {
   await driver.waitFor(async () => {
     const binding = (await activePaneBindings(driver, base)).find((pane) => pane.runtimeId === runtimeId);
@@ -656,6 +681,20 @@ async function waitForRuntimePaneReady(driver: WebDriver, base: string, runtimeI
     ) : false;
   }, `WebSocket attachment and replay completion for runtime ${runtimeId}`, 25_000);
 }
+async function focusRuntimePane(
+  driver: WebDriver,
+  base: string,
+  runtimeId: string,
+): Promise<{ binding: { paneId: string; runtimeId: string }; textarea: WebDriverElement }> {
+  const binding = await driver.waitFor(async () =>
+    (await activePaneBindings(driver, base)).find((pane) => pane.runtimeId === runtimeId) ?? false,
+  `the new runtime ${runtimeId} to have a visible active-space pane binding`);
+  const paneSelector = `#panes .pane[data-pane=${JSON.stringify(binding.paneId)}]`;
+  await driver.click(await driver.find(paneSelector));
+  const textarea = await driver.find(`${paneSelector} textarea.xterm-helper-textarea`);
+  return { binding, textarea };
+}
+
 
 
 async function waitConnected(driver: WebDriver, port: number): Promise<void> {
@@ -718,14 +757,29 @@ async function captureShellScreenshot(driver: WebDriver, path: string): Promise<
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, Buffer.from(image, "base64"));
 }
-async function waitForRenderedTerminalFrame(driver: WebDriver): Promise<void> {
-  await Bun.sleep(300);
+async function waitForRenderedTerminalFrame(driver: WebDriver, settleMs = 300): Promise<void> {
+  await Bun.sleep(settleMs);
   await driver.executeAsync(`
     const complete = arguments[arguments.length - 1];
     Promise.resolve(document.fonts.ready).then(() => {
       requestAnimationFrame(() => requestAnimationFrame(() => complete(true)));
     });
   `);
+}
+
+async function captureTerminalScreenshots(
+  driver: WebDriver,
+  screenshotPath: string,
+  suffix: string,
+): Promise<{ immediate: string; afterTwoSeconds: string }> {
+  const stem = screenshotPath.replace(/\.png$/i, "");
+  const immediate = `${stem}-${suffix}-initial.png`;
+  const afterTwoSeconds = `${stem}-${suffix}-after-2s.png`;
+  await waitForRenderedTerminalFrame(driver);
+  await captureShellScreenshot(driver, immediate);
+  await waitForRenderedTerminalFrame(driver, 2_000);
+  await captureShellScreenshot(driver, afterTwoSeconds);
+  return { immediate, afterTwoSeconds };
 }
 
 
@@ -1068,14 +1122,19 @@ async function testFirstSessionAndPaneWorkload(
   await waitForRuntimePaneReady(driver, base, created.id);
   console.log("ok - #new-session creates a real runtime and WebSocket attachment starts its fake-OMP PTY");
   const createdRecord = fakeOmpRecordPath(daemon.root, created.id);
-  const terminal = await driver.find("#panes .pane textarea.xterm-helper-textarea");
-  await driver.click(await driver.find("#panes .pane"));
+  const { binding: createdBinding, textarea: terminal } = await focusRuntimePane(driver, base, created.id);
   const echo = "native-echo-✓";
   await driver.sendKeys(terminal, `${echo}${PRIVATE_USE_ENTER}`);
-  await waitFor("the exact initial PTY bytes", async () => {
-    const bytes = (await readRecord(daemon.root, created.id)).toString("utf8");
-    return bytes.includes(`${echo}\n`) ? true : false;
-  });
+  try {
+    await waitFor("the exact initial PTY bytes", async () => {
+      const bytes = (await readRecord(daemon.root, created.id)).toString("utf8");
+      return bytes.includes(`${echo}\n`) ? true : false;
+    });
+  } catch (error) {
+    throw new Error(
+      `${String(error)}; initial PTY diagnostics: ${await nativeInputDiagnostics(driver, base, daemon.root, createdBinding)}`,
+    );
+  }
   const initialScreen = await waitFor("the first input ACK in the daemon screen", async () => {
     const output = await screen(base, created.id);
     return output.includes(`ACK:${echo}`) ? output : false;
@@ -1083,9 +1142,10 @@ async function testFirstSessionAndPaneWorkload(
   assert(countOccurrences(initialScreen, `ACK:${echo}`) === 1, "The daemon screen snapshot duplicated the first terminal ACK.");
   const bytes = (await readRecord(daemon.root, created.id)).toString("utf8");
   assert(countOccurrences(bytes, echo) === 1, "WebDriver key input was lost or duplicated in the PTY byte record.");
-  await waitForRenderedTerminalFrame(driver);
-  await captureShellScreenshot(driver, screenshotPath);
-  console.log(`ok - WebDriver entered native-echo-✓ through xterm; PTY bytes and daemon /screen ACK verified, native screenshot captured at ${screenshotPath}`);
+  const acknowledgementFrames = await captureTerminalScreenshots(driver, screenshotPath, "initial-input");
+  console.log(
+    `ok - WebDriver entered native-echo-✓ through xterm; PTY bytes and daemon /screen ACK verified; immediate and 2s screenshots captured at ${acknowledgementFrames.immediate} and ${acknowledgementFrames.afterTwoSeconds}`,
+  );
   assert(await fileExists(createdRecord), "The UI-created runtime did not get a fixture-owned input record.");
 
   await driver.rightClick(await driver.find("#panes .pane"));
@@ -2608,14 +2668,20 @@ async function testInitialNativeInput(parent: string, binary: string, busAddress
       return current.length === 2 && added.length === 1 && added[0]!.pid !== null ? added[0] : false;
     });
     await waitForRuntimePaneReady(shell.driver, daemon.base, runtime.id);
-    const textarea = await shell.driver.find("#panes .pane textarea.xterm-helper-textarea");
-    await shell.driver.click(await shell.driver.find("#panes .pane"));
+    const { binding, textarea } = await focusRuntimePane(shell.driver, daemon.base, runtime.id);
     const marker = "native-echo-✓";
     await shell.driver.sendKeys(textarea, `${marker}${PRIVATE_USE_ENTER}`);
-    const record = await waitFor("OS-keyboard bytes in the first fake OMP PTY", async () => {
-      const bytes = await readRecord(daemon!.root, runtime.id);
-      return bytes.length > 0 ? bytes : false;
-    });
+    let record: Buffer;
+    try {
+      record = await waitFor("the exact OS-keyboard bytes in the new runtime's fake OMP PTY", async () => {
+        const bytes = await readRecord(daemon!.root, runtime.id);
+        return bytes.toString("utf8") === `${marker}\n` ? bytes : false;
+      });
+    } catch (error) {
+      throw new Error(
+        `${String(error)}; initial PTY diagnostics: ${await nativeInputDiagnostics(shell.driver, daemon.base, daemon.root, binding)}`,
+      );
+    }
     assert(record.toString("utf8") === `${marker}\n`,
       `X11 OS-keyboard input did not produce exactly one UTF-8 line: ${JSON.stringify(record.toString("utf8"))}`);
     const output = await waitFor("the first real PTY's exact daemon screen ACK", async () => {
@@ -2623,9 +2689,10 @@ async function testInitialNativeInput(parent: string, binary: string, busAddress
       return countOccurrences(value, `ACK:${marker}`) === 1 ? value : false;
     });
     assert(countOccurrences(output, `ACK:${marker}`) === 1, "The daemon screen omitted or duplicated the first native ACK.");
-    await waitForRenderedTerminalFrame(shell.driver);
-    await captureShellScreenshot(shell.driver, screenshotPath);
-    console.log(`ok - X11 OS input typed ${marker}; exact PTY bytes and daemon /screen ACK verified; native screenshot captured at ${screenshotPath}`);
+    const acknowledgementFrames = await captureTerminalScreenshots(shell.driver, screenshotPath, "initial-input");
+    console.log(
+      `ok - X11 OS input typed ${marker}; exact PTY bytes and daemon /screen ACK verified; immediate and 2s screenshots captured at ${acknowledgementFrames.immediate} and ${acknowledgementFrames.afterTwoSeconds}`,
+    );
     await closeShell(shell);
     shell = null;
     assert(await isProcessAlive(runtime.pid!), "Closing the shell terminated the fixture-owned PTY.");
@@ -2953,8 +3020,30 @@ async function runNativeSmoke(): Promise<"full" | "images-only" | "policy-only" 
 
 const debugNativeHandles = process.env.OMP_DESKTOP_NATIVE_DEBUG_HANDLES === "1";
 let smokeReturned = false;
+let beforeExitReported = false;
 
-function reportNativeProcessResources(label: string, code?: number): void {
+async function reportNativeProcessResources(label: string): Promise<void> {
+  const fdEntries = await readdir("/proc/self/fd").catch(() => []);
+  const fileDescriptors = await Promise.all(fdEntries.filter((entry) => /^\d+$/.test(entry)).map(async (fd) => ({
+    fd,
+    target: await readlink(`/proc/self/fd/${fd}`).catch(() => null),
+  })));
+  const socketInodes = new Set(fileDescriptors.flatMap(({ target }) => {
+    const match = target?.match(/^socket:\[(\d+)\]$/);
+    return match ? [match[1]!] : [];
+  }));
+  const netTables = await Promise.all(["unix", "tcp", "tcp6"].map(async (table) => ({
+    table,
+    text: await readFile(`/proc/self/net/${table}`, "utf8").catch(() => ""),
+  })));
+  const matchingSockets = netTables.flatMap(({ table, text }) => {
+    const lines = text.trimEnd().split("\n");
+    const inodeIndex = lines[0]?.trim().split(/\s+/).findIndex((column) => column.toLowerCase() === "inode") ?? -1;
+    if (inodeIndex < 0) return [];
+    return lines.slice(1)
+      .filter((line) => socketInodes.has(line.trim().split(/\s+/)[inodeIndex] ?? ""))
+      .map((line) => ({ table, row: line.trim() }));
+  });
   const getActiveHandles = Reflect.get(process, "_getActiveHandles");
   const rawHandles = typeof getActiveHandles === "function"
     ? (getActiveHandles as () => unknown[]).call(process)
@@ -2973,18 +3062,27 @@ function reportNativeProcessResources(label: string, code?: number): void {
     }
     return { type: value.constructor?.name ?? "unknown", fd: value.fd ?? null, address };
   });
-  console.log(`NATIVE PROCESS ${label} pid=${process.pid}${code === undefined ? "" : ` code=${code}`} ${JSON.stringify({
+  console.log(`NATIVE PROCESS ${label} pid=${process.pid} ${JSON.stringify({
     resources: process.getActiveResourcesInfo(),
     handles,
+    fileDescriptors,
+    matchingSockets,
   })}`);
 }
 
 if (debugNativeHandles) {
   process.on("beforeExit", (code) => {
-    if (smokeReturned) reportNativeProcessResources("beforeExit", code);
+    if (smokeReturned && !beforeExitReported) {
+      beforeExitReported = true;
+      console.log(`NATIVE PROCESS beforeExit pid=${process.pid} code=${code} resources=${JSON.stringify(process.getActiveResourcesInfo())}`);
+      void reportNativeProcessResources("beforeExit").catch((error) =>
+        console.error(`NATIVE PROCESS beforeExit diagnostic failed: ${String(error)}`));
+    }
   });
   process.on("exit", (code) => {
-    if (smokeReturned) reportNativeProcessResources("exit", code);
+    if (smokeReturned) {
+      console.log(`NATIVE PROCESS exit pid=${process.pid} code=${code} resources=${JSON.stringify(process.getActiveResourcesInfo())}`);
+    }
   });
 }
 
@@ -3001,8 +3099,11 @@ try {
           ? "NATIVE NORMAL-MODE NOTIFICATION AND PERSISTENCE SMOKE PASSED"
           : "NATIVE SMOKE PASSED");
   if (debugNativeHandles) {
-    reportNativeProcessResources("main-return");
-    const diagnosticTimer = setTimeout(() => reportNativeProcessResources("unref-watchdog"), 2_000);
+    await reportNativeProcessResources("main-return");
+    const diagnosticTimer = setTimeout(() => {
+      void reportNativeProcessResources("unref-watchdog").catch((error) =>
+        console.error(`NATIVE PROCESS watchdog diagnostic failed: ${String(error)}`));
+    }, 2_000);
     diagnosticTimer.unref();
   }
 } catch (error) {
