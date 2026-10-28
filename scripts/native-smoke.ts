@@ -469,7 +469,21 @@ async function openShell(profile: Profile, port: number, binary: string): Promis
     console.log(`Negotiated WebDriver capabilities: ${JSON.stringify(driver.capabilities)}`);
     return { host: host.child, driver, closed: false };
   } catch (error) {
-    return await stopChildAndRethrow(host.child, error, "Automated GTK window creation failed and its WebKitWebDriver cleanup failed.");
+    const diagnostics = [
+      `WebKitWebDriver binary: ${host.binary}`,
+      `WebKitWebDriver endpoint: ${host.endpoint}`,
+      `WebKitWebDriver pid/exit: ${host.child.proc.pid}/${String(host.child.proc.exitCode)}`,
+      `GTK launch environment: DISPLAY=${JSON.stringify(profile.env.DISPLAY ?? "")} GDK_BACKEND=${JSON.stringify(profile.env.GDK_BACKEND ?? "")} XDG_RUNTIME_DIR=${JSON.stringify(profile.env.XDG_RUNTIME_DIR ?? "")}`,
+      `WebKitWebDriver stdout:\n${host.child.stdout.text || "(empty)"}`,
+      `WebKitWebDriver stderr:\n${host.child.stderr.text || "(empty)"}`,
+    ].join("\n");
+    const failure = new Error(`Automated GTK window creation failed: ${String(error)}\n${diagnostics}`, { cause: error });
+    try {
+      await stopChild(host.child);
+    } catch (cleanupError) {
+      throw new AggregateError([failure, cleanupError], "Automated GTK startup and WebKitWebDriver cleanup failed.");
+    }
+    throw failure;
   }
 }
 
