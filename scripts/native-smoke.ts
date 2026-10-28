@@ -3,7 +3,6 @@
 import { access, chmod, mkdir, mkdtemp, readFile, readlink, readdir, rm, writeFile } from "node:fs/promises";
 import { createServer as createNetServer, type AddressInfo } from "node:net";
 import { createServer as createHttpServer } from "node:http";
-import { dlopen, FFIType, ptr } from "bun:ffi";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { isRecord } from "../src/guards";
@@ -2620,35 +2619,40 @@ async function testNativeImages(parent: string, binary: string, busAddress: stri
           : `hardware not proven for renderer ${JSON.stringify(webgl.renderer)}`;
       if (requireGpu) throw new Error(`GPU-required native image run cannot accept an unverified renderer: ${reason}`);
       console.log(`Native WebGL image assertions not run: ${reason}; DOM image assertions passed.`);
-      return;
+    } else {
+      await shell.driver.navigate(`${imageFixture.url}/?renderer=webgl`);
+      await shell.driver.waitFor(async () => (await shell!.driver.execute<string>("return location.href")).includes("?renderer=webgl"),
+        "the fixture-owned WebGL image page", 30_000);
+      await shell.driver.waitFor(async () => await shell!.driver.execute<boolean>("return Boolean(document.querySelector('#terminal'))"),
+        "the fixture-owned WebGL terminal", 30_000);
+      await runImageAssertions(shell.driver);
+      console.log(`ok - native WebKitGTK WebGL image assertions (${webgl.renderer}; NVIDIA WebKit process proof=${nvidiaProcessProof})`);
     }
-
-    await shell.driver.navigate(`${imageFixture.url}/?renderer=webgl`);
-    await shell.driver.waitFor(async () => (await shell!.driver.execute<string>("return location.href")).includes("?renderer=webgl"),
-      "the fixture-owned WebGL image page", 30_000);
-    await shell.driver.waitFor(async () => await shell!.driver.execute<boolean>("return Boolean(document.querySelector('#terminal'))"),
-      "the fixture-owned WebGL terminal", 30_000);
-    await runImageAssertions(shell.driver);
-    console.log(`ok - native WebKitGTK WebGL image assertions (${webgl.renderer}; NVIDIA WebKit process proof=${nvidiaProcessProof})`);
   } catch (error) {
     if (shell) {
       console.error(`WebKitWebDriver stdout:\n${shell.host.stdout.text}\nWebKitWebDriver stderr:\n${shell.host.stderr.text}`);
     }
     failure = { error };
-  }
-  try {
-    await cleanupOwned("native image scenario", [
-      async () => {
-        if (shell) await closeShell(shell);
-      },
-      async () => {
-        if (fixture) fixture.server.stop(true);
-      },
-      () => rm(root, { recursive: true, force: true }),
-    ]);
-  } catch (cleanupError) {
-    if (failure) throw new AggregateError([failure.error, cleanupError], "Native image scenario failed and cleanup also failed.");
-    throw cleanupError;
+  } finally {
+    try {
+      await cleanupOwned("native image scenario", [
+        async () => {
+          if (shell) await closeShell(shell);
+        },
+        async () => {
+          if (fixture) fixture.server.stop(true);
+        },
+        () => rm(root, { recursive: true, force: true }),
+      ]);
+    } catch (cleanupError) {
+      if (failure) {
+        failure = {
+          error: new AggregateError([failure.error, cleanupError], "Native image scenario failed and cleanup also failed."),
+        };
+      } else {
+        throw cleanupError;
+      }
+    }
   }
   if (failure) throw failure.error;
 }
@@ -3029,124 +3033,9 @@ async function runNativeSmoke(): Promise<"full" | "images-only" | "policy-only" 
   return imagesOnly ? "images-only" : policyOnly ? "policy-only" : inputOnly ? "input-only" : notificationOnly ? "notification-only" : "full";
 }
 
-const debugNativeHandles = process.env.OMP_DESKTOP_NATIVE_DEBUG_HANDLES === "1";
-let smokeReturned = false;
-let beforeExitReported = false;
-
-function inspectLinuxSocketDescriptors(
-  fileDescriptors: Array<{ fd: string; target: string | null }>,
-): Array<Record<string, unknown>> {
-  if (process.platform !== "linux") return [];
-  const sockets = fileDescriptors.flatMap(({ fd, target }) => {
-    const match = target?.match(/^socket:\[(\d+)\]$/);
-    return match ? [{ fd: Number(fd), target, inode: match[1]! }] : [];
-  });
-  if (sockets.length === 0) return [];
-
-  const libc = dlopen("libc.so.6", {
-    getsockopt: {
-      args: [FFIType.i32, FFIType.i32, FFIType.i32, FFIType.ptr, FFIType.ptr],
-      returns: FFIType.i32,
-    },
-    getsockname: { args: [FFIType.i32, FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
-    getpeername: { args: [FFIType.i32, FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
-  });
-  try {
-    const option = (fd: number, name: number): number | null => {
-      const value = new Int32Array(1);
-      const length = new Uint32Array([value.byteLength]);
-      return libc.symbols.getsockopt(fd, 1, name, ptr(value), ptr(length)) === 0 ? value[0]! : null;
-    };
-    const address = (name: "getsockname" | "getpeername", fd: number): string | null => {
-      const bytes = new Uint8Array(128);
-      const length = new Uint32Array([bytes.byteLength]);
-      if (libc.symbols[name](fd, ptr(bytes), ptr(length)) !== 0) return null;
-      return Array.from(bytes.subarray(0, length[0]!), (byte) => byte.toString(16).padStart(2, "0")).join("");
-    };
-    return sockets.map(({ fd, target, inode }) => ({
-      fd,
-      target,
-      inode,
-      domain: option(fd, 39), // Linux SO_DOMAIN
-      type: option(fd, 3), // Linux SO_TYPE
-      protocol: option(fd, 38), // Linux SO_PROTOCOL
-      acceptingConnections: option(fd, 30), // Linux SO_ACCEPTCONN
-      localAddress: address("getsockname", fd),
-      peerAddress: address("getpeername", fd),
-    }));
-  } finally {
-    libc.close();
-  }
-}
-
-async function reportNativeProcessResources(label: string): Promise<void> {
-  const fdEntries = await readdir("/proc/self/fd").catch(() => []);
-  const fileDescriptors = await Promise.all(fdEntries.filter((entry) => /^\d+$/.test(entry)).map(async (fd) => ({
-    fd,
-    target: await readlink(`/proc/self/fd/${fd}`).catch(() => null),
-  })));
-  const socketInodes = new Set(fileDescriptors.flatMap(({ target }) => {
-    const match = target?.match(/^socket:\[(\d+)\]$/);
-    return match ? [match[1]!] : [];
-  }));
-  const netTables = await Promise.all(["unix", "tcp", "tcp6"].map(async (table) => ({
-    table,
-    text: await readFile(`/proc/self/net/${table}`, "utf8").catch(() => ""),
-  })));
-  const matchingSockets = netTables.flatMap(({ table, text }) => {
-    const lines = text.trimEnd().split("\n");
-    const inodeIndex = lines[0]?.trim().split(/\s+/).findIndex((column) => column.toLowerCase() === "inode") ?? -1;
-    if (inodeIndex < 0) return [];
-    return lines.slice(1)
-      .filter((line) => socketInodes.has(line.trim().split(/\s+/)[inodeIndex] ?? ""))
-      .map((line) => ({ table, row: line.trim() }));
-  });
-  const getActiveHandles = Reflect.get(process, "_getActiveHandles");
-  const rawHandles = typeof getActiveHandles === "function"
-    ? (getActiveHandles as () => unknown[]).call(process)
-    : [];
-  const handles = rawHandles.map((handle: unknown) => {
-    const value = handle as {
-      constructor?: { name?: string };
-      fd?: unknown;
-      address?: () => unknown;
-    };
-    let address: unknown = null;
-    try {
-      address = value.address?.() ?? null;
-    } catch (error) {
-      address = String(error);
-    }
-    return { type: value.constructor?.name ?? "unknown", fd: value.fd ?? null, address };
-  });
-  console.log(`NATIVE PROCESS ${label} pid=${process.pid} ${JSON.stringify({
-    resources: process.getActiveResourcesInfo(),
-    handles,
-    fileDescriptors,
-    matchingSockets,
-    socketDetails: inspectLinuxSocketDescriptors(fileDescriptors),
-  })}`);
-}
-
-if (debugNativeHandles) {
-  process.on("beforeExit", (code) => {
-    if (smokeReturned && !beforeExitReported) {
-      beforeExitReported = true;
-      console.log(`NATIVE PROCESS beforeExit pid=${process.pid} code=${code} resources=${JSON.stringify(process.getActiveResourcesInfo())}`);
-      void reportNativeProcessResources("beforeExit").catch((error) =>
-        console.error(`NATIVE PROCESS beforeExit diagnostic failed: ${String(error)}`));
-    }
-  });
-  process.on("exit", (code) => {
-    if (smokeReturned) {
-      console.log(`NATIVE PROCESS exit pid=${process.pid} code=${code} resources=${JSON.stringify(process.getActiveResourcesInfo())}`);
-    }
-  });
-}
 
 try {
   const result = await runNativeSmoke();
-  smokeReturned = true;
   console.log(result === "images-only"
     ? "NATIVE IMAGE SMOKE PASSED (functional input scenarios not run)"
     : result === "policy-only"
@@ -3156,16 +3045,7 @@ try {
         : result === "notification-only"
           ? "NATIVE NORMAL-MODE NOTIFICATION AND PERSISTENCE SMOKE PASSED"
           : "NATIVE SMOKE PASSED");
-  if (debugNativeHandles) {
-    await reportNativeProcessResources("main-return");
-    const diagnosticTimer = setTimeout(() => {
-      void reportNativeProcessResources("unref-watchdog").catch((error) =>
-        console.error(`NATIVE PROCESS watchdog diagnostic failed: ${String(error)}`));
-    }, 2_000);
-    diagnosticTimer.unref();
-  }
 } catch (error) {
-  smokeReturned = true;
   console.error("NATIVE SMOKE FAILED", error);
   process.exitCode = 1;
 }
