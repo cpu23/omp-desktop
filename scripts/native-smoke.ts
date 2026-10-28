@@ -1694,12 +1694,20 @@ async function testClipboardAndFileDrop(profile: Profile, daemon: TestDaemon, sh
     await stopChild(textOwner);
   }
   console.log(`ok - ${backend} OS clipboard text reaches the selected terminal exactly once`);
+  const targetPaneSelector = `#panes .pane[data-pane=${JSON.stringify(target.paneId)}]`;
+  const targetTextarea = await shell.driver.find(`${targetPaneSelector} textarea.xterm-helper-textarea`);
+  const terminalStillFocused = await shell.driver.execute<boolean>(
+    `return document.activeElement === arguments[0];`,
+    [targetTextarea],
+  );
+  assert(terminalStillFocused, `The selected terminal ${target.paneId} lost native keyboard focus after the text paste; refusing to click again before PNG paste.`);
 
   const previous = await readRecord(daemon.root, target.runtimeId);
   const pasteFilesBefore = new Set(await readdir(join(daemon.root, "pastes")).catch(() => []));
   const imageOwner = await setClipboard(backend, profile, "image/png", PNG_FIXTURE);
   try {
-    await shell.driver.click(await shell.driver.find(`#panes .pane[data-pane="${target.paneId}"]`));
+    // The text paste leaves this terminal focused. A second click could select
+    // rendered ACK text and replace the OS image selection before the real paste.
     const shellMarker = await shell.driver.execute<string | null>(
       `return window.__OMP_DESKTOP_SHELL__ ?? null;`,
     );
@@ -1717,6 +1725,8 @@ async function testClipboardAndFileDrop(profile: Profile, daemon: TestDaemon, sh
           trusted: event.isTrusted, types: Array.from(data?.types ?? []), items,
           textPlain: data?.getData("text/plain") ?? null,
           marker: window.__OMP_DESKTOP_SHELL__ ?? null, url: location.href,
+          activePane: document.activeElement?.closest(".pane")?.dataset.pane ?? null,
+          selection: window.getSelection()?.toString() ?? "",
           clipboardReadAvailable: typeof navigator.clipboard?.read === "function"
         });
       }, { capture: true, once: true });
