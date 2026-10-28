@@ -63,6 +63,7 @@ from your application menu; the daemon above must remain running.
   on macOS and Windows.
 - Require Rust 1.92+, GTK 4.14+, and WebKitGTK 6.0 2.44+ development APIs to build the Linux shell; no private
   WebKit runtime builder or prefix is supported.
+- Include the multi-size Windows icon resource required by the retained Tauri build.
 
 
 ## v0.1.4
