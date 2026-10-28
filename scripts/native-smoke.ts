@@ -1564,12 +1564,43 @@ async function setClipboard(backend: "x11" | "wayland", profile: Profile, mime: 
     input.write(bytes);
     input.flush();
     input.end();
-    await waitFor(`${mime} clipboard owner to start`, () => child.proc.exitCode === null ? true : false, 3_000);
+    await verifyClipboardSelection(backend, profile, mime, bytes);
     return child;
   } catch (error) {
     await stopChild(child);
     throw error;
   }
+}
+
+async function verifyClipboardSelection(
+  backend: "x11" | "wayland",
+  profile: Profile,
+  mime: string,
+  bytes: Uint8Array,
+): Promise<void> {
+  const timeout = requireCommand(["timeout"], "timeout for bounded OS clipboard verification");
+  const clipboardCommand = requireCommand(
+    backend === "x11" ? ["xclip"] : ["wl-paste"],
+    backend === "x11" ? "xclip for native X11 clipboard verification" : "wl-paste for native Wayland clipboard verification",
+  );
+  const runBounded = (command: string, args: string[]) => Bun.spawnSync({
+    cmd: [timeout, "--signal=TERM", "--kill-after=1s", "2s", command, ...args],
+    env: profile.env,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  await waitFor(`${backend} OS clipboard to advertise ${mime} and return the exact payload`, () => {
+    const targetResult = backend === "x11"
+      ? runBounded(clipboardCommand, ["-selection", "clipboard", "-out", "-t", "TARGETS"])
+      : runBounded(clipboardCommand, ["--list-types"]);
+    if (targetResult.exitCode !== 0) return false;
+    const targets = new TextDecoder().decode(targetResult.stdout).split(/\s+/);
+    if (!targets.includes(mime)) return false;
+    const payloadResult = backend === "x11"
+      ? runBounded(clipboardCommand, ["-selection", "clipboard", "-out", "-t", mime])
+      : runBounded(clipboardCommand, ["--no-newline", "--type", mime]);
+    return payloadResult.exitCode === 0 && Buffer.from(payloadResult.stdout).equals(Buffer.from(bytes));
+  }, 5_000);
 }
 
 function clipboardBackend(profile?: Profile): "x11" | "wayland" {
@@ -1623,6 +1654,7 @@ async function testClipboardAndFileDrop(profile: Profile, daemon: TestDaemon, sh
         });
         document.documentElement.dataset.ompNativePasteObservation = JSON.stringify({
           trusted: event.isTrusted, types: Array.from(data?.types ?? []), items,
+          textPlain: data?.getData("text/plain") ?? null,
           marker: window.__OMP_DESKTOP_SHELL__ ?? null, url: location.href,
           clipboardReadAvailable: typeof navigator.clipboard?.read === "function"
         });
