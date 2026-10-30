@@ -1290,6 +1290,21 @@ body.session-dragging * {
   transition: color 0.15s ease;
 }
 
+.title-edit-actions:not([hidden]) {
+  display: flex;
+  flex-shrink: 0;
+  gap: 3px;
+}
+.session-menu button {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.session-menu input {
+  width: min(320px, 70vw);
+  margin: 4px;
+}
+
 .pane-menu {
   position: fixed;
   z-index: 100;
