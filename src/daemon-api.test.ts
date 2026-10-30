@@ -231,6 +231,79 @@ describe("real daemon API behavior", () => {
     }
   }, 60_000);
 
+  test("desktop session titles are renamed, searched, and retained across daemon restart", async () => {
+    const daemon = await startTestDaemon();
+    try {
+      const originalTitle = "Transcript-owned title";
+      const transcript = await writeTestTranscript(daemon.root, "custom-title-persistence", { title: originalTitle });
+      const transcriptBefore = await Bun.file(transcript).text();
+      const outside = join(daemon.root, "outside-title-session.jsonl");
+      await Bun.write(outside, "{}\n");
+      const missing = join(testSessionsRoot(daemon.root), "-test-fixtures", "missing-title-session.jsonl");
+      const invalidPaths = [
+        outside,
+        missing,
+        join(testSessionsRoot(daemon.root), "..", "..", "..", "..", "outside-title-session.jsonl"),
+      ];
+      for (const path of invalidPaths) {
+        const rejected = await fetch(`${daemon.base}/api/sessions/title`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ path, title: "Rejected title" }),
+        });
+        expect(rejected.status).toBe(400);
+      }
+      for (const body of [
+        { path: transcript, title: "" },
+        { path: transcript, title: " \t\n " },
+        { path: transcript, title: 42 },
+        { path: 42, title: "Not a path" },
+        null,
+      ]) {
+        const rejected = await fetch(`${daemon.base}/api/sessions/title`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        expect(rejected.status).toBe(400);
+      }
+
+      const rename = async (title: string): Promise<void> => {
+        const response = await fetch(`${daemon.base}/api/sessions/title`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ path: transcript, title }),
+        });
+        expect(response.status).toBe(200);
+        expect(await response.json()).toEqual({ ok: true, path: transcript, title: title.trim() });
+      };
+      const matchingTitles = async (search: string): Promise<string[]> => {
+        const response = await fetch(`${daemon.base}/api/sessions?limit=5&search=${encodeURIComponent(search)}`);
+        expect(response.status).toBe(200);
+        const payload: unknown = await response.json();
+        if (!isRecord(payload) || !Array.isArray(payload.sessions)) throw new Error("bad /api/sessions payload");
+        return payload.sessions.flatMap((entry) =>
+          isRecord(entry) && typeof entry.title === "string" && typeof entry.path === "string"
+            ? [entry.path === transcript ? entry.title : ""]
+            : [],
+        ).filter(Boolean);
+      };
+
+      await rename("  First desktop title  ");
+      expect(await matchingTitles("First desktop title")).toEqual(["First desktop title"]);
+      await rename("  Renamed desktop session  ");
+      expect(await matchingTitles("Renamed desktop session")).toEqual(["Renamed desktop session"]);
+      expect(await matchingTitles(originalTitle)).toEqual([]);
+      expect(await Bun.file(transcript).text()).toBe(transcriptBefore);
+
+      await daemon.restart();
+      expect(await matchingTitles("Renamed desktop session")).toEqual(["Renamed desktop session"]);
+      expect(await Bun.file(transcript).text()).toBe(transcriptBefore);
+    } finally {
+      await daemon.stop();
+    }
+  }, 60_000);
+
   test("runtime capacity rejects new transcripts and DELETE stops and reaps the PTY", async () => {
     const daemon = await startTestDaemon({ env: { OMP_DESKTOP_MAX_RUNTIMES: "1" } });
     try {

@@ -470,7 +470,7 @@ async function readParsedHeader(file: SessionFile): Promise<HeadInfo | null> {
 }
 
 export async function listSessions(
-  options: { limit?: number; search?: string; sessionsRoot?: string } = {},
+  options: { limit?: number; search?: string; sessionsRoot?: string; titleOverrides?: ReadonlyMap<string, string> } = {},
 ): Promise<SessionSummary[]> {
   const root = resolve(
     options.sessionsRoot ??
@@ -483,7 +483,15 @@ export async function listSessions(
       : DEFAULT_LIMIT;
   const limit = Math.min(requestedLimit, MAX_SESSION_LIMIT);
   const search = options.search?.toLowerCase() ?? "";
-  const { files, summaries } = await readSessionIndex(root);
+  const indexed = await readSessionIndex(root);
+  const titleOverrides = options.titleOverrides;
+  const summaries = titleOverrides
+    ? indexed.summaries.map((summary) => {
+        const title = titleOverrides.get(summary.path);
+        return title ? { ...summary, title } : summary;
+      })
+    : indexed.summaries;
+  const { files } = indexed;
   const matched = search
     ? summaries.filter(
         (summary) =>

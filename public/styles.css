@@ -1248,10 +1248,23 @@ body.session-dragging * {
 .pane-title {
   flex: 0 1 auto;
   min-width: 0;
+  max-width: 100%;
+  padding: 2px 3px;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
   font-weight: 700;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.pane-title:not([readonly]) {
+  border-color: var(--accent);
+  outline: none;
+  background: var(--bg);
 }
 
 /* Exit state text only (the pid field was removed); same dim treatment the pid

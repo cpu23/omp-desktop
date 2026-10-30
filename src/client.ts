@@ -467,6 +467,13 @@ async function refreshSessions(): Promise<void> {
   const list = parseSessionList(await getJson(`/api/sessions?${query}`));
   if (!list) return;
   sessions = list;
+  for (const pane of panes.values()) {
+    const session = sessions.find((entry) => entry.path === pane.binding.sessionFile);
+    if (!session || pane.binding.title === session.title) continue;
+    pane.binding.title = session.title;
+    pane.renderHeader();
+    pane.renderPlaceholder();
+  }
   renderSidebar();
 }
 
@@ -547,7 +554,8 @@ class Pane {
   #startupFrame = false;
   #placeholderKey = "";
   #jumpLatest: HTMLButtonElement;
-  #titleEl: HTMLElement;
+  #titleEl: HTMLInputElement;
+  #editingTitle: { path: string; original: string } | null = null;
   #stateEl: HTMLElement;
   #pin: HTMLButtonElement;
   #observer: ResizeObserver;
@@ -569,8 +577,28 @@ class Pane {
 
     const header = document.createElement("header");
     header.className = "pane-header";
-    this.#titleEl = document.createElement("span");
+    this.#titleEl = document.createElement("input");
     this.#titleEl.className = "pane-title";
+    this.#titleEl.readOnly = true;
+    this.#titleEl.setAttribute("aria-label", "Session title");
+    this.#titleEl.addEventListener("mousedown", (event) => event.stopPropagation());
+    this.#titleEl.addEventListener("input", () => {
+      this.#titleEl.style.width = `${Math.max(2, this.#titleEl.value.length + 2)}ch`;
+    });
+    this.#titleEl.addEventListener("click", () => this.#beginTitleEdit());
+    this.#titleEl.addEventListener("blur", () => this.#finishTitleEdit(true));
+    this.#titleEl.addEventListener("keydown", (event) => {
+      event.stopPropagation();
+      if (event.isComposing) return;
+      if (event.key === "Enter" || event.key === "Escape") {
+        event.preventDefault();
+        if (!this.#editingTitle && event.key === "Enter") this.#beginTitleEdit();
+        else {
+          this.#finishTitleEdit(event.key === "Enter");
+          this.focus();
+        }
+      }
+    });
     this.#stateEl = document.createElement("span");
     this.#stateEl.className = "pane-state";
     const actions = document.createElement("div");
@@ -888,6 +916,7 @@ class Pane {
   }
 
   bind(binding: PaneBinding): void {
+    this.#finishTitleEdit(false);
     const changed = this.binding.runtimeId !== binding.runtimeId;
     if (changed || !binding.runtimeId) this.detach();
     this.binding = binding;
@@ -1109,14 +1138,59 @@ class Pane {
     if (!this.ws && this.retry !== Number.POSITIVE_INFINITY) this.attach();
     this.renderPlaceholder();
   }
+  #beginTitleEdit(): void {
+    if (this.#editingTitle || !this.binding.sessionFile) return;
+    this.#editingTitle = {
+      path: this.binding.sessionFile,
+      original: this.#titleEl.value,
+    };
+    this.#titleEl.readOnly = false;
+    this.#titleEl.focus();
+  }
+
+  #finishTitleEdit(commit: boolean): void {
+    const editing = this.#editingTitle;
+    if (!editing) return;
+    const title = this.#titleEl.value.trim();
+    this.#editingTitle = null;
+    this.#titleEl.readOnly = true;
+    this.renderHeader();
+    if (commit && title && title !== editing.original) {
+      void this.#saveTitle(editing.path, title);
+    }
+  }
+
+  async #saveTitle(path: string, title: string): Promise<void> {
+    const result = await getJson("/api/sessions/title", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path, title }),
+    });
+    if (result === null) return;
+    for (const session of [...sessions, ...pinnedSessions]) {
+      if (session.path === path) session.title = title;
+    }
+    for (const pane of panes.values()) {
+      if (pane.binding.sessionFile !== path) continue;
+      pane.binding.title = title;
+      pane.renderHeader();
+      pane.renderPlaceholder();
+    }
+    renderSidebar();
+    save();
+    await refreshSessions();
+  }
+
 
   renderHeader(): void {
     const sessionFile = this.binding.sessionFile ?? "";
     const session = sessionFile ? sessionSummary(sessionFile) ?? null : null;
     const title = this.binding.title ?? "no session";
     syncPinButton(this.#pin, session);
-    if (this.#titleEl.textContent !== title) this.#titleEl.textContent = title;
-    if (this.#titleEl.title !== sessionFile) this.#titleEl.title = sessionFile;
+    if (!this.#editingTitle && this.#titleEl.value !== title) this.#titleEl.value = title;
+    this.#titleEl.style.width = `${Math.max(2, this.#titleEl.value.length + 2)}ch`;
+    this.#titleEl.disabled = !sessionFile;
+    this.#titleEl.title = sessionFile ? "Click to edit title · Enter to save · Esc to cancel" : "Waiting for session file";
     if (this.binding.runtimeId && this.#stateEl.textContent !== "") this.#stateEl.textContent = "";
   }
 

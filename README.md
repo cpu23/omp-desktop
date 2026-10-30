@@ -41,6 +41,8 @@ from your application menu; the daemon above must remain running.
 
 - Panes show **Starting session…** while a new session initializes, hiding transient startup protocol text.
   Existing sessions reappear after replay; startup exits and disconnects uncover their output immediately.
+- Click a pane's session title to edit it. **Enter** or clicking away saves; **Escape** cancels.
+  Custom titles persist in Desktop and appear in the sidebar without modifying OMP transcripts.
 
 - **Loaded → Pinned → Recent:** each session appears only in its highest applicable section. Recent is ordered by
   last conversation activity. Thin, inset dividers separate the groups. Click a section label to collapse or expand it.
@@ -59,6 +61,7 @@ from your application menu; the daemon above must remain running.
 
 ## Unreleased
 
+- Edit session titles directly in pane headers, saving with Enter or blur and cancelling with Escape.
 - Replace the Linux GTK3/Tauri shell with a GTK4/WebKitGTK 6 shell using system packages, while retaining Tauri
   on macOS and Windows.
 - Require Rust 1.92+, GTK 4.14+, and WebKitGTK 6.0 2.44+ development APIs to build the Linux shell; no private
