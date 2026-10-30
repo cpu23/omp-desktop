@@ -202,6 +202,129 @@ const sidebarHeadings = new Map<string, HTMLElement>();
 const collapsedSidebarSections = new Set<string>();
 let sidebarFolderSeq = 0;
 let sidebarEmpty: HTMLElement | null = null;
+let archivedPaths = new Set<string>();
+
+const SESSION_ICONS = {
+  edit: '<path d="m16 3 5 5-12 12H4v-5Z"/><path d="m14 5 5 5"/>',
+  pin: '<path d="M9 3h6l-1 6 4 4v2H6v-2l4-4-1-6Z"/><path d="M12 15v6"/>',
+  unload: '<path d="M5 4v16h14V4"/><path d="M12 3v11m-4-4 4 4 4-4"/>',
+  archive: '<path d="M3 3h18v5H3zM5 8v13h14V8M10 12h4"/>',
+  save: '<path d="m5 12 4 4L19 6"/>',
+  cancel: '<path d="m6 6 12 12M6 18 18 6"/>',
+};
+function iconButton(label: string, icon: keyof typeof SESSION_ICONS): HTMLButtonElement {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.title = label;
+  button.setAttribute("aria-label", label);
+  button.innerHTML = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">${SESSION_ICONS[icon]}</svg>`;
+  return button;
+}
+
+async function saveSessionTitle(path: string, title: string): Promise<void> {
+  const result = await getJson("/api/sessions/title", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path, title }),
+  });
+  if (result === null) return;
+  for (const session of [...sessions, ...pinnedSessions]) if (session.path === path) session.title = title;
+  for (const pane of panes.values()) {
+    if (pane.binding.sessionFile !== path) continue;
+    pane.binding.title = title;
+    pane.renderHeader();
+    pane.renderPlaceholder();
+  }
+  renderSidebar();
+  save();
+  await refreshSessions();
+}
+
+const sessionMenu = document.createElement("div");
+sessionMenu.className = "pane-menu session-menu";
+sessionMenu.setAttribute("role", "menu");
+sessionMenu.setAttribute("aria-label", "Session actions");
+sessionMenu.hidden = true;
+document.body.append(sessionMenu);
+sessionMenu.addEventListener("mousedown", (event) => {
+  if (event.target instanceof Element && event.target.closest("button")) event.preventDefault();
+});
+function closeSessionMenu(): void {
+  sessionMenu.hidden = true;
+  sessionMenu.replaceChildren();
+}
+function showSessionMenu(record: SidebarRowRecord, x: number, y: number): void {
+  closePaneMenu();
+  closeSessionMenu();
+  const session = record.snapshot;
+  const runtime = record.runtime;
+  const item = (label: string, icon: keyof typeof SESSION_ICONS, action: () => void, disabled = false): void => {
+    const button = iconButton(label, icon);
+    button.append(document.createTextNode(label));
+    button.setAttribute("role", "menuitem");
+    button.disabled = disabled;
+    button.addEventListener("click", action);
+    sessionMenu.append(button);
+  };
+  item("Edit title", "edit", () => {
+    if (!session) return;
+    sessionMenu.replaceChildren();
+    const input = document.createElement("input");
+    input.value = session.title;
+    input.setAttribute("aria-label", "Edit session title");
+    const save = iconButton("Save title", "save");
+    const cancel = iconButton("Cancel title edit", "cancel");
+    const commit = (): void => {
+      const title = input.value.trim();
+      closeSessionMenu();
+      if (title) void saveSessionTitle(session.path, title);
+    };
+    save.addEventListener("click", commit);
+    cancel.addEventListener("click", closeSessionMenu);
+    input.addEventListener("keydown", (event) => {
+      event.stopPropagation();
+      if (event.key === "Enter" && !event.isComposing) { event.preventDefault(); commit(); }
+    });
+    sessionMenu.append(input, save, cancel);
+    input.focus();
+  }, !session);
+  const pinned = session && pinnedSessions.some((pin) => pin.path === session.path);
+  item(pinned ? "Unpin" : "Pin", "pin", () => { closeSessionMenu(); record.pin.click(); }, !session);
+  item("Unload session", "unload", () => {
+    closeSessionMenu();
+    if (runtime) void killRuntime(runtime.id);
+  }, !runtime);
+  item("Archive", "archive", () => {
+    closeSessionMenu();
+    if (!session) return;
+    void (async () => {
+      const result = await getJson("/api/sessions/archive", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ path: session.path }),
+      });
+      if (result === null) return;
+      archivedPaths.add(session.path);
+      pinnedSessions = pinnedSessions.filter((pin) => pin.path !== session.path);
+      savePins();
+      renderSidebar();
+      await refreshSessions();
+    })();
+  }, !session);
+  sessionMenu.hidden = false;
+  const rect = sessionMenu.getBoundingClientRect();
+  sessionMenu.style.left = `${Math.max(0, Math.min(x, innerWidth - rect.width))}px`;
+  sessionMenu.style.top = `${Math.max(0, Math.min(y, innerHeight - rect.height))}px`;
+  sessionMenu.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus();
+}
+document.addEventListener("pointerdown", (event) => {
+  if (event.target instanceof Node && !sessionMenu.contains(event.target)) closeSessionMenu();
+}, true);
+sessionMenu.addEventListener("focusout", () => {
+  queueMicrotask(() => {
+    if (!sessionMenu.contains(document.activeElement)) closeSessionMenu();
+  });
+});
+window.addEventListener("blur", closeSessionMenu);
+window.addEventListener("resize", closeSessionMenu);
 
 function pinButton(currentSession: () => SessionSummaryLike | null): HTMLButtonElement {
   const button = document.createElement("button");
@@ -464,9 +587,20 @@ async function refreshSessions(): Promise<void> {
   const search = searchEl.value.trim();
   const query = new URLSearchParams({ limit: "60" });
   if (search) query.set("search", search);
-  const list = parseSessionList(await getJson(`/api/sessions?${query}`));
+  const payload = await getJson(`/api/sessions?${query}`);
+  const list = parseSessionList(payload);
+  if (isRecord(payload) && Array.isArray(payload.archivedPaths)) {
+    archivedPaths = new Set(payload.archivedPaths.filter((path): path is string => typeof path === "string"));
+  }
   if (!list) return;
   sessions = list;
+  for (const pane of panes.values()) {
+    const session = sessions.find((entry) => entry.path === pane.binding.sessionFile);
+    if (!session || pane.binding.title === session.title) continue;
+    pane.binding.title = session.title;
+    pane.renderHeader();
+    pane.renderPlaceholder();
+  }
   renderSidebar();
 }
 
@@ -541,13 +675,15 @@ class Pane {
   #lastSent = "";
   #body: HTMLElement;
   #host: HTMLElement;
+  #titleActions: HTMLElement;
   #placeholder: HTMLElement;
   #starting: HTMLElement;
   #startupTimer: number | undefined;
   #startupFrame = false;
   #placeholderKey = "";
   #jumpLatest: HTMLButtonElement;
-  #titleEl: HTMLElement;
+  #titleEl: HTMLInputElement;
+  #editingTitle: { path: string; original: string } | null = null;
   #stateEl: HTMLElement;
   #pin: HTMLButtonElement;
   #observer: ResizeObserver;
@@ -569,8 +705,50 @@ class Pane {
 
     const header = document.createElement("header");
     header.className = "pane-header";
-    this.#titleEl = document.createElement("span");
+    this.#titleEl = document.createElement("input");
     this.#titleEl.className = "pane-title";
+    this.#titleEl.readOnly = true;
+    this.#titleEl.setAttribute("aria-label", "Session title");
+    this.#titleEl.addEventListener("mousedown", (event) => event.stopPropagation());
+    this.#titleEl.addEventListener("input", () => {
+      this.#titleEl.style.width = `${Math.max(2, this.#titleEl.value.length + 2)}ch`;
+    });
+    this.#titleEl.addEventListener("click", () => this.#beginTitleEdit());
+    this.#titleEl.addEventListener("blur", (event) => {
+      if (event.relatedTarget instanceof Node && this.#titleActions.contains(event.relatedTarget)) return;
+      this.#finishTitleEdit(false);
+    });
+    this.#titleEl.addEventListener("keydown", (event) => {
+      event.stopPropagation();
+      if (event.isComposing) return;
+      if (event.key === "Enter") {
+        event.preventDefault();
+        if (!this.#editingTitle && event.key === "Enter") this.#beginTitleEdit();
+        else {
+          this.#finishTitleEdit(true);
+          this.focus();
+        }
+      }
+    });
+    this.#titleActions = document.createElement("div");
+    this.#titleActions.className = "title-edit-actions";
+    this.#titleActions.hidden = true;
+    for (const [label, icon, commit] of [
+      ["Save title", "save", true], ["Cancel title edit", "cancel", false],
+    ] as const) {
+      const button = iconButton(label, icon);
+      button.addEventListener("mousedown", (event) => { event.preventDefault(); event.stopPropagation(); });
+      button.addEventListener("click", (event) => {
+        event.stopPropagation();
+        this.#finishTitleEdit(commit);
+        this.focus();
+      });
+      button.addEventListener("blur", (event) => {
+        if (event.relatedTarget === this.#titleEl || event.relatedTarget instanceof Node && this.#titleActions.contains(event.relatedTarget)) return;
+        this.#finishTitleEdit(false);
+      });
+      this.#titleActions.append(button);
+    }
     this.#stateEl = document.createElement("span");
     this.#stateEl.className = "pane-state";
     const actions = document.createElement("div");
@@ -586,7 +764,7 @@ class Pane {
       closePane(this.id);
     });
     actions.append(close, this.#pin);
-    header.append(this.#titleEl, this.#stateEl, actions);
+    header.append(this.#titleEl, this.#titleActions, this.#stateEl, actions);
 
     this.#body = document.createElement("div");
     this.#body.className = "pane-body";
@@ -888,6 +1066,7 @@ class Pane {
   }
 
   bind(binding: PaneBinding): void {
+    this.#finishTitleEdit(false);
     const changed = this.binding.runtimeId !== binding.runtimeId;
     if (changed || !binding.runtimeId) this.detach();
     this.binding = binding;
@@ -1109,14 +1288,41 @@ class Pane {
     if (!this.ws && this.retry !== Number.POSITIVE_INFINITY) this.attach();
     this.renderPlaceholder();
   }
+  #beginTitleEdit(): void {
+    if (this.#editingTitle || !this.binding.sessionFile) return;
+    this.#editingTitle = {
+      path: this.binding.sessionFile,
+      original: this.#titleEl.value,
+    };
+    this.#titleEl.readOnly = false;
+    this.#titleActions.hidden = false;
+    this.#titleEl.focus();
+  }
+
+  #finishTitleEdit(commit: boolean): void {
+    const editing = this.#editingTitle;
+    if (!editing) return;
+    const title = this.#titleEl.value.trim();
+    this.#editingTitle = null;
+    this.#titleEl.readOnly = true;
+    this.#titleActions.hidden = true;
+    this.renderHeader();
+    if (commit && title && title !== editing.original) {
+      void saveSessionTitle(editing.path, title);
+    }
+  }
+
+
 
   renderHeader(): void {
     const sessionFile = this.binding.sessionFile ?? "";
     const session = sessionFile ? sessionSummary(sessionFile) ?? null : null;
     const title = this.binding.title ?? "no session";
     syncPinButton(this.#pin, session);
-    if (this.#titleEl.textContent !== title) this.#titleEl.textContent = title;
-    if (this.#titleEl.title !== sessionFile) this.#titleEl.title = sessionFile;
+    if (!this.#editingTitle && this.#titleEl.value !== title) this.#titleEl.value = title;
+    this.#titleEl.style.width = `${Math.max(2, this.#titleEl.value.length + 2)}ch`;
+    this.#titleEl.disabled = !sessionFile;
+    this.#titleEl.title = sessionFile ? "Click to edit title · Enter to save · Click away to cancel" : "Waiting for session file";
     if (this.binding.runtimeId && this.#stateEl.textContent !== "") this.#stateEl.textContent = "";
   }
 
@@ -1781,6 +1987,10 @@ function createSidebarRow(kind: "runtime" | "session"): SidebarRowRecord {
     actions.append(record.pin);
   }
   element.append(name, sub, actions);
+  element.addEventListener("contextmenu", (event) => {
+    event.preventDefault();
+    showSessionMenu(record, event.clientX, event.clientY);
+  });
   element.addEventListener("click", () => {
     const pane = focusedPane();
     if (!pane) return;
@@ -1967,10 +2177,12 @@ function renderSidebar(): void {
       return `${displayTitle(runtime)} ${summary?.cwd ?? runtime.cwd}`.toLowerCase().includes(query);
     })
     : runtimes;
+  const visibleRuntimes = liveRuntimes.filter((runtime) => !runtime.sessionFile || !archivedPaths.has(runtime.sessionFile));
   const candidates = new Map(pinnedSessions.map((session) => [session.path, session]));
   for (const session of sessions) candidates.set(session.path, session);
   const recent = [...candidates.values()].filter((session) =>
     !liveFiles.has(session.path) &&
+    !archivedPaths.has(session.path) &&
     (!query || sessionByPath.has(session.path) || `${session.title} ${session.cwd}`.toLowerCase().includes(query)),
   ).sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt) || a.path.localeCompare(b.path));
 
@@ -1978,7 +2190,7 @@ function renderSidebar(): void {
   const pinnedRows: SidebarRowRecord[] = [];
   const otherRows: SidebarRowRecord[] = [];
   const activeKeys = new Set<string>();
-  for (const runtime of liveRuntimes) {
+  for (const runtime of visibleRuntimes) {
     const title = displayTitle(runtime);
     // The transcript directory is the project; runtime.cwd may only be its
     // process launch directory after omp relocates out of a disallowed path.

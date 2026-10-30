@@ -3,6 +3,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { RuntimeManager, RuntimeCapacityError, PendingRuntimeCapacityError } from "./manager";
 import { listSessions, readSessionCwd } from "./sessions";
+import { SessionTitleStore } from "./session-titles";
+import { SessionArchiveStore } from "./session-archives";
 import { isRecord } from "./guards";
 import { MAX_RUNTIME_INPUT_CODE_UNITS, parseClientMessage, type RuntimeInfo, type RuntimesResponse, type ServerMessage } from "./protocol";
 import { PresentationReader } from "./presentation";
@@ -62,6 +64,12 @@ const STATE_DIR = resolve(
 );
 const STATE_FILE = process.env.OMP_DESKTOP_STATE_FILE ?? join(STATE_DIR, "state.json");
 const stateStore = new WorkspaceStateStore(STATE_FILE);
+const SESSION_TITLES_FILE =
+  process.env.OMP_DESKTOP_SESSION_TITLES_FILE ?? join(STATE_DIR, "session-titles.json");
+const sessionTitleStore = new SessionTitleStore(SESSION_TITLES_FILE);
+const SESSION_ARCHIVES_FILE =
+  process.env.OMP_DESKTOP_SESSION_ARCHIVES_FILE ?? join(STATE_DIR, "session-archives.json");
+const sessionArchiveStore = new SessionArchiveStore(SESSION_ARCHIVES_FILE);
 // Durable record of the live runtime pool, owned by the daemon (see state.ts):
 // client documents describe panes, this describes the sessions themselves, so a
 // restart restores every session that was live — including ones no pane holds.
@@ -500,13 +508,52 @@ const server = Bun.serve<WsData>({
           throw error;
         }
       }
+      case "POST /api/sessions/title": {
+        const body: unknown = await req.json().catch(() => null);
+        if (!isRecord(body) || typeof body.path !== "string" || typeof body.title !== "string") {
+          return new Response("path and title must be strings", { status: 400 });
+        }
+        const path = validResume(body.path);
+        if (!path) return new Response("path must be an existing session file under the session store", { status: 400 });
+        const title = body.title.trim();
+        if (!title) return new Response("title must be nonempty", { status: 400 });
+        try {
+          await sessionTitleStore.save(path, title);
+          return Response.json({ ok: true, path, title }, { headers: NO_STORE });
+        } catch (error) {
+          return new Response(
+            `session title save failed: ${error instanceof Error ? error.message : String(error)}`,
+            { status: 500 },
+          );
+        }
+      }
+      case "POST /api/sessions/archive": {
+        const body: unknown = await req.json().catch(() => null);
+        if (!isRecord(body) || typeof body.path !== "string") {
+          return new Response("path must be a string", { status: 400 });
+        }
+        const path = validResume(body.path);
+        if (!path) return new Response("path must be an existing session file under the session store", { status: 400 });
+        try {
+          await sessionArchiveStore.archive(path);
+          return Response.json({ ok: true, path }, { headers: NO_STORE });
+        } catch (error) {
+          return new Response(
+            `session archive save failed: ${error instanceof Error ? error.message : String(error)}`,
+            { status: 500 },
+          );
+        }
+      }
       case "GET /api/sessions": {
-        // `listSessions` owns limit validation; forwarding keeps one policy.
+        // `listSessions` owns limit validation; archived entries are removed before search/limit.
+        const archivedPaths = await sessionArchiveStore.read();
         const sessions = await listSessions({
           limit: Number(url.searchParams.get("limit") ?? 60),
           search: url.searchParams.get("search") ?? undefined,
+          titleOverrides: await sessionTitleStore.read(),
+          excludedPaths: new Set(archivedPaths),
         });
-        return conditionalJson(req, { sessions });
+        return conditionalJson(req, { sessions, archivedPaths });
       }
       default:
         break;
