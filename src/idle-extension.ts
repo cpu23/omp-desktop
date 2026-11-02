@@ -287,17 +287,21 @@ function serviceRefsSignature(refs: readonly NamedBashService[]): string {
 
 type PromptImage = { type: "image"; mimeType: string; data: string };
 
-async function readPromptImages(paths: string[]): Promise<PromptImage[]> {
+export async function readPromptImages(paths: string[]): Promise<PromptImage[]> {
   const images: PromptImage[] = [];
-  for (const path of paths) {
+  const imagePaths = [...new Set(paths)].filter((path) => imageExtensionForMime(Bun.file(path).type));
+  if (imagePaths.length > 16) throw new Error("A request may include at most 16 image attachments");
+  let totalBytes = 0;
+  for (const path of imagePaths) {
     const mimeType = Bun.file(path).type;
-    if (!imageExtensionForMime(mimeType)) continue;
     const handle = await open(path, "r");
     try {
       const stat = await handle.stat();
       if (!stat.isFile() || stat.size === 0 || stat.size > IMAGE_FILE_LIMIT) {
         throw new Error("Image attachments must be regular files of at most 32 MiB");
       }
+      totalBytes += stat.size;
+      if (totalBytes > IMAGE_FILE_LIMIT) throw new Error("Image attachments must fit within 32 MiB total per request");
       const bytes = Buffer.allocUnsafe(stat.size);
       let offset = 0;
       while (offset < bytes.length) {

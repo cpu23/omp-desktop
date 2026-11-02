@@ -109,6 +109,12 @@ if (idleDir && idleToken) {
         return Response.json({ kind: "conflict", reason: "session changed or unloading" }, { status: 409 });
       }
       if (request.method === "POST" && path === "/prompt") {
+        if (process.env.OMP_DESKTOP_TEST_REJECT_PROMPT === "unavailable") {
+          return Response.json({ kind: "unavailable", reason: "fixture acknowledgement unavailable" }, { status: 503 });
+        }
+        if (process.env.OMP_DESKTOP_TEST_REJECT_PROMPT === "1") {
+          return Response.json({ kind: "conflict", reason: "fixture rejected request before admission" }, { status: 409 });
+        }
         if (typeof body.text !== "string" || !body.text.trim()) return new Response("empty request", { status: 400 });
         const timestamp = new Date().toISOString();
         const userId = crypto.randomUUID();
@@ -130,6 +136,9 @@ if (idleDir && idleToken) {
         return Response.json({ kind: "accepted" }, { status: 202 });
       }
       if (request.method === "POST" && path === "/unload") {
+        if (process.env.OMP_DESKTOP_TEST_PROTECT_UNLOAD === "1") {
+          return Response.json({ kind: "conflict", reason: "fixture active work" }, { status: 409 });
+        }
         if (typeof body.idleTimeoutMs !== "number" || body.idleTimeoutMs <= 0 ||
             Date.now() - idleSince < body.idleTimeoutMs) {
           return Response.json({ kind: "conflict", reason: "not idle long enough" }, { status: 409 });

@@ -15,6 +15,7 @@
  * workspace.
  */
 import { isRecord } from "./guards";
+import { parseIdleTimeoutInput } from "./runtime-settings-input";
 
 /** Shown until the first successful read; the daemon's own default. */
 const DEFAULT_MAX_RUNTIMES = 16;
@@ -243,8 +244,8 @@ async function save(): Promise<void> {
 
 async function saveIdleTimeout(): Promise<void> {
   if (!controls || busy) return;
-  const value = Number(controls.idleInput.value.trim());
-  if (!isNonNegativeInteger(value)) {
+  const value = parseIdleTimeoutInput(controls.idleInput.value);
+  if (value === null) {
     controls.idleStatus.textContent = "Enter a whole number of minutes, or 0 to disable automatic unloading.";
     controls.idleStatus.dataset.kind = "warn";
     controls.idleInput.focus();

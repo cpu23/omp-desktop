@@ -62,6 +62,39 @@ function inputRequest(base: string, runtimeId: string, body: BodyInit): Promise<
 }
 
 describe("real daemon API behavior", () => {
+  test("failed admission never force-stops protected or ambiguously admitted work", async () => {
+    for (const ambiguous of [false, true]) {
+      const daemon = await startTestDaemon({ env: {
+        OMP_DESKTOP_TEST_REJECT_PROMPT: ambiguous ? "unavailable" : "1",
+        OMP_DESKTOP_TEST_PROTECT_UNLOAD: "1",
+      } });
+      try {
+        const response = await fetch(`${daemon.base}/api/sessions/request`, {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ cwd: join(daemon.root, "project"), text: "protected request" }),
+        });
+        expect(response.status).toBe(ambiguous ? 503 : 409);
+        const remaining = await runtimeList(daemon.base);
+        expect(remaining).toHaveLength(1);
+        expect(remaining[0]!.alive).toBe(true);
+      } finally { await daemon.stop(); }
+    }
+  }, 60_000);
+  test("rejected new requests retire only their unadmitted runtime", async () => {
+    const daemon = await startTestDaemon({ env: { OMP_DESKTOP_TEST_REJECT_PROMPT: "1" } });
+    try {
+      const path = await writeTestTranscript(daemon.root, "existing-rejected-request");
+      const existing = await createRuntime(daemon.base, { resume: path });
+      for (const request of [{ cwd: join(daemon.root, "project") }, { path }]) {
+        const response = await fetch(`${daemon.base}/api/sessions/request`, {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ ...request, text: "rejected before admission" }),
+        });
+        expect(response.status).toBe(409);
+        expect((await runtimeList(daemon.base)).map((runtime) => runtime.id)).toEqual([existing.id]);
+      }
+    } finally { await daemon.stop(); }
+  }, 60_000);
   test("reserves runtimes, starts one PTY on WebSocket attach, and preserves exact input", async () => {
     const daemon = await startTestDaemon();
     let ws: WebSocket | null = null;

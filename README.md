@@ -49,6 +49,7 @@ from your application menu; the daemon above must remain running.
   show titles without repeating their directory; working and unread-completion indicators remain visible.
 - Use **+** beside a workspace to prepare a new-session draft there, or select a workspace and use the header **+**.
   The workspace button appears only on heading hover or keyboard focus.
+  Each submitted request accepts at most 16 unique image attachments and 32 MiB of image data in total; repeated paths are encoded once.
 - Opening a running session reattaches; opening a saved one reads its history without loading an agent.
   Select **Send** or press **Ctrl+Enter** / **⌘Enter** to create or resume the agent. Plain Enter inserts a newline.
 - Truly idle agents unload gracefully after **60 minutes**. Change **Settings → Sessions → Idle timeout (minutes)**

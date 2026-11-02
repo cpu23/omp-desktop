@@ -741,7 +741,28 @@ const server = Bun.serve<WsData>({
           const dispatched = await idleClient.prompt(runtime.id, {
             sessionFile: file, text: body.text, files: body.files as string[] | undefined,
           });
-          if (dispatched.kind === "conflict") return new Response(dispatched.reason, { status: 409 });
+          if (dispatched.kind === "conflict") {
+            if (!resume) {
+              // A rejected fresh draft owns this new process, but another client
+              // may have started work meanwhile. Let the SDK recheck quiescence;
+              // never force-kill on rejection or an ambiguous acknowledgement.
+              try {
+                const status = await idleClient.status(runtime.id);
+                if (status.kind === "available" && status.status.idleSince !== null && status.status.reasons.length === 0) {
+                  const remaining = 1 - (Date.now() - status.status.idleSince);
+                  if (remaining > 0) await Bun.sleep(remaining);
+                }
+                const retired = await idleClient.unload(runtime.id, { sessionFile: file, idleTimeoutMs: 1 });
+                if (retired.kind === "accepted") {
+                  const deadline = Date.now() + 2000;
+                  while (runtime.alive && Date.now() < deadline) await Bun.sleep(25);
+                }
+              } catch (error) {
+                console.warn(`omp-desktopd: rejected request cleanup unavailable: ${String(error)}`);
+              }
+            }
+            return new Response(dispatched.reason, { status: 409 });
+          }
           if (dispatched.kind === "unavailable") {
             return new Response("request acknowledgement unavailable; it may have been queued. Check the session before sending again.", { status: 503 });
           }
