@@ -18,6 +18,7 @@ import { isRecord } from "./guards";
 
 /** Shown until the first successful read; the daemon's own default. */
 const DEFAULT_MAX_RUNTIMES = 16;
+const DEFAULT_IDLE_TIMEOUT_MINUTES = 60;
 /** How long to wait for a restarted daemon to answer before telling the user. */
 const RESTART_TIMEOUT_MS = 60_000;
 const RESTART_POLL_MS = 500;
@@ -29,6 +30,8 @@ type RuntimeSettings = {
   effectiveMaxRuntimes: number;
   /** True while the saved limit cannot apply until the daemon restarts. */
   restartRequired: boolean;
+  /** Continuous safe-idle threshold; zero disables automatic unloading. */
+  idleTimeoutMinutes: number;
 };
 
 type Controls = {
@@ -37,6 +40,9 @@ type Controls = {
   status: HTMLElement;
   restartBox: HTMLElement;
   restartButton: HTMLButtonElement;
+  idleInput: HTMLInputElement;
+  idleSave: HTMLButtonElement;
+  idleStatus: HTMLElement;
 };
 
 /**
@@ -50,17 +56,23 @@ function queryControls(): Controls | null {
   const status = document.getElementById("runtime-limit-status");
   const restartBox = document.getElementById("runtime-limit-restart");
   const restartButton = document.getElementById("runtime-limit-restart-button");
+  const idleInput = document.getElementById("idle-timeout-input");
+  const idleSave = document.getElementById("idle-timeout-save");
+  const idleStatus = document.getElementById("idle-timeout-status");
   if (
     !(input instanceof HTMLInputElement) ||
     !(save instanceof HTMLButtonElement) ||
     !status ||
     !restartBox ||
-    !(restartButton instanceof HTMLButtonElement)
+    !(restartButton instanceof HTMLButtonElement) ||
+    !(idleInput instanceof HTMLInputElement) ||
+    !(idleSave instanceof HTMLButtonElement) ||
+    !idleStatus
   ) {
-    console.warn("runtime limit: controls missing from index.html");
+    console.warn("runtime settings: controls missing from index.html");
     return null;
   }
-  return { input, save, status, restartBox, restartButton };
+  return { input, save, status, restartBox, restartButton, idleInput, idleSave, idleStatus };
 }
 
 const controls = queryControls();
@@ -76,13 +88,17 @@ function isPositiveInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value > 0;
 }
 
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
+}
+
 /** Validates the settings payload against the shared contract. */
 function parseSettings(value: unknown): RuntimeSettings | null {
   if (!isRecord(value)) return null;
-  const { maxRuntimes, effectiveMaxRuntimes, restartRequired } = value;
+  const { maxRuntimes, effectiveMaxRuntimes, restartRequired, idleTimeoutMinutes } = value;
   if (!isPositiveInteger(maxRuntimes) || !isPositiveInteger(effectiveMaxRuntimes)) return null;
-  if (typeof restartRequired !== "boolean") return null;
-  return { maxRuntimes, effectiveMaxRuntimes, restartRequired };
+  if (typeof restartRequired !== "boolean" || !isNonNegativeInteger(idleTimeoutMinutes)) return null;
+  return { maxRuntimes, effectiveMaxRuntimes, restartRequired, idleTimeoutMinutes };
 }
 
 /** The daemon's own explanation for a failure (plain text), never a bare code. */
@@ -93,9 +109,14 @@ async function failureText(res: Response): Promise<string> {
 
 /** One line for the settings panel: the limit, what runs now, and any restart. */
 function summary(current: RuntimeSettings): string {
-  const parts = [`Max sessions ${current.maxRuntimes}, in effect now ${current.effectiveMaxRuntimes}.`];
-  if (current.restartRequired) parts.push("Restart required to apply.");
-  return parts.join(" ");
+  return `Max sessions ${current.maxRuntimes}, in effect now ${current.effectiveMaxRuntimes}.` +
+    (current.restartRequired ? " Restart required to apply the saved maximum." : "");
+}
+
+function idleSummary(current: RuntimeSettings): string {
+  return current.idleTimeoutMinutes === 0
+    ? "Automatic idle unloading is disabled."
+    : `Idle runtimes unload after ${current.idleTimeoutMinutes} minutes of safe inactivity.`;
 }
 
 function say(text: string, kind: "ok" | "warn" | "pending"): void {
@@ -111,6 +132,8 @@ function render(): void {
   controls.save.disabled = locked;
   controls.input.disabled = locked;
   controls.restartButton.disabled = locked;
+  controls.idleSave.disabled = busy;
+  controls.idleInput.disabled = busy;
   controls.restartBox.hidden = !(settings?.restartRequired ?? false);
 }
 
@@ -122,6 +145,11 @@ function render(): void {
 function showSavedLimit(next: RuntimeSettings): void {
   if (!controls || document.activeElement === controls.input) return;
   controls.input.value = String(next.maxRuntimes);
+}
+
+function showSavedIdleTimeout(next: RuntimeSettings): void {
+  if (!controls || document.activeElement === controls.idleInput) return;
+  controls.idleInput.value = String(next.idleTimeoutMinutes);
 }
 
 /** Reads the current settings; null on a transport error, bad status, or bad shape. */
@@ -160,7 +188,10 @@ export async function syncRuntimeLimit(): Promise<void> {
     }
     settings = next;
     showSavedLimit(next);
+    showSavedIdleTimeout(next);
     say(summary(next), next.restartRequired ? "warn" : "ok");
+    controls.idleStatus.textContent = idleSummary(next);
+    controls.idleStatus.dataset.kind = "ok";
   } catch {
     say("Session limit unavailable: the daemon is unreachable.", "warn");
   }
@@ -200,9 +231,57 @@ async function save(): Promise<void> {
     }
     settings = next;
     showSavedLimit(next);
+    showSavedIdleTimeout(next);
     say(next.restartRequired ? `Saved. ${summary(next)}` : summary(next), next.restartRequired ? "warn" : "ok");
   } catch {
     say("Could not reach the daemon to save the session limit.", "warn");
+  } finally {
+    busy = false;
+    render();
+  }
+}
+
+async function saveIdleTimeout(): Promise<void> {
+  if (!controls || busy) return;
+  const value = Number(controls.idleInput.value.trim());
+  if (!isNonNegativeInteger(value)) {
+    controls.idleStatus.textContent = "Enter a whole number of minutes, or 0 to disable automatic unloading.";
+    controls.idleStatus.dataset.kind = "warn";
+    controls.idleInput.focus();
+    return;
+  }
+  if (settings && value === settings.idleTimeoutMinutes) {
+    controls.idleStatus.textContent = idleSummary(settings);
+    controls.idleStatus.dataset.kind = "ok";
+    return;
+  }
+  busy = true;
+  render();
+  try {
+    const res = await fetch("/api/settings", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ idleTimeoutMinutes: value }),
+    });
+    if (!res.ok) {
+      controls.idleStatus.textContent = await failureText(res);
+      controls.idleStatus.dataset.kind = "warn";
+      return;
+    }
+    const next = parseSettings(await res.json().catch(() => null));
+    if (!next) {
+      controls.idleStatus.textContent = "The daemon returned an unrecognised runtime settings payload.";
+      controls.idleStatus.dataset.kind = "warn";
+      return;
+    }
+    settings = next;
+    showSavedLimit(next);
+    showSavedIdleTimeout(next);
+    controls.idleStatus.textContent = `Saved and applied immediately. ${idleSummary(next)}`;
+    controls.idleStatus.dataset.kind = "ok";
+  } catch {
+    controls.idleStatus.textContent = "Could not reach the daemon to save the idle timeout.";
+    controls.idleStatus.dataset.kind = "warn";
   } finally {
     busy = false;
     render();
@@ -230,7 +309,7 @@ async function restart(): Promise<void> {
   // is on its way; watch the settings endpoint for the daemon that comes back.
   restartPending = true;
   render();
-  say("Restarting the daemon… running sessions stop now; their transcripts resume when it is back.", "pending");
+  say("Restarting the daemon… running processes stop; saved transcripts remain readable and load only after you submit.", "pending");
   const deadline = Date.now() + RESTART_TIMEOUT_MS;
   while (Date.now() < deadline) {
     const { promise, resolve } = Promise.withResolvers<void>();
@@ -241,6 +320,8 @@ async function restart(): Promise<void> {
     // it exits; the restarted one reports the saved limit in effect.
     if (!next || next.restartRequired) continue;
     settings = next;
+    showSavedLimit(next);
+    showSavedIdleTimeout(next);
     restartPending = false;
     say(`Restarted. ${summary(next)}`, "ok");
     render();
@@ -253,11 +334,18 @@ async function restart(): Promise<void> {
 
 if (controls) {
   controls.input.value = String(DEFAULT_MAX_RUNTIMES);
+  controls.idleInput.value = String(DEFAULT_IDLE_TIMEOUT_MINUTES);
   controls.save.addEventListener("click", () => void save());
   controls.input.addEventListener("keydown", (event) => {
     if (event.key !== "Enter") return;
     event.preventDefault();
     void save();
+  });
+  controls.idleSave.addEventListener("click", () => void saveIdleTimeout());
+  controls.idleInput.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    void saveIdleTimeout();
   });
   controls.restartButton.addEventListener("click", () => void restart());
   render();

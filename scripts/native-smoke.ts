@@ -604,7 +604,6 @@ function workspaceSignature(workspace: Workspace): string {
         isRecord(binding) ? {
           runtimeId: binding.runtimeId ?? null,
           sessionFile: binding.sessionFile ?? null,
-          autoResume: binding.autoResume ?? null,
           keepEmpty: binding.keepEmpty ?? null,
         } : binding,
       ])),
@@ -1107,20 +1106,25 @@ async function testFirstSessionAndPaneWorkload(
   const { driver } = shell;
   await waitConnected(driver, daemon.port);
   const base = daemon.base;
-  const beforeNewSession = await driver.waitFor(async () => {
-    const current = await runtimes(base);
-    return current.length === 1 && current[0]!.pid !== null ? current : false;
-  }, "the app's automatic initial session to attach before the explicit new-session control");
+  const initialRuntimes = await runtimes(base);
+  assert(initialRuntimes.length === 0, "A fresh daemon boot created a runtime before the user requested a message.");
   await verifyNativeResize(driver);
-  const beforeSessionIds = new Set(beforeNewSession.map((runtime) => runtime.id));
+  const beforeSessionIds = new Set(initialRuntimes.map((runtime) => runtime.id));
   await driver.clickCss("#new-session");
+  const coldComposer = await driver.waitFor(async () => {
+    const input = await driver.find("#panes .pane .cold-composer textarea").catch(() => null);
+    return input && await driver.displayed(input) ? input : false;
+  }, "#new-session to show a cold composer");
+  assert((await runtimes(base)).length === 0, "#new-session created a runtime before submission.");
+  await driver.sendKeys(coldComposer, "start-native-session");
+  await driver.clickCss("#panes .pane .cold-composer button[type='submit']");
   const created = await driver.waitFor(async () => {
     const current = await runtimes(base);
     const added = current.filter((runtime) => !beforeSessionIds.has(runtime.id));
-    return current.length === beforeNewSession.length + 1 && added.length === 1 && added[0]!.pid !== null ? added[0] : false;
-  }, "#new-session to add and attach one real daemon runtime");
+    return current.length === 1 && added.length === 1 && added[0]!.pid !== null ? added[0] : false;
+  }, "submitting the cold composer to create and attach one real daemon runtime");
   await waitForRuntimePaneReady(driver, base, created.id);
-  console.log("ok - #new-session creates a real runtime and WebSocket attachment starts its fake-OMP PTY");
+  console.log("ok - blank boot and #new-session stay cold until explicit submission, then the fake-OMP PTY attaches");
   const createdRecord = fakeOmpRecordPath(daemon.root, created.id);
   const { binding: createdBinding, textarea: terminal } = await focusRuntimePane(driver, base, created.id);
   const echo = "native-echo-✓";
@@ -1965,8 +1969,16 @@ async function testConnectionRetry(parent: string, binary: string, busAddress: s
     await waitConnected(shell.driver, customPort);
     const buildResponse = await fetch(`${daemon.base}/api/build`);
     assert(buildResponse.ok, "Retry did not connect the app to the real daemon build endpoint.");
-    if ((await runtimes(daemon.base)).length === 0) await shell.driver.clickCss("#new-session");
-    await waitFor("Retry's new-session control to create a usable real daemon runtime", async () => {
+    assert((await runtimes(daemon.base)).length === 0, "Retry recovery created a runtime during blank boot.");
+    await shell.driver.clickCss("#new-session");
+    const composer = await shell.driver.waitFor(async () => {
+      const input = await shell!.driver.find("#panes .pane .cold-composer textarea").catch(() => null);
+      return input && await shell!.driver.displayed(input) ? input : false;
+    }, "Retry recovery to show a cold new-session composer");
+    assert((await runtimes(daemon.base)).length === 0, "Retry's new-session control created a runtime before submission.");
+    await shell.driver.sendKeys(composer, "retry-session");
+    await shell.driver.clickCss("#panes .pane .cold-composer button[type='submit']");
+    await waitFor("Retry's submitted cold draft to create a usable real daemon runtime", async () => {
       const current = await runtimes(daemon!.base);
       return current.some((runtime) => runtime.pid !== null && runtime.alive) ? true : false;
     });
@@ -2671,16 +2683,18 @@ async function testInitialNativeInput(parent: string, binary: string, busAddress
     configureX11Input(profile, display.display);
     shell = await openShell(profile, daemon.port, binary);
     await waitConnected(shell.driver, daemon.port);
-    const beforeSession = await waitFor("the fresh app's automatic first runtime", async () => {
+    assert((await runtimes(daemon.base)).length === 0, "First boot created a runtime before user input.");
+    await shell.driver.clickCss("#new-session");
+    const composer = await shell.driver.waitFor(async () => {
+      const input = await shell!.driver.find("#panes .pane .cold-composer textarea").catch(() => null);
+      return input && await shell!.driver.displayed(input) ? input : false;
+    }, "the fresh app's cold new-session composer");
+    assert((await runtimes(daemon.base)).length === 0, "New session created a runtime before explicit submission.");
+    await shell.driver.sendKeys(composer, "start-native-input");
+    await shell.driver.clickCss("#panes .pane .cold-composer button[type='submit']");
+    const runtime = await waitFor("the submitted cold composer to create one real runtime", async () => {
       const current = await runtimes(daemon!.base);
       return current.length === 1 && current[0]!.pid !== null ? current[0] : false;
-    });
-    const beforeIds = new Set([beforeSession.id]);
-    await shell.driver.clickCss("#new-session");
-    const runtime = await waitFor("the #new-session button to add one real runtime", async () => {
-      const current = await runtimes(daemon!.base);
-      const added = current.filter((entry) => !beforeIds.has(entry.id));
-      return current.length === 2 && added.length === 1 && added[0]!.pid !== null ? added[0] : false;
     });
     await waitForRuntimePaneReady(shell.driver, daemon.base, runtime.id);
     const { binding, textarea } = await focusRuntimePane(shell.driver, daemon.base, runtime.id);

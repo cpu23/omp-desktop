@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
+import { symlink } from "node:fs/promises";
 import { IMAGE_FILE_LIMIT } from "./image-limits";
 import { isRecord } from "./guards";
 import { parseServerMessage } from "./protocol";
@@ -119,9 +120,15 @@ describe("real daemon API behavior", () => {
         const snapshot: unknown = await response.json();
         return isRecord(snapshot) && typeof snapshot.screen === "string" && snapshot.screen.includes("ACK:api-byte-check-✓");
       }, "the exact acknowledged input in the screen snapshot");
+      const wsData = "acknowledged-ws-input\n";
+      ws.send(JSON.stringify({ type: "input", id: "input-1", data: wsData }));
+      await waitFor(
+        () => messages.some((entry) => entry.parsed?.type === "inputAck" && entry.parsed.id === "input-1"),
+        "accepted WebSocket input acknowledgement",
+      );
       await waitFor(async () => {
         const bytes = await Bun.file(fakeOmpRecordPath(daemon.root, reserved.id)).arrayBuffer().catch(() => null);
-        return bytes !== null && Buffer.from(bytes).equals(Buffer.from(data));
+        return bytes !== null && Buffer.from(bytes).equals(Buffer.from(data + wsData));
       }, "the fake OMP's exact PTY input bytes");
       expect(await runtimeList(daemon.base)).toHaveLength(1);
     } finally {
@@ -226,6 +233,30 @@ describe("real daemon API behavior", () => {
       const summary = indexPayload.sessions.find((entry) => isRecord(entry) && entry.path === valid);
       expect(isRecord(summary) && summary.title).toBe(title);
       expect(isRecord(summary) && typeof summary.costUsd === "number" && Number.isFinite(summary.costUsd)).toBe(true);
+    } finally {
+      await daemon.stop();
+    }
+  }, 60_000);
+
+  test("history and request paths reject session-store symlink escapes without starting an agent", async () => {
+    const daemon = await startTestDaemon();
+    try {
+      const fixture = await writeTestTranscript(daemon.root, "inside-history-root");
+      const outside = join(daemon.root, "outside-session.jsonl");
+      await Bun.write(outside, '{"type":"session","id":"outside"}\n');
+      const escaped = join(testSessionsRoot(daemon.root), "-test-fixtures", "escape.jsonl");
+      await symlink(outside, escaped);
+      for (const path of [outside, escaped, `${fixture}/not-a-file.jsonl`]) {
+        const history = await fetch(`${daemon.base}/api/sessions/history?path=${encodeURIComponent(path)}`);
+        expect(history.status).toBe(400);
+        const request = await fetch(`${daemon.base}/api/sessions/request`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ path, text: "must not execute" }),
+        });
+        expect(request.status).toBe(400);
+      }
+      expect(await runtimeList(daemon.base)).toEqual([]);
     } finally {
       await daemon.stop();
     }

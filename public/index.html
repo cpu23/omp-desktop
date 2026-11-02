@@ -120,11 +120,30 @@
                 <button id="runtime-limit-save" type="button">Save</button>
               </div>
               <span id="runtime-limit-status" class="shortcut-message" role="status" aria-live="polite"></span>
+              <p id="idle-timeout-help" class="runtime-limit-help">
+                Unload confidently idle runtimes after this many minutes; 0 disables automatic unloading. Changing
+                this timeout applies immediately.
+              </p>
+              <div class="runtime-limit-row">
+                <label class="motion-label" for="idle-timeout-input">Idle timeout (minutes)</label>
+                <input
+                  id="idle-timeout-input"
+                  type="number"
+                  inputmode="numeric"
+                  min="0"
+                  step="1"
+                  value="60"
+                  autocomplete="off"
+                  aria-describedby="idle-timeout-help"
+                />
+                <button id="idle-timeout-save" type="button">Save</button>
+              </div>
+              <span id="idle-timeout-status" class="shortcut-message" role="status" aria-live="polite"></span>
               <div id="runtime-limit-restart" class="runtime-limit-restart" hidden>
                 <p id="runtime-limit-restart-warning" class="runtime-limit-warn">
-                  Restart to apply the saved limit. Restarting stops every running session: in-progress work and
-                  unsaved input are lost. Sessions with a saved transcript resume automatically afterwards; their
-                  running processes are not preserved.
+                  Restart to apply the saved limit. Restarting stops every running session; in-progress work and
+                  unsaved terminal input are lost. Saved transcripts remain readable and load only after you submit
+                  a message; their running processes are not preserved.
                 </p>
                 <button
                   id="runtime-limit-restart-button"

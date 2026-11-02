@@ -1,12 +1,37 @@
-import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
+#!/usr/bin/env bun
+import { appendFileSync, chmodSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { isRecord } from "../../src/guards";
+
+const args = process.argv.slice(2);
+
+function messageText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.filter(isRecord).filter((part) => part.type === "text" && typeof part.text === "string")
+    .map((part) => part.text).join("\n");
+}
+
+// The deterministic harness has the same standalone offline-render entry point
+// as OMP; this path never creates a runtime socket or touches the PTY record.
+if (args[0] === "render") {
+  if (!args[1]) throw new Error("render requires a fixture transcript");
+  for (const line of readFileSync(args[1], "utf8").split("\n")) {
+    let entry: unknown;
+    try { entry = JSON.parse(line); } catch { continue; }
+    if (!isRecord(entry) || !isRecord(entry.message)) continue;
+    const role = entry.message.role;
+    if (role !== "user" && role !== "assistant") continue;
+    process.stdout.write(`\x1b[1m${role === "user" ? "User" : "Assistant"}\x1b[0m\r\n${messageText(entry.message.content).replace(/\r?\n/g, "\r\n")}\r\n\r\n`);
+  }
+  process.exit(0);
+}
 
 const FIXED_TIMESTAMP = "2026-10-05T00:00:00.000Z";
 const runtimeId = process.env.OMP_DESKTOP_RUNTIME ?? "rt-fixture";
 const recordDir = process.env.OMP_DESKTOP_TEST_RECORD_DIR;
 const recordFile = recordDir ? join(recordDir, `${runtimeId}.bin`) : null;
 const sessionsDir = process.env.OMP_DESKTOP_SESSIONS_DIR;
-const args = process.argv.slice(2);
 let transcript = "";
 for (let index = 0; index < args.length; index += 1) {
   if (args[index] === "--resume" && args[index + 1]) {
@@ -55,9 +80,77 @@ if (transcript) {
 }
 process.stdout.write("FAKE-OMP READY\r\n");
 
+let idleSince = Date.now();
+let unloading = false;
+let revision = 0;
+const idleDir = process.env.OMP_DESKTOP_IDLE_IPC_DIR;
+const idleToken = process.env.OMP_DESKTOP_IDLE_IPC_TOKEN;
+if (idleDir && idleToken) {
+  mkdirSync(idleDir, { recursive: true, mode: 0o700 });
+  const socket = join(idleDir, `${runtimeId}.sock`);
+  const idleServer = Bun.serve({
+    unix: socket,
+    async fetch(request) {
+      if (request.headers.get("authorization") !== `Bearer ${idleToken}`) {
+        return new Response("unauthorized", { status: 401 });
+      }
+      const path = new URL(request.url).pathname;
+      if (request.method === "GET" && path === "/status") {
+        return Response.json({
+          hostId: `fixture-${process.pid}`, sessionId: runtimeId, sessionFile: transcript || null,
+          idleSince: unloading ? null : idleSince, reasons: unloading ? ["unloading"] : [],
+          revision, unloading,
+        });
+      }
+      const body: unknown = await request.json().catch(() => null);
+      if (!isRecord(body) || body.sessionFile !== transcript || unloading) {
+        return Response.json({ kind: "conflict", reason: "session changed or unloading" }, { status: 409 });
+      }
+      if (request.method === "POST" && path === "/prompt") {
+        if (typeof body.text !== "string" || !body.text.trim()) return new Response("empty request", { status: 400 });
+        const timestamp = new Date().toISOString();
+        const userId = crypto.randomUUID();
+        const assistantId = crypto.randomUUID();
+        let parentId: string | null = null;
+        for (const line of readFileSync(transcript, "utf8").split("\n")) {
+          try {
+            const entry: unknown = JSON.parse(line);
+            if (isRecord(entry) && entry.type === "message" && typeof entry.id === "string") parentId = entry.id;
+          } catch {}
+        }
+        appendFileSync(transcript, [
+          { type: "message", id: userId, parentId, timestamp, message: { role: "user", content: body.text } },
+          { type: "message", id: assistantId, parentId: userId, timestamp, message: { role: "assistant", content: `ACK:${body.text}` } },
+        ].map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+        idleSince = Date.now();
+        revision += 1;
+        process.stdout.write(`ACK:${body.text}\r\n`);
+        return Response.json({ kind: "accepted" }, { status: 202 });
+      }
+      if (request.method === "POST" && path === "/unload") {
+        if (typeof body.idleTimeoutMs !== "number" || body.idleTimeoutMs <= 0 ||
+            Date.now() - idleSince < body.idleTimeoutMs) {
+          return Response.json({ kind: "conflict", reason: "not idle long enough" }, { status: 409 });
+        }
+        unloading = true;
+        setTimeout(() => process.exit(0), 25);
+        return Response.json({ kind: "accepted" }, { status: 202 });
+      }
+      return new Response("not found", { status: 404 });
+    },
+  });
+  chmodSync(socket, 0o600);
+  process.on("exit", () => {
+    idleServer.stop(true);
+    try { unlinkSync(socket); } catch {}
+  });
+}
+
 let pending = "";
 const decoder = new TextDecoder();
 process.stdin.on("data", (chunk: Buffer) => {
+  idleSince = Date.now();
+  revision += 1;
   if (recordFile) appendFileSync(recordFile, chunk);
   pending += decoder.decode(chunk, { stream: true });
   for (;;) {

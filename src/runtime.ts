@@ -36,6 +36,8 @@ export class Runtime {
   /** Absolute session file this process is writing, sniffed from omp's OSC 1337. */
   sessionFile: string | null = null;
   lastActivityAt: number | null = null;
+  /** Accepted input or an explicit load request fences eviction for a full idle grace period. */
+  lastInputAt: number | null = null;
 
   #pty: IPty | null = null;
   #exit: RuntimeExit | null = null;
@@ -207,7 +209,9 @@ export class Runtime {
   }
 
   write(data: string): void {
-    this.#pty?.write(data);
+    if (!this.#pty || data.length === 0) return;
+    this.lastInputAt = Date.now();
+    this.#pty.write(data);
   }
 
   /** Remember the size even when not running, so the next spawn uses it. */

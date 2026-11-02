@@ -1436,6 +1436,8 @@ body.session-dragging * {
 
 .pane-body {
   position: relative;
+  display: flex;
+  flex-direction: column;
   flex: 1 1 auto;
   min-height: 0;
   overflow: hidden;
@@ -1489,7 +1491,9 @@ body.session-dragging * {
    content height, which pins rows to whatever the first fit produced and leaves
    the pane bottom empty. */
 .pane-body .term-host {
-  height: 100%;
+  height: auto;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow: hidden;
 }
 
@@ -1529,6 +1533,7 @@ body.session-dragging * {
 
 .pane-placeholder {
   display: flex;
+  flex: 1 1 auto;
   flex-direction: column;
   gap: 12px;
   align-items: center;
@@ -1539,28 +1544,94 @@ body.session-dragging * {
   text-align: center;
 }
 
-/* Why a start/resume was refused (a full pool, a transcript the daemon will not
-   reopen): the daemon's own sentence, warn-coloured, above the retry buttons. */
-.pane-notice {
-  max-width: 60ch;
-  color: var(--warn);
-  font: 12px/1.5 var(--mono);
+.pane-placeholder-cold {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  height: auto;
+  background: rgb(0 0 0 / 88%);
 }
 
 .pane-placeholder button {
   padding: 7px 12px;
-  background: var(--panel-raised);
-  color: var(--muted);
   border: 1px solid var(--line);
   border-radius: 8px;
+  background: var(--panel-raised);
+  color: var(--muted);
   font: 600 12px var(--mono);
   cursor: pointer;
-  transition:
-    border-color 0.15s ease,
-    color 0.15s ease;
 }
 
 .pane-placeholder button:hover {
   border-color: var(--effort-accent);
   color: var(--text);
+}
+
+
+.cold-composer {
+  display: grid;
+  position: relative;
+  z-index: 3;
+  flex: 0 0 auto;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px;
+  align-items: end;
+  padding: 7px;
+  border-top: 1px solid var(--line-muted);
+  background: var(--panel);
+}
+
+.cold-composer[hidden] {
+  display: none;
+}
+
+.cold-composer textarea {
+  width: 100%;
+  min-width: 0;
+  min-height: 40px;
+  max-height: 30vh;
+  padding: 7px 9px;
+  resize: vertical;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font: 12px/1.45 var(--mono);
+}
+
+.cold-composer textarea:focus {
+  border-color: var(--effort-accent);
+  outline: 0;
+}
+
+.cold-composer button {
+  height: 34px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-raised);
+  color: var(--text);
+  font: 11px var(--mono);
+  cursor: pointer;
+}
+
+.cold-composer button:hover:enabled,
+.cold-composer button:focus-visible {
+  border-color: var(--effort-accent);
+  color: var(--effort-accent);
+}
+
+.cold-composer button:disabled {
+  color: var(--dim);
+  cursor: default;
+}
+
+.cold-composer-status {
+  grid-column: 1 / -1;
+  color: var(--warn);
+  font: 10px/1.4 var(--mono);
+}
+
+.cold-composer-status:empty {
+  display: none;
 }
