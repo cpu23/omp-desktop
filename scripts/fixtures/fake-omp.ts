@@ -74,10 +74,12 @@ if (!transcript && sessionsDir) {
 
 if (recordDir) mkdirSync(recordDir, { recursive: true, mode: 0o700 });
 
-if (transcript) {
+function announceSessionFile(): void {
+  if (!transcript) return;
   const encodedPath = Buffer.from(transcript, "utf8").toString("base64");
   process.stdout.write(`\x1b]1337;SetUserVar=omp_session_file=${encodedPath}\x07`);
 }
+if (process.env.OMP_DESKTOP_TEST_DEFER_SESSION_FILE !== "1") announceSessionFile();
 process.stdout.write("FAKE-OMP READY\r\n");
 
 let idleSince = Date.now();
@@ -160,6 +162,7 @@ process.stdin.on("data", (chunk: Buffer) => {
     let consume = lineEnd + 1;
     if (pending[lineEnd] === "\r" && pending[lineEnd + 1] === "\n") consume += 1;
     pending = pending.slice(consume);
+    if (line === "announce session") announceSessionFile();
     if (line === "exit 7") {
       process.exit(7);
       return;

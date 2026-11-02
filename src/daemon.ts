@@ -3,6 +3,8 @@ import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { RuntimeManager, RuntimeCapacityError, PendingRuntimeCapacityError, type SpawnRequest } from "./manager";
 import { listSessions, readSessionCwd } from "./sessions";
+import { SessionTitleStore } from "./session-titles";
+import { SessionArchiveStore } from "./session-archives";
 import { isRecord } from "./guards";
 import { MAX_RUNTIME_INPUT_CODE_UNITS, parseClientMessage, type RuntimeInfo, type RuntimesResponse, type ServerMessage } from "./protocol";
 import { PresentationReader } from "./presentation";
@@ -60,6 +62,12 @@ const STATE_DIR = resolve(
 );
 const STATE_FILE = process.env.OMP_DESKTOP_STATE_FILE ?? join(STATE_DIR, "state.json");
 const stateStore = new WorkspaceStateStore(STATE_FILE);
+const SESSION_TITLES_FILE =
+  process.env.OMP_DESKTOP_SESSION_TITLES_FILE ?? join(STATE_DIR, "session-titles.json");
+const sessionTitleStore = new SessionTitleStore(SESSION_TITLES_FILE);
+const SESSION_ARCHIVES_FILE =
+  process.env.OMP_DESKTOP_SESSION_ARCHIVES_FILE ?? join(STATE_DIR, "session-archives.json");
+const sessionArchiveStore = new SessionArchiveStore(SESSION_ARCHIVES_FILE);
 // Durable record of the live runtime pool, owned by the daemon (see state.ts):
 // client documents describe panes, this describes the sessions themselves, so a
 // restart restores every session that was live — including ones no pane holds.
@@ -204,6 +212,7 @@ let idleSweepBusy = false;
 
 class RuntimeUnavailableError extends Error {}
 class SessionIdentityError extends Error {}
+class ArchivedSessionError extends Error {}
 
 async function waitForUnload(done: Promise<void>): Promise<void> {
   const expired = Promise.withResolvers<never>();
@@ -219,7 +228,18 @@ async function waitForUnload(done: Promise<void>): Promise<void> {
 }
 
 /** Requests serialize behind a graceful unload; reads never call this path. */
-async function createRequestedRuntime(request: SpawnRequest): Promise<Runtime> {
+function createRequestedRuntime(request: SpawnRequest): Promise<Runtime> {
+  const file = request.resume;
+  if (!file) return allocateRequestedRuntime(request);
+  return withSessionOperation(file, async () => {
+    if ((await sessionArchiveStore.read()).includes(file)) {
+      throw new ArchivedSessionError("archived sessions cannot be resumed");
+    }
+    return allocateRequestedRuntime(request);
+  });
+}
+
+async function allocateRequestedRuntime(request: SpawnRequest): Promise<Runtime> {
   const file = request.resume;
   if (file) requestingSessions.set(file, (requestingSessions.get(file) ?? 0) + 1);
   try {
@@ -441,6 +461,24 @@ function beginRestart(): Response {
   });
 }
 
+// Serialize resume and archive through metadata reads, process start/stop and persistence.
+const sessionOperations = new Map<string, Promise<unknown>>();
+const archivedSessionPaths = new Set<string>();
+async function stopSessionRuntimes(path: string): Promise<void> {
+  await Promise.all(manager.list()
+    .filter((runtime) => runtime.sessionFile === path)
+    .map((runtime) => manager.kill(runtime.id)));
+}
+function withSessionOperation<T>(path: string, operation: () => Promise<T>): Promise<T> {
+  const previous = sessionOperations.get(path) ?? Promise.resolve();
+  const result = previous.catch(() => {}).then(operation);
+  sessionOperations.set(path, result);
+  void result.finally(() => {
+    if (sessionOperations.get(path) === result) sessionOperations.delete(path);
+  }).catch(() => {});
+  return result;
+}
+
 await waitForPreviousDaemon();
 
 const server = Bun.serve<WsData>({
@@ -454,6 +492,7 @@ const server = Bun.serve<WsData>({
       url.pathname === "/api/settings" ||
       url.pathname === "/api/restart" ||
       url.pathname === "/api/sessions/request" ||
+      url.pathname === "/api/sessions/archive" ||
       url.pathname === "/ws/term"
     ) {
       await poolReady;
@@ -661,6 +700,7 @@ const server = Bun.serve<WsData>({
               { status: 409 },
             );
           }
+          if (error instanceof ArchivedSessionError) return new Response(error.message, { status: 400 });
           if (error instanceof RuntimeUnavailableError) return new Response(error.message, { status: 503 });
           throw error;
         }
@@ -708,6 +748,7 @@ const server = Bun.serve<WsData>({
           return Response.json({ runtime: runtime.info() }, { headers: NO_STORE });
         } catch (error) {
           if (runtime && !runtime.alive && manager.get(runtime.id) === runtime) await manager.kill(runtime.id);
+          if (error instanceof ArchivedSessionError) return new Response(error.message, { status: 400 });
           if (error instanceof RuntimeCapacityError) {
             return new Response("session limit reached; stop a session or raise the runtime limit in Settings", { status: 409 });
           }
@@ -715,13 +756,61 @@ const server = Bun.serve<WsData>({
           return new Response(error instanceof Error ? error.message : "session request unavailable", { status: 503 });
         }
       }
+      case "POST /api/sessions/title": {
+        const body: unknown = await req.json().catch(() => null);
+        if (!isRecord(body) || typeof body.path !== "string" || typeof body.title !== "string") {
+          return new Response("path and title must be strings", { status: 400 });
+        }
+        const path = validResume(body.path);
+        if (!path) return new Response("path must be an existing session file under the session store", { status: 400 });
+        const title = body.title.trim();
+        if (!title) return new Response("title must be nonempty", { status: 400 });
+        if (title.length > 1024) return new Response("title must contain at most 1024 characters", { status: 400 });
+        try {
+          await sessionTitleStore.save(path, title);
+          return Response.json({ ok: true, path, title }, { headers: NO_STORE });
+        } catch (error) {
+          return new Response(
+            `session title save failed: ${error instanceof Error ? error.message : String(error)}`,
+            { status: 500 },
+          );
+        }
+      }
+      case "POST /api/sessions/archive": {
+        const body: unknown = await req.json().catch(() => null);
+        if (!isRecord(body) || typeof body.path !== "string") {
+          return new Response("path must be a string", { status: 400 });
+        }
+        const path = validResume(body.path);
+        if (!path) return new Response("path must be an existing session file under the session store", { status: 400 });
+        try {
+          return await withSessionOperation(path, async () => {
+            // Stop and reap before hiding controls, using Unload's lifecycle
+            // path so the restart ledger also drops the runtime.
+            await stopSessionRuntimes(path);
+            await sessionArchiveStore.archive(path);
+            archivedSessionPaths.add(path);
+            // A fresh runtime may announce its transcript during the save.
+            await stopSessionRuntimes(path);
+            return Response.json({ ok: true, path }, { headers: NO_STORE });
+          });
+        } catch (error) {
+          return new Response(
+            `session archive save failed: ${error instanceof Error ? error.message : String(error)}`,
+            { status: 500 },
+          );
+        }
+      }
       case "GET /api/sessions": {
-        // `listSessions` owns limit validation; forwarding keeps one policy.
+        // `listSessions` owns limit validation; archived entries are removed before search/limit.
+        const archivedPaths = await sessionArchiveStore.read();
         const sessions = await listSessions({
           limit: Number(url.searchParams.get("limit") ?? 60),
           search: url.searchParams.get("search") ?? undefined,
+          titleOverrides: await sessionTitleStore.read(),
+          excludedPaths: new Set(archivedPaths),
         });
-        return conditionalJson(req, { sessions });
+        return conditionalJson(req, { sessions, archivedPaths });
       }
       case "GET /api/sessions/history": {
         const file = validResume(url.searchParams.get("path") ?? undefined);
@@ -889,6 +978,17 @@ function writeLedger(): void {
 }
 
 manager.subscribeChanges((change) => {
+  if (change === "started") {
+    // New sessions acquire their transcript identity asynchronously through PTY
+    // output. Apply archive intent when that identity first becomes known.
+    for (const runtime of manager.list()) {
+      if (runtime.sessionFile && archivedSessionPaths.has(runtime.sessionFile)) {
+        void manager.kill(runtime.id).catch((error) => {
+          console.warn(`omp-desktopd: archived runtime cleanup failed: ${String(error)}`);
+        });
+      }
+    }
+  }
   if (shuttingDown || restoringPool) return;
   if (change === "exited") {
     exitSaveTimer ??= setTimeout(() => {
@@ -920,11 +1020,15 @@ manager.subscribeChanges((change) => {
  */
 async function restorePool(): Promise<void> {
   try {
+    for (const path of await sessionArchiveStore.read()) archivedSessionPaths.add(path);
     const records = await ledger.read();
     if (records.length === 0) return;
+    // Older versions archived without stopping, and a crash can leave a stale
+    // ledger. Persistent archive intent wins over either runtime snapshot.
     let restored = 0;
     for (const record of records) {
       if (shuttingDown) break;
+      if (archivedSessionPaths.has(record.sessionFile)) continue;
       const resume = validResume(record.sessionFile);
       if (!resume) {
         console.warn(`omp-desktopd: not restoring ${record.sessionFile}: no such transcript under ${SESSIONS_ROOT}`);

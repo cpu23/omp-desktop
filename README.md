@@ -55,6 +55,12 @@ from your application menu; the daemon above must remain running.
   without restarting; **0** disables unloading. Execution, sleeps, background jobs, subagents, queued delivery,
   pending dialogs and unsent terminal input prevent unloading. Unknown activity also prevents unloading.
 - Settings retains a flat **Sessions** view with Pinned and Sessions sections. Pin/stop controls appear on hover or keyboard focus.
+- Click a pane's session title to edit it. **Enter** or the Save icon saves; clicking away or the Cancel icon discards the edit. Escape has no special action.
+  Custom titles are limited to 1,024 UTF-16 code units after trimming. They persist in Desktop and appear in the sidebar without modifying OMP transcripts.
+
+- Right-click a session for an icon menu: **Edit title**, **Pin/Unpin**, **Unload session**, and **Archive**.
+  Unload stops the runtime while preserving its transcript. Archive stops the runtime and persistently hides the session from the sidebar without deleting its transcript.
+  Archived sessions cannot be resumed through Desktop, including from an existing pane; their transcript files remain on disk.
 - Press **Ctrl+Shift+E** (macOS browser: **⌘⇧E**) to cycle split layouts. Press **Ctrl+Shift+F** (**⌘⇧F**) to
   expand the selected pane; press again to restore the split without restarting its session.
 - Open the gear beside search for Appearance, Notifications, Sessions, and grouped Keyboard shortcuts.
@@ -79,6 +85,8 @@ from your application menu; the daemon above must remain running.
 - Read saved transcripts without a resident agent; start or resume only on explicit submission. Preserve local
   drafts across navigation and send dropped/pasted image attachments with cold requests.
 
+- Edit session titles with explicit Save/Cancel icons, Enter to save, and click-away to discard.
+- Add an icon-based sidebar context menu for editing, pinning, unloading, and non-destructive archiving.
 - Replace the Linux GTK3/Tauri shell with a GTK4/WebKitGTK 6 shell using system packages, while retaining Tauri
   on macOS and Windows.
 - Require Rust 1.92+, GTK 4.14+, and WebKitGTK 6.0 2.44+ development APIs to build the Linux shell; no private

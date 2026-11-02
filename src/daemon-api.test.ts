@@ -262,6 +262,313 @@ describe("real daemon API behavior", () => {
     }
   }, 60_000);
 
+  test("desktop session titles are renamed, searched, and retained across daemon restart", async () => {
+    const daemon = await startTestDaemon();
+    try {
+      const originalTitle = "Transcript-owned title";
+      const transcript = await writeTestTranscript(daemon.root, "custom-title-persistence", { title: originalTitle });
+      const transcriptBefore = await Bun.file(transcript).text();
+      const outside = join(daemon.root, "outside-title-session.jsonl");
+      await Bun.write(outside, "{}\n");
+      const missing = join(testSessionsRoot(daemon.root), "-test-fixtures", "missing-title-session.jsonl");
+      const invalidPaths = [
+        outside,
+        missing,
+        join(testSessionsRoot(daemon.root), "..", "..", "..", "..", "outside-title-session.jsonl"),
+      ];
+      for (const path of invalidPaths) {
+        const rejected = await fetch(`${daemon.base}/api/sessions/title`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ path, title: "Rejected title" }),
+        });
+        expect(rejected.status).toBe(400);
+      }
+      for (const body of [
+        { path: transcript, title: "" },
+        { path: transcript, title: " \t\n " },
+        { path: transcript, title: "😀".repeat(513) },
+        { path: transcript, title: 42 },
+        { path: 42, title: "Not a path" },
+        null,
+      ]) {
+        const rejected = await fetch(`${daemon.base}/api/sessions/title`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        expect(rejected.status).toBe(400);
+      }
+
+      const rename = async (title: string): Promise<void> => {
+        const response = await fetch(`${daemon.base}/api/sessions/title`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ path: transcript, title }),
+        });
+        expect(response.status).toBe(200);
+        expect(await response.json()).toEqual({ ok: true, path: transcript, title: title.trim() });
+      };
+      const matchingTitles = async (search: string): Promise<string[]> => {
+        const response = await fetch(`${daemon.base}/api/sessions?limit=5&search=${encodeURIComponent(search)}`);
+        expect(response.status).toBe(200);
+        const payload: unknown = await response.json();
+        if (!isRecord(payload) || !Array.isArray(payload.sessions)) throw new Error("bad /api/sessions payload");
+        return payload.sessions.flatMap((entry) =>
+          isRecord(entry) && typeof entry.title === "string" && typeof entry.path === "string"
+            ? [entry.path === transcript ? entry.title : ""]
+            : [],
+        ).filter(Boolean);
+      };
+
+      await rename("😀".repeat(512));
+      expect(await matchingTitles("😀".repeat(512))).toEqual(["😀".repeat(512)]);
+      await rename(`  ${"x".repeat(1024)}  `);
+      expect(await matchingTitles("x".repeat(1024))).toEqual(["x".repeat(1024)]);
+      const oversized = await fetch(`${daemon.base}/api/sessions/title`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ path: transcript, title: "y".repeat(1025) }),
+      });
+      expect(oversized.status).toBe(400);
+      expect(await oversized.text()).toContain("1024");
+      expect(await matchingTitles("x".repeat(1024))).toEqual(["x".repeat(1024)]);
+
+      await rename("  First desktop title  ");
+      expect(await matchingTitles("First desktop title")).toEqual(["First desktop title"]);
+      await rename("  Renamed desktop session  ");
+      expect(await matchingTitles("Renamed desktop session")).toEqual(["Renamed desktop session"]);
+      expect(await matchingTitles(originalTitle)).toEqual([]);
+      expect(await Bun.file(transcript).text()).toBe(transcriptBefore);
+
+      await daemon.restart();
+      expect(await matchingTitles("Renamed desktop session")).toEqual(["Renamed desktop session"]);
+      expect(await Bun.file(transcript).text()).toBe(transcriptBefore);
+    } finally {
+      await daemon.stop();
+    }
+  }, 60_000);
+
+  test("session archives persist without changing transcripts or desktop titles", async () => {
+    const daemon = await startTestDaemon();
+    try {
+      const [firstPath, secondPath] = await Promise.all([
+        writeTestTranscript(daemon.root, "archive-api-first", { title: "Archive coverage first" }),
+        writeTestTranscript(daemon.root, "archive-api-second", { title: "Archive coverage second" }),
+      ]);
+      const transcriptBefore = new Map([
+        [firstPath, await Bun.file(firstPath).text()],
+        [secondPath, await Bun.file(secondPath).text()],
+      ]);
+      const outside = join(daemon.root, "outside-archive-session.jsonl");
+      await Bun.write(outside, "{}\n");
+      const missing = join(testSessionsRoot(daemon.root), "-test-fixtures", "missing-archive-session.jsonl");
+      for (const path of [
+        outside,
+        missing,
+        join(testSessionsRoot(daemon.root), "..", "..", "..", "..", "outside-archive-session.jsonl"),
+      ]) {
+        const rejected = await fetch(`${daemon.base}/api/sessions/archive`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ path }),
+        });
+        expect(rejected.status).toBe(400);
+      }
+      for (const body of [{ path: 42 }, { path: "" }, null]) {
+        const rejected = await fetch(`${daemon.base}/api/sessions/archive`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        expect(rejected.status).toBe(400);
+      }
+
+      const readIndex = async (limit: number): Promise<{ sessions: unknown[]; archivedPaths: unknown[] }> => {
+        const response = await fetch(
+          `${daemon.base}/api/sessions?limit=${limit}&search=${encodeURIComponent("Archive coverage")}`,
+        );
+        expect(response.status).toBe(200);
+        const payload: unknown = await response.json();
+        if (!isRecord(payload) || !Array.isArray(payload.sessions) || !Array.isArray(payload.archivedPaths)) {
+          throw new Error("bad /api/sessions payload");
+        }
+        if (!payload.archivedPaths.every((path) => typeof path === "string")) {
+          throw new Error("/api/sessions archivedPaths must contain strings");
+        }
+        return { sessions: payload.sessions, archivedPaths: payload.archivedPaths };
+      };
+      const initial = await readIndex(10);
+      expect(initial.archivedPaths).toEqual([]);
+      expect(initial.sessions).toHaveLength(2);
+      const first = initial.sessions[0];
+      const second = initial.sessions[1];
+      if (!isRecord(first) || typeof first.path !== "string" || !isRecord(second) || typeof second.path !== "string") {
+        throw new Error("session list omitted transcript paths");
+      }
+      const archivedPath = first.path;
+      const visiblePath = second.path;
+      const titled = await fetch(`${daemon.base}/api/sessions/title`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ path: archivedPath, title: "  Archive coverage retained title  " }),
+      });
+      expect(titled.status).toBe(200);
+      expect(await titled.json()).toEqual({ ok: true, path: archivedPath, title: "Archive coverage retained title" });
+      const titlesBeforeArchive = await Bun.file(join(daemon.root, "state", "session-titles.json")).text();
+
+      const runtime = await createRuntime(daemon.base, { resume: archivedPath });
+      if (runtime.pid === null) throw new Error("archive runtime did not start");
+      const otherRuntime = await createRuntime(daemon.base, { resume: visiblePath });
+
+      const archiveUrl = `${daemon.base}/api/sessions/archive`;
+      const archiveRequest = {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ path: archivedPath }),
+      };
+      const archived = await fetch(archiveUrl, archiveRequest);
+      expect(archived.status).toBe(200);
+      expect(await archived.json()).toEqual({ ok: true, path: archivedPath });
+      expect((await runtimeList(daemon.base)).map((entry) => entry.id)).toEqual([otherRuntime.id]);
+      expect(() => process.kill(runtime.pid!, 0)).toThrow();
+      expect((await fetch(archiveUrl, archiveRequest)).status).toBe(200);
+      const resumedArchive = await fetch(`${daemon.base}/api/runtimes`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ resume: archivedPath }),
+      });
+      expect(resumedArchive.status).toBe(400);
+      const requestedArchive = await fetch(`${daemon.base}/api/sessions/request`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ path: archivedPath, text: "Do not revive an archived conversation" }),
+      });
+      expect(requestedArchive.status).toBe(400);
+      expect((await runtimeList(daemon.base)).map((entry) => entry.id)).toEqual([otherRuntime.id]);
+
+      const afterArchive = await readIndex(1);
+      expect(afterArchive.archivedPaths).toContain(archivedPath);
+      expect(afterArchive.sessions).toHaveLength(1);
+      expect(isRecord(afterArchive.sessions[0]) && afterArchive.sessions[0].path).toBe(visiblePath);
+      expect(await Bun.file(join(daemon.root, "state", "session-titles.json")).text()).toBe(titlesBeforeArchive);
+      expect(transcriptBefore.get(firstPath)).toBe(await Bun.file(firstPath).text());
+      expect(transcriptBefore.get(secondPath)).toBe(await Bun.file(secondPath).text());
+
+      await daemon.restart();
+      const afterRestart = await readIndex(1);
+      expect((await runtimeList(daemon.base)).some((entry) => entry.sessionFile === archivedPath)).toBe(false);
+      expect((await runtimeList(daemon.base)).some((entry) => entry.sessionFile === visiblePath)).toBe(true);
+      expect(afterRestart.archivedPaths).toContain(archivedPath);
+      expect(afterRestart.sessions).toHaveLength(1);
+      expect(isRecord(afterRestart.sessions[0]) && afterRestart.sessions[0].path).toBe(visiblePath);
+      expect(await Bun.file(join(daemon.root, "state", "session-titles.json")).text()).toBe(titlesBeforeArchive);
+      expect(transcriptBefore.get(firstPath)).toBe(await Bun.file(firstPath).text());
+      expect(transcriptBefore.get(secondPath)).toBe(await Bun.file(secondPath).text());
+    } finally {
+      await daemon.stop();
+    }
+  }, 60_000);
+
+  test("archive stops a fresh runtime when its delayed transcript announcement arrives", async () => {
+    const daemon = await startTestDaemon({ env: { OMP_DESKTOP_TEST_DEFER_SESSION_FILE: "1" } });
+    try {
+      const runtime = await createRuntime(daemon.base);
+      expect((await fetch(`${daemon.base}/api/runtimes/${runtime.id}/screen`)).status).toBe(200);
+      await waitFor(async () => {
+        const response = await fetch(`${daemon.base}/api/runtimes/${runtime.id}/screen`);
+        const screen: unknown = await response.json();
+        return isRecord(screen) && typeof screen.screen === "string" && screen.screen.includes("FAKE-OMP READY");
+      }, "fresh runtime ready before transcript announcement");
+      const started = (await runtimeList(daemon.base)).find((entry) => entry.id === runtime.id)!;
+      expect(started.sessionFile).toBeNull();
+      expect(started.pid).toEqual(expect.any(Number));
+      const index: unknown = await (await fetch(`${daemon.base}/api/sessions`)).json();
+      if (!isRecord(index) || !Array.isArray(index.sessions) || !isRecord(index.sessions[0]) ||
+          typeof index.sessions[0].path !== "string") throw new Error("fresh transcript missing from index");
+      const path = index.sessions[0].path;
+      const before = await Bun.file(path).text();
+      const archived = await fetch(`${daemon.base}/api/sessions/archive`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ path }),
+      });
+      expect(archived.status).toBe(200);
+      expect((await inputRequest(daemon.base, runtime.id, JSON.stringify({ data: "announce session\n" }))).status).toBe(200);
+      await waitFor(async () => !(await runtimeList(daemon.base)).some((entry) => entry.id === runtime.id),
+        "late-discovered archived runtime to stop", 2000);
+      await waitFor(() => {
+        try { process.kill(started.pid!, 0); return false; }
+        catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
+      }, "late-discovered archived PTY to be reaped");
+      expect(await Bun.file(path).text()).toBe(before);
+      await daemon.restart();
+      expect(await runtimeList(daemon.base)).toEqual([]);
+    } finally {
+      await daemon.stop();
+    }
+  }, 60_000);
+
+  test("startup skips archived entries left in a legacy runtime ledger", async () => {
+    const daemon = await startTestDaemon();
+    try {
+      const archivedPath = await writeTestTranscript(daemon.root, "legacy-archived");
+      const visiblePath = await writeTestTranscript(daemon.root, "legacy-visible");
+      const archived = await fetch(`${daemon.base}/api/sessions/archive`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ path: archivedPath }),
+      });
+      expect(archived.status).toBe(200);
+      const ledgerFile = join(daemon.root, "state", "sessions.json");
+      await Bun.write(ledgerFile, JSON.stringify({
+        version: 1,
+        sessions: [archivedPath, visiblePath].map((sessionFile) => ({ sessionFile, cwd: join(daemon.root, "project") })),
+      }));
+      await daemon.restart();
+      expect((await runtimeList(daemon.base)).map((runtime) => runtime.sessionFile)).toEqual([visiblePath]);
+      await waitFor(async () => {
+        const ledger: unknown = await Bun.file(ledgerFile).json();
+        return isRecord(ledger) && Array.isArray(ledger.sessions) && ledger.sessions.length === 1 &&
+          isRecord(ledger.sessions[0]) && ledger.sessions[0].sessionFile === visiblePath;
+      }, "legacy archived entry removed from ledger");
+    } finally {
+      await daemon.stop();
+    }
+  }, 60_000);
+
+  test("archive and overlapping resumes leave no hidden runtime", async () => {
+    const daemon = await startTestDaemon();
+    try {
+      for (const [route, archiveFirst] of [
+        ["runtimes", false], ["runtimes", true],
+        ["sessions/request", false], ["sessions/request", true],
+      ] as const) {
+        const path = await writeTestTranscript(daemon.root, `overlapping-archive-${route}-${archiveFirst}`);
+        const send = (route: string, body: unknown) => fetch(`${daemon.base}/api/${route}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        const resumeBody = route === "runtimes" ? { resume: path } : { path, text: "Concurrent explicit request" };
+        const requests = archiveFirst
+          ? [send("sessions/archive", { path }), send(route, resumeBody)]
+          : [send(route, resumeBody), send("sessions/archive", { path })];
+        const responses = await Promise.all(requests);
+        const archive = responses[archiveFirst ? 0 : 1]!;
+        const resume = responses[archiveFirst ? 1 : 0]!;
+        expect(archive.status).toBe(200);
+        expect(route === "runtimes" ? [200, 400] : [200, 400, 503]).toContain(resume.status);
+        expect((await runtimeList(daemon.base)).some((runtime) => runtime.sessionFile === path)).toBe(false);
+        // Future resumes must not recreate an invisible process either.
+        expect((await send("runtimes", { resume: path })).status).toBe(400);
+        expect((await send("sessions/request", { path, text: "Must remain archived" })).status).toBe(400);
+      }
+      await daemon.restart();
+      expect(await runtimeList(daemon.base)).toEqual([]);
+    } finally {
+      await daemon.stop();
+    }
+  }, 60_000);
+
   test("runtime capacity rejects new transcripts and DELETE stops and reaps the PTY", async () => {
     const daemon = await startTestDaemon({ env: { OMP_DESKTOP_MAX_RUNTIMES: "1" } });
     try {
