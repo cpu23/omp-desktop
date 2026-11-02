@@ -202,10 +202,13 @@ function trustedOrigins(port: number): Set<string> {
  *  Requests without browser provenance headers remain available to local tools. */
 function sameOriginRequest(req: Request, requestUrl: URL, port: number): boolean {
   const allowedOrigins = trustedOrigins(port);
+  if (!allowedOrigins.has(requestUrl.origin)) return false;
   const origin = req.headers.get("origin");
   if (origin !== null && (origin !== requestUrl.origin || !allowedOrigins.has(origin))) return false;
   const fetchSite = req.headers.get("sec-fetch-site");
-  return fetchSite === null || (fetchSite === "same-origin" && allowedOrigins.has(requestUrl.origin));
+  if (fetchSite === null) return true;
+  if (fetchSite === "none") return req.method === "GET" && allowedOrigins.has(requestUrl.origin);
+  return fetchSite === "same-origin" && allowedOrigins.has(requestUrl.origin);
 }
 
 
@@ -512,7 +515,8 @@ const server = Bun.serve<WsData>({
     const url = new URL(req.url);
     const websocketUpgrade = req.headers.get("upgrade")?.toLowerCase() === "websocket";
     const listenPort = server.port;
-    if ((MUTATING_METHODS.has(req.method) || websocketUpgrade) &&
+    const apiRequest = url.pathname.startsWith("/api/");
+    if ((apiRequest || MUTATING_METHODS.has(req.method) || websocketUpgrade) &&
         (listenPort === undefined || !sameOriginRequest(req, url, listenPort))) {
       return new Response("cross-origin request rejected", { status: 403 });
     }

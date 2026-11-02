@@ -133,6 +133,69 @@ describe("real daemon API behavior", () => {
     } finally { await daemon.stop(); }
   }, 60_000);
 
+  test("DNS-rebound GET API requests cannot read sessions or start a reserved runtime", async () => {
+    const daemon = await startTestDaemon();
+    try {
+      const transcript = await writeTestTranscript(daemon.root, "rebound-get-history", {
+        title: "private rebound history",
+        firstPrompt: "private transcript contents",
+      });
+      const reserved = await createRuntime(daemon.base);
+      const reboundGet = (path: string) => rawHttpRequest(daemon.port, [
+        `GET ${path} HTTP/1.1`,
+        `Host: rebound.invalid:${daemon.port}`,
+        `Origin: http://rebound.invalid:${daemon.port}`,
+        "Sec-Fetch-Site: same-origin",
+        "Connection: close",
+        "",
+        "",
+      ].join("\r\n"));
+      const sessions = await reboundGet("/api/sessions");
+      const history = await reboundGet(`/api/sessions/history?path=${encodeURIComponent(transcript)}`);
+      const screen = await reboundGet(`/api/runtimes/${reserved.id}/screen`);
+
+      const responseStatus = (response: string) => Number(response.match(/^HTTP\/1\.1 (\d+)/)?.[1] ?? 0);
+      const runtimesAfterRebound = await runtimeList(daemon.base);
+      expect({
+        sessions: responseStatus(sessions),
+        history: responseStatus(history),
+        screen: responseStatus(screen),
+        runtime: runtimesAfterRebound.find((entry) => entry.id === reserved.id),
+      }).toEqual({
+        sessions: 403,
+        history: 403,
+        screen: 403,
+        runtime: expect.objectContaining({ alive: false, pid: null }),
+      });
+
+      const headerlessRebound = await rawHttpRequest(daemon.port, [
+        "GET /api/sessions HTTP/1.1",
+        `Host: rebound.invalid:${daemon.port}`,
+        "Connection: close", "", "",
+      ].join("\r\n"));
+      expect(headerlessRebound).toMatch(/^HTTP\/1\.1 403 /);
+      const appRead = await fetch(`${daemon.base}/api/sessions`, {
+        headers: { "sec-fetch-site": "same-origin" },
+      });
+      expect(appRead.status).toBe(200);
+      const localToolRead = await fetch(`${daemon.base}/api/sessions`);
+      expect(localToolRead.status).toBe(200);
+      const navigationRead = await fetch(`${daemon.base}/api/sessions`, {
+        headers: { "sec-fetch-site": "none" },
+      });
+      expect(navigationRead.status).toBe(200);
+      const documentNavigation = await rawHttpRequest(daemon.port, [
+        "GET / HTTP/1.1",
+        `Host: 127.0.0.1:${daemon.port}`,
+        "Sec-Fetch-Site: none",
+        "Connection: close",
+        "",
+        "",
+      ].join("\r\n"));
+      expect(documentNavigation).toMatch(/^HTTP\/1\.1 200 /);
+    } finally { await daemon.stop(); }
+  }, 60_000);
+
   test("same-origin JSON prompt submissions are accepted and recorded by the real fixture endpoint", async () => {
     const daemon = await startTestDaemon();
     const marker = `same-origin-prompt-${crypto.randomUUID()}`;

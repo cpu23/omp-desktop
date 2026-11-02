@@ -757,7 +757,7 @@ class Pane {
     this.#orphanReview.className = "orphan-draft-review";
     this.#orphanReview.setAttribute("aria-label", "Unattributed recovered input");
     const orphanHeading = document.createElement("strong");
-    orphanHeading.textContent = "Unconfirmed input — not sent to this session";
+    orphanHeading.textContent = "Recovered input — review before reuse; not automatically resent";
     this.#orphanText = document.createElement("pre");
     const discardOrphan = document.createElement("button");
     discardOrphan.type = "button";
@@ -1053,6 +1053,15 @@ class Pane {
       else this.binding.orphanDraft = `${this.binding.orphanDraft ?? ""}${recovered}`;
       save();
     }
+  }
+
+  /** Keep close-raced terminal input visible in the surviving pane, never resend it. */
+  preservePendingForClose(): void {
+    const recovered = draftableTerminalInput(
+      [...this.#pendingInputs.values()].map((input) => input.data).join(""),
+    );
+    this.#pendingInputs.clear();
+    if (recovered) this.binding.orphanDraft = `${this.binding.orphanDraft ?? ""}${recovered}`;
   }
 
   #associateUnknownInputs(sessionFile: string): void {
@@ -1404,14 +1413,14 @@ class Pane {
     this.ws.send(JSON.stringify({ type: "resize", cols: this.term.cols, rows: this.term.rows }));
   }
 
-  bind(binding: PaneBinding): void {
+  bind(binding: PaneBinding, mergePreviousRecovery = true): void {
     this.#finishTitleEdit(false);
     const previous = this.binding;
     const identityChanged = previous.sessionFile !== binding.sessionFile ||
       (!binding.sessionFile && previous.cwd !== binding.cwd);
     const runtimeChanged = previous.runtimeId !== binding.runtimeId;
     if (runtimeChanged && previous.runtimeId) this.#preservePendingInputs();
-    binding = rebindPaneBinding(previous, binding);
+    if (mergePreviousRecovery) binding = rebindPaneBinding(previous, binding);
     if (runtimeChanged || !binding.runtimeId) this.detach();
     if (identityChanged || (binding.runtimeId && !previous.runtimeId)) this.#cancelColdHistory();
     this.binding = binding;
@@ -1849,6 +1858,16 @@ function closePane(paneId: string): void {
     return;
   }
   const removed = ids.length === 4 && alreadyClosed ? [alreadyClosed, paneId] : [paneId];
+  const survivorId = ids.find((id) => !removed.includes(id));
+  const survivor = survivorId ? panes.get(survivorId) : null;
+  if (survivor) {
+    for (const id of removed) {
+      const closing = panes.get(id);
+      if (!closing) continue;
+      closing.preservePendingForClose();
+      survivor.bind(rebindPaneBinding(closing.binding, survivor.binding));
+    }
+  }
   for (const id of removed) {
     const remaining = removeLeaf(layout.tree, id);
     if (!remaining) return;
@@ -2132,8 +2151,8 @@ function swapPanes(aId: string, bId: string): void {
   const b = panes.get(bId);
   if (!a || !b) return;
   const binding = a.binding;
-  a.bind(b.binding);
-  b.bind(binding);
+  a.bind(b.binding, false);
+  b.bind(binding, false);
 }
 
 function togglePaneFocus(): void {
