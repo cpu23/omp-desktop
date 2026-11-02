@@ -32,6 +32,7 @@ const AUTOMATION_APP_ID: &str = "sh.omp.desktop.automation";
 const WINDOW_TITLE: &str = "OMP Desktop";
 const SHELL_MARKER: &str = "Object.defineProperty(window,'__OMP_DESKTOP_SHELL__',{value:'gtk'});";
 const CONNECT_HANDLER: &str = "ompDesktopConnect";
+const WORKSPACE_PICKER_HANDLER: &str = "ompDesktopSelectWorkspaceDirectory";
 const BOOTSTRAP_RECOVERY_MARKER: &str = "__OMP_DESKTOP_RECOVERY_ERROR__";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,8 +210,13 @@ fn build_window(
     };
     let daemon_script_origin = serde_json::to_string(&daemon_script_origin)
         .expect("daemon origin is always a valid JSON string");
-    let user_script_source =
-        format!("if(location.origin==={daemon_script_origin}){{{SHELL_MARKER}}}");
+    // Only the trusted top frame receives this capability. WebKit's message
+    // value context cannot evaluate DOM globals to identify its calling frame.
+    let workspace_picker_token = glib::uuid_string_random().to_string();
+    let token_json = serde_json::to_string(&workspace_picker_token).expect("UUID is valid JSON");
+    let user_script_source = format!(
+        "if(location.origin==={daemon_script_origin}){{{SHELL_MARKER}Object.defineProperty(window,'__OMP_SELECT_WORKSPACE_DIRECTORY__',{{value:(()=>{{const token={token_json};const handler=window.webkit.messageHandlers.{WORKSPACE_PICKER_HANDLER};const post=handler.postMessage.bind(handler);return ()=>post(token);}})()}});}}"
+    );
     let user_script = UserScript::new(
         &user_script_source,
         UserContentInjectedFrames::TopFrame,
@@ -290,6 +296,7 @@ fn build_window(
     install_navigation_policy(&view, port, &user_content, &bootstrap_generation);
     let single_flight = Rc::new(Cell::new(false));
     install_connect_bridge(&view, &user_content, port, &single_flight, &bootstrap_generation);
+    install_workspace_picker_bridge(&view, &user_content, port, &window, workspace_picker_token);
 
     let recovery_script: Rc<RefCell<Option<UserScript>>> = Rc::new(RefCell::new(None));
     let recovery_in_progress = Rc::new(Cell::new(false));
@@ -489,8 +496,10 @@ fn install_navigation_policy(
                         if uri == policy::BOOTSTRAP_URI {
                             generation.set(generation.get().wrapping_add(1));
                             ensure_connect_handler(&manager);
+                            manager.unregister_script_message_handler(WORKSPACE_PICKER_HANDLER, None);
                         } else {
                             manager.unregister_script_message_handler(CONNECT_HANDLER, None);
+                            ensure_workspace_picker_handler(&manager);
                         }
                         if let Some(view) = weak_view.upgrade() {
                             view.load_uri(&uri);
@@ -525,8 +534,10 @@ fn install_navigation_policy(
                 if uri.as_str() == policy::BOOTSTRAP_URI {
                     generation.set(generation.get().wrapping_add(1));
                     ensure_connect_handler(&manager);
+                    manager.unregister_script_message_handler(WORKSPACE_PICKER_HANDLER, None);
                 } else {
                     manager.unregister_script_message_handler(CONNECT_HANDLER, None);
+                    ensure_workspace_picker_handler(&manager);
                 }
                 decision.use_();
             }
@@ -624,6 +635,112 @@ fn install_connect_bridge(
             true
         },
     );
+}
+
+fn install_workspace_picker_bridge(
+    view: &WebView,
+    user_content: &UserContentManager,
+    port: u16,
+    window: &ApplicationWindow,
+    token: String,
+) {
+    let weak_view = view.downgrade();
+    let weak_window = window.downgrade();
+    let pending = Rc::new(Cell::new(false));
+    let signal_manager = user_content.clone();
+    signal_manager.connect_script_message_with_reply_received(
+        Some(WORKSPACE_PICKER_HANDLER),
+        move |_manager, value, reply| {
+            if !value.is_string() || value.to_str().as_str() != token.as_str() {
+                reply.return_error_message("Unsupported workspace picker request.");
+                return true;
+            }
+            let Some(js_context) = value.context() else {
+                reply.return_error_message("The workspace picker reply context is unavailable.");
+                return true;
+            };
+            let Some(view) = weak_view.upgrade() else {
+                reply.return_error_message("The desktop window has closed.");
+                return true;
+            };
+            if !view
+                .uri()
+                .is_some_and(|uri| policy::is_daemon_origin(uri.as_str(), port))
+            {
+                reply.return_error_message("Workspace selection is only available from the desktop daemon page.");
+                return true;
+            }
+            let Some(parent) = weak_window.upgrade() else {
+                reply.return_error_message("The desktop window has closed.");
+                return true;
+            };
+            if pending.replace(true) {
+                reply.return_error_message("A workspace directory chooser is already open.");
+                return true;
+            }
+            let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+                pending.set(false);
+                reply.return_error_message("Could not determine the user's home directory.");
+                return true;
+            };
+            if !home.is_absolute() {
+                pending.set(false);
+                reply.return_error_message("The user's home directory is not an absolute path.");
+                return true;
+            }
+
+            let dialog = gtk4::FileDialog::builder()
+                .title("Select workspace directory")
+                .accept_label("Select")
+                .initial_folder(&gio::File::for_path(home))
+                .modal(true)
+                .build();
+            let callback_pending = Rc::clone(&pending);
+            let callback_view = weak_view.clone();
+            let callback_context = js_context.clone();
+            let callback_reply = reply.clone();
+            dialog.select_folder(Some(&parent), None::<&gio::Cancellable>, move |selection| {
+                callback_pending.set(false);
+
+                let page_is_authorized = callback_view.upgrade().is_some_and(|view| {
+                    view.uri()
+                        .is_some_and(|uri| policy::is_daemon_origin(uri.as_str(), port))
+                });
+                if !page_is_authorized {
+                    callback_reply.return_error_message("The desktop page changed before workspace selection completed.");
+                } else if let Ok(file) = selection {
+                    let selected = file.path()
+                        .ok_or_else(|| "The chooser did not return a local directory path.".to_owned())
+                        .and_then(|path| {
+                            if !path.is_absolute() {
+                                return Err("The chooser returned a non-absolute directory path.".to_owned());
+                            }
+                            path.to_str()
+                                .map(str::to_owned)
+                                .ok_or_else(|| "The selected directory path is not valid UTF-8.".to_owned())
+                        });
+                    match selected {
+                        Ok(path) => {
+                            let result = JsValue::new_string(&callback_context, Some(&path));
+                            callback_reply.return_value(&result);
+                        }
+                        Err(error) => callback_reply.return_error_message(&error),
+                    }
+                } else if let Err(error) = selection {
+                    if error.matches(gtk4::DialogError::Dismissed) || error.matches(gtk4::DialogError::Cancelled) {
+                        callback_reply.return_value(&JsValue::new_null(&callback_context));
+                    } else {
+                        callback_reply.return_error_message(&format!("Could not select a workspace directory: {error}"));
+                    }
+                }
+            });
+            true
+        },
+    );
+}
+
+fn ensure_workspace_picker_handler(user_content: &UserContentManager) {
+    let _ = user_content.register_script_message_handler_with_reply(WORKSPACE_PICKER_HANDLER, None);
 }
 
 

@@ -2,9 +2,9 @@
 //!
 //! The window is either on the bundled connection page (local `tauri://localhost`)
 //! or on the daemon origin (`http://127.0.0.1:<port>`). The bundled page receives
-//! core APIs; the loopback daemon page receives only the separately scoped
-//! notification plugin permissions. `connect` re-checks its caller's URL before
-//! using the shell command, so remote content gets no other shell privileges.
+//! core APIs; the loopback daemon page receives separately scoped notification
+//! and workspace-picker permissions. Each command re-checks its caller's URL
+//! before allowing native access.
 
 use tauri::webview::NewWindowResponse;
 use tauri::{AppHandle, Manager, Runtime, WebviewWindow, WebviewWindowBuilder};
@@ -122,4 +122,50 @@ pub async fn connect(webview: WebviewWindow) -> Result<String, String> {
         .map_err(|error| format!("connected to build {build}, but could not open {target}: {error}"))?;
 
     Ok(build)
+}
+ 
+/// Opens a native directory chooser for a workspace on the loopback daemon page.
+#[tauri::command]
+pub async fn select_workspace_directory(webview: WebviewWindow) -> Result<Option<String>, String> {
+    if webview.label() != MAIN_WINDOW {
+        return Err("workspace selection is only available in the main window".to_owned());
+    }
+    let current = webview
+        .url()
+        .map_err(|error| format!("cannot read the current page URL: {error}"))?;
+    let port = daemon::daemon_port();
+    if !daemon::is_daemon_url(&current, port)
+        || !current.username().is_empty()
+        || current.password().is_some()
+    {
+        return Err("workspace selection is only available from the desktop daemon page".to_owned());
+    }
+
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| "could not determine the user's home directory".to_owned())?;
+    if !home.is_absolute() || !home.is_dir() {
+        return Err(format!("the user's home directory is not available: {}", home.display()));
+    }
+
+    let selected = tauri::async_runtime::spawn_blocking(move || {
+        rfd::FileDialog::new()
+            .set_title("Select workspace directory")
+            .set_directory(home)
+            .pick_folder()
+    })
+    .await
+    .map_err(|error| format!("workspace directory chooser failed: {error}"))?;
+
+    let Some(path) = selected else {
+        return Ok(None);
+    };
+    if !path.is_absolute() {
+        return Err("the directory chooser returned a non-absolute path".to_owned());
+    }
+    let path = path
+        .to_str()
+        .ok_or_else(|| "the selected directory path is not valid UTF-8".to_owned())?;
+    Ok(Some(path.to_owned()))
 }

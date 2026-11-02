@@ -174,12 +174,24 @@ fall back to upload; other pathless files are ignored. Paths containing control 
 
 ### Sidebar, settings and shortcuts
 
-The session view groups compact, borderless two-line rows into **Loaded**, **Pinned**, then **Recent**.
-Each session appears only in its highest applicable section: a loaded, pinned session appears under Loaded,
-not Pinned or Recent. The Loaded heading includes its count; Recent is ordered by last conversation activity,
-newest first. Rows show the directory and title, with an unread-completion dot when attention is needed.
-Hover or focus within a row to reveal pin and stop controls. Start a session with **+** beside search.
-The sidebar stays open and remains resizable; settings retain the optional folder view.
+The default **Workspaces** view groups sessions by their directory, showing the directory basename once in the
+group heading and compact title-only rows beneath it. Hover a heading to see its full path. In the native app,
+click the folder-plus **Add workspace** icon to open the system directory chooser at your home directory.
+Cancel leaves the list unchanged; choosing the same directory again selects the existing workspace.
+Added workspaces remain visible even without sessions. Selection and collapsed groups persist across reloads
+and are included in the daemon's durable sidebar mirror.
+
+Use **+** on a workspace heading to start a session in that directory. The header **+** uses the selected workspace,
+falling back to the daemon's default directory when no workspace is selected. Browser clients can use saved
+workspaces, but adding a directory requires the native desktop shell; the browser reports this rather than
+pretending an upload picker can return an absolute local directory.
+
+Running and saved sessions appear together, with pinned sessions first and then newest conversation activity.
+Opening a running session reattaches to its existing process; opening a saved session resumes its transcript.
+Working and unread-completion indicators remain authoritative extension state. Stopping a process does not
+delete its saved conversation. Settings offers a flat **Sessions** view with **Pinned** and **Sessions** sections,
+where rows retain directory subtitles. Hover or focus within a row to reveal pin and stop controls.
+The sidebar stays open and remains resizable.
 Pane title bars retain their compact single-line layout without a bottom border. Only the close and pin icons
 match the sidebar controls; they appear on hover or keyboard focus. Pinning updates both surfaces;
 closing a pane only detaches its view and does not stop the session.

@@ -1,7 +1,8 @@
 import { trimSelectionHighlight } from "./selection";
 import {
   applySidebarState, onSidebarStateChange, sidebarFolderView, sidebarFolderExpanded,
-  toggleSidebarFolder, STORE_KEY as SIDEBAR_KEY,
+  toggleSidebarFolder, sidebarWorkspaces, sidebarActiveWorkspace, selectSidebarWorkspace,
+  normalizeDirectoryPath, STORE_KEY as SIDEBAR_KEY,
 } from "./sidebar";
 import { doneIndicator, workingIndicator } from "./working-indicator";
 import { CompletionTracker } from "./completion-tracker";
@@ -1747,6 +1748,8 @@ function syncPinButton(button: HTMLButtonElement, session: SessionSummaryLike | 
 function createSidebarRow(kind: "runtime" | "session"): SidebarRowRecord {
   const element = document.createElement("div");
   const name = document.createElement("span");
+  element.tabIndex = 0;
+  element.setAttribute("role", "button");
   name.className = "name";
   const sub = document.createElement("span");
   sub.className = "sub";
@@ -1784,11 +1787,18 @@ function createSidebarRow(kind: "runtime" | "session"): SidebarRowRecord {
   element.addEventListener("click", () => {
     const pane = focusedPane();
     if (!pane) return;
+    const cwd = record.element.dataset.cwd;
+    if (cwd) selectSidebarWorkspace(cwd);
     if (record.runtime) {
       pane.bind(bindingForRuntime(record.runtime, daemonId, displayTitle(record.runtime)));
     } else if (record.session) {
       void openSession(pane, record.session);
     }
+  });
+  element.addEventListener("keydown", (event) => {
+    if (event.target !== element || (event.key !== "Enter" && event.key !== " ")) return;
+    event.preventDefault();
+    element.click();
   });
   wireSessionDrag(element, () => record.dragPayload);
   return record;
@@ -1827,14 +1837,22 @@ function updateRuntimeSidebarRow(
   title: string,
   cwd: string,
   snapshot: SessionSummaryLike | null,
+  workspaceView: boolean,
 ): void {
+  if (workspaceView && (title === cwd || title === cwd.replace(/^\/home\/[^/]+/, "~") || title === runtime.id)) {
+    title = "New session";
+  }
   record.runtime = runtime;
   record.session = null;
   record.snapshot = snapshot;
-  const className = runtime.alive ? "row live loaded" : "row recent loaded";
+  const className = runtime.alive ? "row live" : "row recent";
   if (record.element.className !== className) record.element.className = className;
-  if (record.element.dataset.cwd !== cwd) record.element.dataset.cwd = cwd;
-  const rowTitle = `${cwd}\n${runtime.sessionFile ?? "(session file not known yet)"}\n${runtime.id}`;
+  const workspace = normalizeDirectoryPath(cwd) ?? cwd;
+  if (record.element.dataset.cwd !== workspace) record.element.dataset.cwd = workspace;
+  const state = !daemonUp ? "Connection unavailable" : !attachable(runtime) ? "Saved · resume on open"
+    : runtime.presentation?.agentActive ? "Working" : runtime.alive ? "Running" : "Starting";
+  record.element.dataset.state = state;
+  const rowTitle = `${title}\n${state}\n${cwd}\n${runtime.sessionFile ?? "(session file not known yet)"}`;
   if (record.element.title !== rowTitle) record.element.title = rowTitle;
   const accent = runtimeAccent(runtime);
   if (record.element.style.getPropertyValue("--row-accent") !== accent) {
@@ -1850,7 +1868,7 @@ function updateRuntimeSidebarRow(
         : "none"
     : "none";
   updateSidebarRowName(record, title, indicator);
-  const sub = cwd.replace(/^\/home\/[^/]+/, "~") || "/";
+  const sub = workspaceView ? "" : cwd.replace(/^\/home\/[^/]+/, "~") || "/";
   updateSidebarRowSub(record, `runtime\u0000${sub}`, sub);
   record.dragPayload.runtimeId = runtime.id;
   syncPinButton(record.pin, record.snapshot);
@@ -1859,16 +1877,20 @@ function updateRuntimeSidebarRow(
 function updateRecentSidebarRow(
   record: SidebarRowRecord,
   session: SessionSummaryLike,
+  workspaceView: boolean,
 ): void {
   record.runtime = null;
   record.session = session;
   record.snapshot = session;
   if (record.element.className !== "row recent") record.element.className = "row recent";
-  if (record.element.dataset.cwd !== session.cwd) record.element.dataset.cwd = session.cwd;
-  const rowTitle = `${session.cwd}\n${session.path}`;
+  const workspace = normalizeDirectoryPath(session.cwd) ?? session.cwd;
+  if (record.element.dataset.cwd !== workspace) record.element.dataset.cwd = workspace;
+  record.element.dataset.state = "Saved";
+  const rowTitle = `${session.title}\nSaved · resume on open\n${session.cwd}\n${session.path}`;
   if (record.element.title !== rowTitle) record.element.title = rowTitle;
-  updateSidebarRowName(record, session.title || session.cwd, "none");
-  const cwd = session.cwd.replace(/^\/home\/[^/]+/, "~") || "/";
+  const title = workspaceView && (!session.title || session.title === session.cwd) ? "New session" : session.title || session.cwd;
+  updateSidebarRowName(record, title, "none");
+  const cwd = workspaceView ? "" : session.cwd.replace(/^\/home\/[^/]+/, "~") || "/";
   updateSidebarRowSub(record, `session\u0000${cwd}`, cwd);
   record.dragPayload.path = session.path;
   record.dragPayload.cwd = session.cwd;
@@ -1904,15 +1926,31 @@ function folderRecord(cwd: string): SidebarFolderRecord {
   const label = document.createElement("span");
   label.className = "folder-label";
   heading.append(marker, label);
+  const add = document.createElement("button");
+  add.type = "button";
+  add.className = "workspace-new-session";
+  const name = cwd.split("/").filter(Boolean).pop() ?? cwd;
+  add.title = `New session in ${name}`;
+  add.setAttribute("aria-label", add.title);
+  add.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>';
+  add.addEventListener("click", () => {
+    selectSidebarWorkspace(cwd);
+    const pane = focusedPane();
+    if (pane) void newSession(pane, true, cwd);
+  });
+  const header = document.createElement("div");
+  header.className = "workspace-heading";
+  header.append(heading, add);
   const contents = document.createElement("div");
   contents.className = "folder-sessions";
   contents.id = `sidebar-folder-${++sidebarFolderSeq}`;
   heading.setAttribute("aria-controls", contents.id);
   heading.addEventListener("click", () => {
+    selectSidebarWorkspace(cwd);
     toggleSidebarFolder(cwd);
     heading.focus();
   });
-  element.append(heading, contents);
+  element.append(header, contents);
   const record = { element, heading, marker, label, contents };
   sidebarFolders.set(cwd, record);
   return record;
@@ -1920,9 +1958,12 @@ function folderRecord(cwd: string): SidebarFolderRecord {
 
 function updateFolder(record: SidebarFolderRecord, cwd: string): void {
   const expanded = sidebarFolderExpanded(cwd);
-  const marker = expanded ? "▾" : "▸";
-  if (record.marker.textContent !== marker) record.marker.textContent = marker;
-  const label = cwd.replace(/^\/home\/[^/]+/, "~") || "(unknown folder)";
+  const marker = expanded
+    ? '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M3 8V5h6l2 2h10v3M3 10h19l-3 10H2L3 10Z"/></svg>'
+    : '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M3 7V5h6l2 2h10v13H3V7Z"/></svg>';
+  if (record.marker.innerHTML !== marker) record.marker.innerHTML = marker;
+  record.heading.classList.toggle("active", cwd === sidebarActiveWorkspace());
+  const label = cwd.split("/").filter(Boolean).pop() ?? (cwd || "Ungrouped");
   if (record.label.textContent !== label) record.label.textContent = label;
   if (record.heading.getAttribute("aria-expanded") !== String(expanded)) {
     record.heading.setAttribute("aria-expanded", String(expanded));
@@ -1948,7 +1989,7 @@ function renderSidebar(): void {
   }
   const liveFiles = new Set<string>();
   for (const runtime of runtimes) {
-    if (runtime.sessionFile) liveFiles.add(runtime.sessionFile);
+    if (attachable(runtime) && runtime.sessionFile) liveFiles.add(runtime.sessionFile);
   }
   let pinsChanged = false;
   pinnedSessions = pinnedSessions.map((pin) => {
@@ -1967,6 +2008,8 @@ function renderSidebar(): void {
       return `${displayTitle(runtime)} ${summary?.cwd ?? runtime.cwd}`.toLowerCase().includes(query);
     })
     : runtimes;
+  // Exited transcripts belong to the same saved-session list, not a stale runtime row.
+  const visibleRuntimes = liveRuntimes.filter((runtime) => attachable(runtime) || !runtime.sessionFile);
   const candidates = new Map(pinnedSessions.map((session) => [session.path, session]));
   for (const session of sessions) candidates.set(session.path, session);
   const recent = [...candidates.values()].filter((session) =>
@@ -1978,7 +2021,7 @@ function renderSidebar(): void {
   const pinnedRows: SidebarRowRecord[] = [];
   const otherRows: SidebarRowRecord[] = [];
   const activeKeys = new Set<string>();
-  for (const runtime of liveRuntimes) {
+  for (const runtime of visibleRuntimes) {
     const title = displayTitle(runtime);
     // The transcript directory is the project; runtime.cwd may only be its
     // process launch directory after omp relocates out of a disallowed path.
@@ -1991,7 +2034,7 @@ function renderSidebar(): void {
     const snapshot = runtime.sessionFile
       ? summary ?? pinnedSessions.find((entry) => entry.path === runtime.sessionFile) ?? null
       : null;
-    updateRuntimeSidebarRow(record, runtime, title, cwd, snapshot);
+    updateRuntimeSidebarRow(record, runtime, title, cwd, snapshot, folderView);
     loadedRows.push(record);
   }
   for (const session of recent) {
@@ -1999,7 +2042,7 @@ function renderSidebar(): void {
     activeKeys.add(key);
     const record = sidebarRows.get(key) ?? createSidebarRow("session");
     sidebarRows.set(key, record);
-    updateRecentSidebarRow(record, session);
+    updateRecentSidebarRow(record, session, folderView);
     (pinnedPaths.has(session.path) ? pinnedRows : otherRows).push(record);
   }
   for (const [key, record] of sidebarRows) {
@@ -2008,9 +2051,19 @@ function renderSidebar(): void {
     sidebarRows.delete(key);
   }
 
-  const rows = [...loadedRows, ...pinnedRows, ...otherRows];
+  // Runtime residency is an implementation detail: keep pinned chats first,
+  // then order running and saved chats together by conversation activity.
+  const rows = [...loadedRows, ...pinnedRows, ...otherRows].sort((a, b) => {
+    const aPath = a.runtime?.sessionFile ?? a.session?.path ?? "";
+    const bPath = b.runtime?.sessionFile ?? b.session?.path ?? "";
+    const pinOrder = Number(pinnedPaths.has(bPath)) - Number(pinnedPaths.has(aPath));
+    if (pinOrder) return pinOrder;
+    const aActivity = Date.parse(a.snapshot?.updatedAt ?? a.runtime?.startedAt ?? "") || 0;
+    const bActivity = Date.parse(b.snapshot?.updatedAt ?? b.runtime?.startedAt ?? "") || 0;
+    return bActivity - aActivity || aPath.localeCompare(bPath);
+  });
   const desiredTopLevel: HTMLElement[] = [];
-  if (rows.length === 0) {
+  if (rows.length === 0 && (!folderView || sidebarWorkspaces().length === 0 || query !== "")) {
     if (!sidebarEmpty) {
       sidebarEmpty = document.createElement("div");
       sidebarEmpty.className = "side-empty";
@@ -2021,6 +2074,7 @@ function renderSidebar(): void {
   }
 
   const rowsByFolder = new Map<string, SidebarRowRecord[]>();
+  for (const cwd of sidebarWorkspaces()) rowsByFolder.set(cwd, []);
   for (const row of rows) {
     const cwd = row.element.dataset.cwd ?? "";
     const folderRows = rowsByFolder.get(cwd) ?? [];
@@ -2029,16 +2083,18 @@ function renderSidebar(): void {
   }
   if (folderView) {
     for (const [cwd, folderRows] of rowsByFolder) {
+      if (query && folderRows.length === 0 && !cwd.toLowerCase().includes(query)) continue;
       const folder = folderRecord(cwd);
       updateFolder(folder, cwd);
       reconcileChildren(folder.contents, folderRows.map((row) => row.element));
       desiredTopLevel.push(folder.element);
     }
   } else {
+    const pinned = rows.filter((row) => pinnedPaths.has(row.runtime?.sessionFile ?? row.session?.path ?? ""));
+    const unpinned = rows.filter((row) => !pinnedPaths.has(row.runtime?.sessionFile ?? row.session?.path ?? ""));
     for (const [label, sectionRows] of [
-      ["Loaded", loadedRows],
-      ["Pinned", pinnedRows],
-      ["Recent", otherRows],
+      ["Pinned", pinned],
+      ["Sessions", unpinned],
     ] as const) {
       if (sectionRows.length === 0) continue;
       let heading = sidebarHeadings.get(label);
@@ -2054,7 +2110,7 @@ function renderSidebar(): void {
         sidebarHeadings.set(label, heading);
       }
       const expanded = !collapsedSidebarSections.has(label);
-      const text = `${expanded ? "▾" : "▸"} ${label === "Loaded" ? `${label} · ${sectionRows.length}` : label}`;
+      const text = `${expanded ? "▾" : "▸"} ${label} · ${sectionRows.length}`;
       if (heading.textContent !== text) heading.textContent = text;
       heading.setAttribute("aria-expanded", String(expanded));
       desiredTopLevel.push(heading);
@@ -2084,9 +2140,9 @@ async function killRuntime(id: string): Promise<void> {
   await refreshRuntimes();
 }
 
-async function newSession(pane: Pane, focus = true): Promise<void> {
+async function newSession(pane: Pane, focus = true, cwd = sidebarActiveWorkspace()): Promise<void> {
   const binding = pane.binding;
-  const { runtime, error } = await requestRuntime({});
+  const { runtime, error } = await requestRuntime(cwd ? { cwd } : {});
   // A pending creation must not replace a newer selection or revive a closed pane.
   if (panes.get(pane.id) !== pane || pane.binding !== binding) return;
   if (!runtime) {

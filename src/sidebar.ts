@@ -2,15 +2,16 @@
  * Sidebar resize and view, self-initialising on import.
  *
  * The resizer is static in index.html. State is one record under
- * omp-desktop.sidebar.v1 — width, view and expanded folders — so preferences
- * survive a reload. Width is applied as the --sidebar-w variable that #sidebar's
- * flex-basis reads, so the panes refit through normal flex layout.
+ * omp-desktop.sidebar.v1 — width, view, registered workspaces and collapsed
+ * workspace groups — so preferences survive a reload. Width is applied as
+ * --sidebar-w, which #sidebar's flex-basis reads, so the panes refit normally.
  *
  * The width is clamped to MIN_WIDTH..MAX_WIDTH and against the viewport, so a
  * stored width cannot swallow a narrow window. Only user-driven changes
  * overwrite the stored intent; a shrinking window just clamps the display.
  */
 import { syncRuntimeLimit } from "./runtime-limit";
+import { selectWorkspaceDirectory } from "./workspace-picker";
 
 export const STORE_KEY = "omp-desktop.sidebar.v1";
 /** Default width and the fallback in #sidebar's flex-basis; keep the two in sync. */
@@ -22,24 +23,121 @@ const PANE_RESERVE = 320;
 const KEY_STEP = 16;
 const KEY_STEP_LARGE = 64;
 
-type SidebarState = { width: number; view: "sessions" | "folders"; expandedFolders: string[] };
+type SidebarState = {
+  width: number;
+  view: "sessions" | "workspaces";
+  workspaces: string[];
+  activeWorkspace: string | null;
+  collapsedWorkspaces: string[];
+};
 
-let view: SidebarState["view"] = "sessions";
-let expandedFolders = new Set<string>();
+let view: SidebarState["view"] = "workspaces";
+let workspaces: string[] = [];
+let activeWorkspace: string | null = null;
+let collapsedWorkspaces = new Set<string>();
 let savePreferences: (() => void) | null = null;
+let refreshViewControls: (() => void) | null = null;
 
 export function sidebarFolderView(): boolean {
-  return view === "folders";
+  return view === "workspaces";
 }
 
 export function sidebarFolderExpanded(cwd: string): boolean {
-  return expandedFolders.has(cwd);
+  const path = normalizeDirectoryPath(cwd);
+  return path !== null && !collapsedWorkspaces.has(workspacePathKey(path));
 }
 
 export function toggleSidebarFolder(cwd: string): void {
-  if (expandedFolders.has(cwd)) expandedFolders.delete(cwd);
-  else expandedFolders.add(cwd);
+  const path = normalizeDirectoryPath(cwd);
+  if (path === null) return;
+  const key = workspacePathKey(path);
+  if (collapsedWorkspaces.has(key)) collapsedWorkspaces.delete(key);
+  else collapsedWorkspaces.add(key);
   savePreferences?.();
+}
+
+export function sidebarWorkspaces(): readonly string[] {
+  return workspaces;
+}
+
+export function addSidebarWorkspace(cwd: string): void {
+  const path = normalizeDirectoryPath(cwd);
+  if (path === null) return;
+  const key = workspacePathKey(path);
+  const existing = workspaces.find((workspace) => workspacePathKey(workspace) === key);
+  if (existing === undefined) workspaces = [...workspaces, path];
+  activeWorkspace = existing ?? path;
+  collapsedWorkspaces.delete(key);
+  view = "workspaces";
+  refreshViewControls?.();
+  savePreferences?.();
+}
+
+export function sidebarActiveWorkspace(): string | null {
+  return activeWorkspace;
+}
+
+export function selectSidebarWorkspace(cwd: string): void {
+  const path = normalizeDirectoryPath(cwd);
+  if (path === null) return;
+  const existing = workspaces.find((workspace) => workspacePathKey(workspace) === workspacePathKey(path));
+  const selected = existing ?? path;
+  if (activeWorkspace !== null && workspacePathKey(activeWorkspace) === workspacePathKey(selected)) return;
+  activeWorkspace = selected;
+  savePreferences?.();
+}
+
+export function normalizeDirectoryPath(value: string): string | null {
+  if (!value || value.includes("\0")) return null;
+  const windows = /^[A-Za-z]:[\\/]/.test(value) || value.startsWith("\\\\");
+  const path = windows ? value.replace(/\\/g, "/") : value;
+  let root: string;
+  let remainder: string;
+  const drive = /^([A-Za-z]):(?:\/|$)/.exec(path);
+  if (drive) {
+    root = `${drive[1].toUpperCase()}:/`;
+    remainder = path.slice(drive[0].length);
+  } else if (path.startsWith("//")) {
+    root = "//";
+    remainder = path.slice(2);
+  } else if (path.startsWith("/")) {
+    root = "/";
+    remainder = path.slice(1);
+  } else {
+    return null;
+  }
+
+  const segments: string[] = [];
+  for (const segment of remainder.split("/")) {
+    if (!segment || segment === ".") continue;
+    if (segment === "..") {
+      segments.pop();
+      continue;
+    }
+    segments.push(segment);
+  }
+  const joined = segments.join("/");
+  return root + joined;
+}
+
+function workspacePathKey(path: string): string {
+  return /^[A-Z]:\//.test(path) || path.startsWith("//") ? path.toLowerCase() : path;
+}
+
+function normalizedDirectoryPaths(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const paths: string[] = [];
+  const seen = new Set<string>();
+  for (const candidate of value) {
+    if (typeof candidate !== "string") continue;
+    const path = normalizeDirectoryPath(candidate);
+    if (path === null) continue;
+    const key = workspacePathKey(path);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    paths.push(path);
+  }
+  return paths;
 }
 
 /** Set by init(); null only in the instant before the controls are wired. */
@@ -88,17 +186,31 @@ function clampWidth(px: number): number {
 function parseSidebarState(value: unknown): SidebarState {
   if (typeof value === "object" && value !== null) {
     const record = value as Record<string, unknown>;
+    const legacyFolders = normalizedDirectoryPaths(record.expandedFolders);
+    const registeredWorkspaces = normalizedDirectoryPaths(record.workspaces);
+    const workspaces = record.workspaces === undefined
+      ? legacyFolders
+      : normalizedDirectoryPaths([...registeredWorkspaces, ...legacyFolders]);
+    const active = typeof record.activeWorkspace === "string"
+      ? normalizeDirectoryPath(record.activeWorkspace)
+      : null;
     return {
       width: typeof record.width === "number" && Number.isFinite(record.width)
         ? Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, record.width))
         : DEFAULT_WIDTH,
-      view: record.view === "folders" ? "folders" : "sessions",
-      expandedFolders: Array.isArray(record.expandedFolders)
-        ? record.expandedFolders.filter((cwd): cwd is string => typeof cwd === "string")
-        : [],
+      view: record.view === "sessions" ? "sessions" : "workspaces",
+      workspaces,
+      activeWorkspace: active,
+      collapsedWorkspaces: normalizedDirectoryPaths(record.collapsedWorkspaces),
     };
   }
-  return { width: DEFAULT_WIDTH, view: "sessions", expandedFolders: [] };
+  return {
+    width: DEFAULT_WIDTH,
+    view: "workspaces",
+    workspaces: [],
+    activeWorkspace: null,
+    collapsedWorkspaces: [],
+  };
 }
 
 function readState(): SidebarState {
@@ -122,25 +234,38 @@ function init(): void {
   let width = stored.width;
 
   view = stored.view;
-  expandedFolders = new Set(stored.expandedFolders);
+  workspaces = stored.workspaces;
+  activeWorkspace = stored.activeWorkspace;
+  collapsedWorkspaces = new Set(stored.collapsedWorkspaces.map(workspacePathKey));
 
   const settings = document.getElementById("sidebar-settings")!;
   const settingsOpen = document.getElementById("sidebar-settings-open")!;
   const settingsBack = document.getElementById("sidebar-settings-back")!;
   const search = document.getElementById("search")!;
   const newSession = document.getElementById("new-session")!;
+  const sidebarTitle = document.getElementById("sidebar-title")!;
+  const addWorkspace = document.getElementById("add-workspace") as HTMLButtonElement;
+  const pickerStatus = document.getElementById("workspace-picker-status")!;
   const list = document.getElementById("session-list")!;
   const viewButtons = document.querySelectorAll<HTMLButtonElement>("[data-sidebar-view]");
+  let settingsVisible = false;
 
   function renderView(): void {
     for (const button of viewButtons) {
       button.setAttribute("aria-pressed", String(button.dataset.sidebarView === view));
     }
+    const title = view === "workspaces" ? "Workspaces" : "Sessions";
+    if (sidebarTitle.textContent !== title) sidebarTitle.textContent = title;
   }
+  refreshViewControls = renderView;
 
   function showSettings(show: boolean): void {
+    settingsVisible = show;
     settings.hidden = !show;
     search.hidden = show;
+    sidebarTitle.hidden = show;
+    addWorkspace.hidden = show;
+    pickerStatus.hidden = show || !pickerStatus.textContent;
     settingsOpen.hidden = show;
 
     newSession.hidden = show;
@@ -164,15 +289,38 @@ function init(): void {
   });
   for (const button of viewButtons) {
     button.addEventListener("click", () => {
-      view = button.dataset.sidebarView === "folders" ? "folders" : "sessions";
+      view = button.dataset.sidebarView === "sessions" ? "sessions" : "workspaces";
       renderView();
       saveState();
     });
   }
 
+  addWorkspace.addEventListener("click", async () => {
+    addWorkspace.disabled = true;
+    pickerStatus.textContent = "";
+    pickerStatus.hidden = true;
+    try {
+      const cwd = await selectWorkspaceDirectory();
+      if (cwd !== null) addSidebarWorkspace(cwd);
+    } catch (error) {
+      pickerStatus.textContent = error instanceof Error && error.message
+        ? error.message
+        : "Could not choose a workspace directory.";
+      pickerStatus.hidden = settingsVisible;
+    } finally {
+      addWorkspace.disabled = false;
+    }
+  });
+
   function saveState(): void {
     try {
-      localStorage.setItem(STORE_KEY, JSON.stringify({ width, view, expandedFolders: [...expandedFolders] } satisfies SidebarState));
+      localStorage.setItem(STORE_KEY, JSON.stringify({
+        width,
+        view,
+        workspaces,
+        activeWorkspace,
+        collapsedWorkspaces: [...collapsedWorkspaces],
+      } satisfies SidebarState));
     } catch {
       // Storage denied: the sidebar still works for this page life.
     }
@@ -262,7 +410,9 @@ function init(): void {
   applyExternalState = (state) => {
     width = clampWidth(state.width);
     view = state.view;
-    expandedFolders = new Set(state.expandedFolders);
+    workspaces = state.workspaces;
+    activeWorkspace = state.activeWorkspace;
+    collapsedWorkspaces = new Set(state.collapsedWorkspaces.map(workspacePathKey));
     renderView();
     saveState();
     render();

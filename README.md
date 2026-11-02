@@ -42,9 +42,13 @@ from your application menu; the daemon above must remain running.
 - Panes show **Starting session…** while a new session initializes, hiding transient startup protocol text.
   Existing sessions reappear after replay; startup exits and disconnects uncover their output immediately.
 
-- **Loaded → Pinned → Recent:** each session appears only in its highest applicable section. Recent is ordered by
-  last conversation activity. Thin, inset dividers separate the groups. Click a section label to collapse or expand it.
-- Rows show the directory and title; secondary pin/stop controls appear on hover or keyboard focus.
+- **Workspaces** is the default sidebar view. In the native app, use the folder-plus icon to add a directory
+  through the system chooser, starting at your home folder. Empty workspaces remain available after a reload.
+- Running and saved sessions share one list, pinned first then newest conversation activity. Workspace rows
+  show titles without repeating their directory; working and unread-completion indicators remain visible.
+- Use **+** beside a workspace to start a session there, or select a workspace and use the header **+**.
+  Opening a running session reattaches; opening a saved one resumes it. Stop releases the process, not its history.
+- Settings retains a flat **Sessions** view with Pinned and Sessions sections. Pin/stop controls appear on hover or keyboard focus.
 - Press **Ctrl+Shift+E** (macOS browser: **⌘⇧E**) to cycle split layouts. Press **Ctrl+Shift+F** (**⌘⇧F**) to
   expand the selected pane; press again to restore the split without restarting its session.
 - Open the gear beside search for Appearance, Notifications, Sessions, and grouped Keyboard shortcuts.
@@ -58,6 +62,11 @@ from your application menu; the daemon above must remain running.
 </details>
 
 ## Unreleased
+
+- Default the sidebar to Workspaces, add a home-rooted native directory chooser on Linux/macOS/Windows, persist
+  empty workspaces and selection, and start sessions in the selected directory.
+- Unify running and saved conversations instead of separating Loaded/Recent sections; omit redundant directory
+  subtitles inside workspace groups.
 
 - Replace the Linux GTK3/Tauri shell with a GTK4/WebKitGTK 6 shell using system packages, while retaining Tauri
   on macOS and Windows.

@@ -2347,8 +2347,8 @@ function normalPreferenceState(root: AccessibilityNode): {
   notifications: boolean | null;
   notificationStatus: string | null;
 } {
-  const folders = accessibleGroupButtons(root, "Sidebar view", ["Folders", "Sessions"])
-    .find((node) => accessibleOptionName(node.name) === "folders");
+  const folders = accessibleGroupButtons(root, "Sidebar view", ["Workspaces", "Sessions"])
+    .find((node) => accessibleOptionName(node.name) === "workspaces");
   const motion = accessibleGroupButtons(root, "Working indicator motion", ["Off", "System", "On"])
     .find((node) => accessibleOptionName(node.name) === "off");
   const notifications = accessibleGroupButtons(root, "Completion notifications", ["Off", "On"]);
@@ -2398,7 +2398,7 @@ async function setNormalGroupToggle(
 
 async function setNormalPreferences(shell: NormalShell): Promise<AccessibilityNode> {
   await openNormalSettings(shell);
-  await setNormalGroupToggle(shell, "Sidebar view", "Folders", ["Folders", "Sessions"], true);
+  await setNormalGroupToggle(shell, "Sidebar view", "Workspaces", ["Workspaces", "Sessions"], true);
   await setNormalGroupToggle(shell, "Working indicator motion", "Off", ["Off", "System", "On"], true);
   await setNormalGroupToggle(shell, "Completion notifications", "Off", ["Off", "On"], true);
   const tree = await waitForAccessibleTree(shell, "real notification permission to be granted", (snapshot) => {

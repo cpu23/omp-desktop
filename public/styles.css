@@ -254,10 +254,39 @@ select:focus-visible {
   padding: 0 0 8px;
 }
 
-/* Search, new-session and settings controls share one compact row. */
+/* The workspace title and controls sit above the search field. */
 .side-search {
   display: flex;
+  flex-direction: column;
   gap: 6px;
+}
+
+.sidebar-heading {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+#sidebar-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font: 700 12px/1.4 var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-picker-status {
+  margin: 0;
+  color: var(--warn);
+  font: 10px/1.45 var(--mono);
+  overflow-wrap: anywhere;
+}
+
+.workspace-picker-status[hidden] {
+  display: none;
 }
 
 .sidebar-toggle {
@@ -276,6 +305,11 @@ select:focus-visible {
   transition:
     border-color 0.15s ease,
     color 0.15s ease;
+}
+
+.sidebar-toggle:disabled {
+  color: var(--dim);
+  cursor: wait;
 }
 
 .sidebar-toggle:hover {
@@ -342,6 +376,48 @@ select:focus-visible {
   flex: 0 0 auto;
 }
 
+.workspace-heading {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.workspace-heading .folder-heading {
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 0;
+}
+
+.workspace-new-session {
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 26px;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+}
+
+.workspace-new-session:hover {
+  background: var(--panel-soft);
+  color: var(--text);
+}
+
+.workspace-new-session:focus-visible {
+  outline: 1px solid var(--effort-accent);
+  outline-offset: 1px;
+}
+
+.workspace-new-session svg,
+.folder-marker svg {
+  display: block;
+  flex: 0 0 auto;
+}
+
 .folder-heading {
   display: flex;
   align-items: center;
@@ -362,6 +438,10 @@ select:focus-visible {
   background: var(--panel-soft);
 }
 
+.folder-heading.active {
+  color: var(--accent);
+}
+
 .folder-label {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -374,6 +454,7 @@ select:focus-visible {
   gap: 4px;
   padding-left: 10px;
 }
+
 
 .side-block input {
   width: 100%;
@@ -884,6 +965,31 @@ body.session-dragging * {
   text-align: left;
   cursor: pointer;
   user-select: none;
+}
+
+.folder-sessions .row {
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas: "name actions";
+  align-content: center;
+  gap: 6px;
+  flex: 0 0 34px;
+  height: 34px;
+  padding: 5px 4px;
+}
+
+.folder-sessions .row .sub {
+  display: none;
+}
+
+.folder-sessions .row .row-actions {
+  position: static;
+  grid-area: actions;
+  justify-self: end;
+  background: transparent;
+}
+
+.folder-sessions .row .row-actions button {
+  flex: 0 0 22px;
 }
 
 .row:hover,
