@@ -67,6 +67,7 @@ from your application menu; the daemon above must remain running.
   empty workspaces and selection, and start sessions in the selected directory.
 - Unify running and saved conversations instead of separating Loaded/Recent sections; omit redundant directory
   subtitles inside workspace groups.
+- Reveal each workspace's add-session button only on heading hover or keyboard focus, without shifting layout.
 
 - Replace the Linux GTK3/Tauri shell with a GTK4/WebKitGTK 6 shell using system packages, while retaining Tauri
   on macOS and Windows.

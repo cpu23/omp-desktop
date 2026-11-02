@@ -181,8 +181,9 @@ Cancel leaves the list unchanged; choosing the same directory again selects the 
 Added workspaces remain visible even without sessions. Selection and collapsed groups persist across reloads
 and are included in the daemon's durable sidebar mirror.
 
-Use **+** on a workspace heading to start a session in that directory. The header **+** uses the selected workspace,
-falling back to the daemon's default directory when no workspace is selected. Browser clients can use saved
+Hover a workspace heading (or focus it with the keyboard) to reveal **+** and start a session in that directory.
+The header **+** uses the selected workspace, falling back to the daemon's default directory when none is selected.
+Browser clients can use saved
 workspaces, but adding a directory requires the native desktop shell; the browser reports this rather than
 pretending an upload picker can return an absolute local directory.
 

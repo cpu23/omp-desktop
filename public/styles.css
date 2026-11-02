@@ -400,6 +400,14 @@ select:focus-visible {
   background: transparent;
   color: var(--dim);
   cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.workspace-heading:hover .workspace-new-session,
+.workspace-heading:focus-within .workspace-new-session {
+  opacity: 1;
+  pointer-events: auto;
 }
 
 .workspace-new-session:hover {
