@@ -295,6 +295,24 @@ function beginRestart(): Response {
   });
 }
 
+// Serialize resume and archive through metadata reads, process start/stop and persistence.
+const sessionOperations = new Map<string, Promise<unknown>>();
+const archivedSessionPaths = new Set<string>();
+async function stopSessionRuntimes(path: string): Promise<void> {
+  await Promise.all(manager.list()
+    .filter((runtime) => runtime.sessionFile === path)
+    .map((runtime) => manager.kill(runtime.id)));
+}
+function withSessionOperation<T>(path: string, operation: () => Promise<T>): Promise<T> {
+  const previous = sessionOperations.get(path) ?? Promise.resolve();
+  const result = previous.catch(() => {}).then(operation);
+  sessionOperations.set(path, result);
+  void result.finally(() => {
+    if (sessionOperations.get(path) === result) sessionOperations.delete(path);
+  }).catch(() => {});
+  return result;
+}
+
 await waitForPreviousDaemon();
 
 const server = Bun.serve<WsData>({
@@ -307,6 +325,7 @@ const server = Bun.serve<WsData>({
       url.pathname.startsWith("/api/runtimes/") ||
       url.pathname === "/api/settings" ||
       url.pathname === "/api/restart" ||
+      url.pathname === "/api/sessions/archive" ||
       url.pathname === "/ws/term"
     ) {
       await poolReady;
@@ -480,15 +499,20 @@ const server = Bun.serve<WsData>({
           // read, so concurrent requests cannot all pass a pre-check. Resuming a
           // transcript that is already live still reuses that process (and is
           // therefore allowed even at the limit).
-          const runtime = await manager.create(
-            {
-              cwd,
-              resume,
-              cols: typeof body.cols === "number" ? body.cols : undefined,
-              rows: typeof body.rows === "number" ? body.rows : undefined,
-            },
-            desiredMaxRuntimes < EFFECTIVE_MAX_RUNTIMES ? { maxRuntimes: desiredMaxRuntimes } : {},
-          );
+          const create = async () => {
+            if (resume && (await sessionArchiveStore.read()).includes(resume)) return null;
+            return manager.create(
+              {
+                cwd,
+                resume,
+                cols: typeof body.cols === "number" ? body.cols : undefined,
+                rows: typeof body.rows === "number" ? body.rows : undefined,
+              },
+              desiredMaxRuntimes < EFFECTIVE_MAX_RUNTIMES ? { maxRuntimes: desiredMaxRuntimes } : {},
+            );
+          };
+          const runtime = resume ? await withSessionOperation(resume, create) : await create();
+          if (!runtime) return new Response("archived sessions cannot be resumed", { status: 400 });
           return Response.json({ runtime: runtime.info() }, { headers: NO_STORE });
         } catch (error) {
           if (error instanceof PendingRuntimeCapacityError) {
@@ -517,6 +541,7 @@ const server = Bun.serve<WsData>({
         if (!path) return new Response("path must be an existing session file under the session store", { status: 400 });
         const title = body.title.trim();
         if (!title) return new Response("title must be nonempty", { status: 400 });
+        if (title.length > 1024) return new Response("title must contain at most 1024 characters", { status: 400 });
         try {
           await sessionTitleStore.save(path, title);
           return Response.json({ ok: true, path, title }, { headers: NO_STORE });
@@ -535,8 +560,16 @@ const server = Bun.serve<WsData>({
         const path = validResume(body.path);
         if (!path) return new Response("path must be an existing session file under the session store", { status: 400 });
         try {
-          await sessionArchiveStore.archive(path);
-          return Response.json({ ok: true, path }, { headers: NO_STORE });
+          return await withSessionOperation(path, async () => {
+            // Stop and reap before hiding controls, using Unload's lifecycle
+            // path so the restart ledger also drops the runtime.
+            await stopSessionRuntimes(path);
+            await sessionArchiveStore.archive(path);
+            archivedSessionPaths.add(path);
+            // A fresh runtime may announce its transcript during the save.
+            await stopSessionRuntimes(path);
+            return Response.json({ ok: true, path }, { headers: NO_STORE });
+          });
         } catch (error) {
           return new Response(
             `session archive save failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -700,6 +733,17 @@ function writeLedger(): void {
 }
 
 manager.subscribeChanges((change) => {
+  if (change === "started") {
+    // New sessions acquire their transcript identity asynchronously through PTY
+    // output. Apply archive intent when that identity first becomes known.
+    for (const runtime of manager.list()) {
+      if (runtime.sessionFile && archivedSessionPaths.has(runtime.sessionFile)) {
+        void manager.kill(runtime.id).catch((error) => {
+          console.warn(`omp-desktopd: archived runtime cleanup failed: ${String(error)}`);
+        });
+      }
+    }
+  }
   if (shuttingDown || restoringPool) return;
   if (change === "exited") {
     exitSaveTimer ??= setTimeout(() => {
@@ -731,11 +775,15 @@ manager.subscribeChanges((change) => {
  */
 async function restorePool(): Promise<void> {
   try {
+    for (const path of await sessionArchiveStore.read()) archivedSessionPaths.add(path);
     const records = await ledger.read();
     if (records.length === 0) return;
+    // Older versions archived without stopping, and a crash can leave a stale
+    // ledger. Persistent archive intent wins over either runtime snapshot.
     let restored = 0;
     for (const record of records) {
       if (shuttingDown) break;
+      if (archivedSessionPaths.has(record.sessionFile)) continue;
       const resume = validResume(record.sessionFile);
       if (!resume) {
         console.warn(`omp-desktopd: not restoring ${record.sessionFile}: no such transcript under ${SESSIONS_ROOT}`);

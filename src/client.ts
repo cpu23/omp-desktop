@@ -269,6 +269,7 @@ function showSessionMenu(record: SidebarRowRecord, x: number, y: number): void {
     if (!session) return;
     sessionMenu.replaceChildren();
     const input = document.createElement("input");
+    input.maxLength = 1024;
     input.value = session.title;
     input.setAttribute("aria-label", "Edit session title");
     const save = iconButton("Save title", "save");
@@ -706,6 +707,7 @@ class Pane {
     const header = document.createElement("header");
     header.className = "pane-header";
     this.#titleEl = document.createElement("input");
+    this.#titleEl.maxLength = 1024;
     this.#titleEl.className = "pane-title";
     this.#titleEl.readOnly = true;
     this.#titleEl.setAttribute("aria-label", "Session title");

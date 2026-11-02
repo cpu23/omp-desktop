@@ -42,13 +42,14 @@ from your application menu; the daemon above must remain running.
 - Panes show **Starting session…** while a new session initializes, hiding transient startup protocol text.
   Existing sessions reappear after replay; startup exits and disconnects uncover their output immediately.
 - Click a pane's session title to edit it. **Enter** or the Save icon saves; clicking away or the Cancel icon discards the edit. Escape has no special action.
-  Custom titles persist in Desktop and appear in the sidebar without modifying OMP transcripts.
+  Custom titles are limited to 1,024 UTF-16 code units after trimming. They persist in Desktop and appear in the sidebar without modifying OMP transcripts.
 
 - **Loaded → Pinned → Recent:** each session appears only in its highest applicable section. Recent is ordered by
   last conversation activity. Thin, inset dividers separate the groups. Click a section label to collapse or expand it.
 - Rows show the directory and title; secondary pin/stop controls appear on hover or keyboard focus.
 - Right-click a session for an icon menu: **Edit title**, **Pin/Unpin**, **Unload session**, and **Archive**.
-  Unload stops the runtime while preserving its transcript. Archive hides the session from the sidebar persistently without deleting its transcript or stopping its runtime.
+  Unload stops the runtime while preserving its transcript. Archive stops the runtime and persistently hides the session from the sidebar without deleting its transcript.
+  Archived sessions cannot be resumed through Desktop, including from an existing pane; their transcript files remain on disk.
 - Press **Ctrl+Shift+E** (macOS browser: **⌘⇧E**) to cycle split layouts. Press **Ctrl+Shift+F** (**⌘⇧F**) to
   expand the selected pane; press again to restore the split without restarting its session.
 - Open the gear beside search for Appearance, Notifications, Sessions, and grouped Keyboard shortcuts.
