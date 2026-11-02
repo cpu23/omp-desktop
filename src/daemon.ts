@@ -1,4 +1,5 @@
 import { isAbsolute, join, resolve } from "node:path";
+import { isIP } from "node:net";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { RuntimeManager, RuntimeCapacityError, PendingRuntimeCapacityError, type SpawnRequest } from "./manager";
@@ -183,6 +184,29 @@ const manager = new RuntimeManager({
 const webAssets = await createWebAssets(ROOT);
 const BUILD = webAssets.build;
 const NO_STORE = { "cache-control": "no-store" };
+const MUTATING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+
+function trustedOrigins(port: number): Set<string> {
+  const hosts = new Set(["127.0.0.1", "localhost"]);
+  const configuredHost = HOST.toLowerCase().replace(/^\[|\]$/g, "");
+  if (configuredHost === "localhost" || configuredHost === "::1" ||
+      (isIP(configuredHost) === 4 && configuredHost.startsWith("127."))) {
+    hosts.add(configuredHost);
+  }
+  return new Set([...hosts].map((host) =>
+    new URL(`http://${host.includes(":") ? `[${host}]` : host}:${port}`).origin,
+  ));
+}
+
+/** Reject browser requests that do not originate from a trusted loopback daemon origin.
+ *  Requests without browser provenance headers remain available to local tools. */
+function sameOriginRequest(req: Request, requestUrl: URL, port: number): boolean {
+  const allowedOrigins = trustedOrigins(port);
+  const origin = req.headers.get("origin");
+  if (origin !== null && (origin !== requestUrl.origin || !allowedOrigins.has(origin))) return false;
+  const fetchSite = req.headers.get("sec-fetch-site");
+  return fetchSite === null || (fetchSite === "same-origin" && allowedOrigins.has(requestUrl.origin));
+}
 
 
 type WsData = { runtime?: Runtime; output?: TerminalOutput; unsubData?: () => void; unsubExit?: () => void };
@@ -486,6 +510,12 @@ const server = Bun.serve<WsData>({
   port: PORT,
   async fetch(req, srv) {
     const url = new URL(req.url);
+    const websocketUpgrade = req.headers.get("upgrade")?.toLowerCase() === "websocket";
+    const listenPort = server.port;
+    if ((MUTATING_METHODS.has(req.method) || websocketUpgrade) &&
+        (listenPort === undefined || !sameOriginRequest(req, url, listenPort))) {
+      return new Response("cross-origin request rejected", { status: 403 });
+    }
     if (
       url.pathname === "/api/runtimes" ||
       url.pathname.startsWith("/api/runtimes/") ||
@@ -706,6 +736,10 @@ const server = Bun.serve<WsData>({
         }
       }
       case "POST /api/sessions/request": {
+        const contentType = (req.headers.get("content-type") ?? "").split(";", 1)[0]!.trim().toLowerCase();
+        if (contentType !== "application/json") {
+          return new Response("session requests require application/json", { status: 415 });
+        }
         let body: unknown;
         try {
           body = JSON.parse(new TextDecoder().decode(await readLimitedBytes(req, 128 * 1024)));

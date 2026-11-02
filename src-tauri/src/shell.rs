@@ -123,7 +123,7 @@ pub async fn connect(webview: WebviewWindow) -> Result<String, String> {
 
     Ok(build)
 }
- 
+
 /// Opens a native directory chooser for a workspace on the loopback daemon page.
 #[tauri::command]
 pub async fn select_workspace_directory(webview: WebviewWindow) -> Result<Option<String>, String> {

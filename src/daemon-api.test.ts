@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import { symlink } from "node:fs/promises";
+import { connect as connectTcp } from "node:net";
 import { IMAGE_FILE_LIMIT } from "./image-limits";
 import { isRecord } from "./guards";
 import { parseServerMessage } from "./protocol";
@@ -61,7 +62,174 @@ function inputRequest(base: string, runtimeId: string, body: BodyInit): Promise<
   });
 }
 
+async function rawHttpRequest(port: number, request: string): Promise<string> {
+  const socket = connectTcp(port, "127.0.0.1");
+  try {
+    return await new Promise<string>((resolve, reject) => {
+      let received = "";
+      const timeout = setTimeout(() => reject(new Error("timed out waiting for raw HTTP response")), 5_000);
+      socket.once("error", (error) => { clearTimeout(timeout); reject(error); });
+      socket.once("connect", () => socket.write(request));
+      socket.on("data", (chunk) => {
+        received += chunk.toString();
+        if (received.includes("\r\n\r\n")) {
+          clearTimeout(timeout);
+          resolve(received);
+        }
+      });
+    });
+  } finally {
+    socket.destroy();
+  }
+}
+
 describe("real daemon API behavior", () => {
+  test("cross-origin simple prompt submissions are rejected before any runtime or transcript side effect", async () => {
+    const daemon = await startTestDaemon();
+    const marker = `blocked-cross-origin-${crypto.randomUUID()}`;
+    try {
+      const response = await fetch(`${daemon.base}/api/sessions/request`, {
+        method: "POST",
+        headers: {
+          "content-type": "text/plain",
+          origin: "https://untrusted.invalid",
+          "sec-fetch-site": "cross-site",
+        },
+        body: JSON.stringify({ text: marker }),
+      });
+      let delivered = false;
+      if (response.ok) {
+        const payload: unknown = await response.json();
+        const sessionFile = isRecord(payload) && isRecord(payload.runtime) &&
+          typeof payload.runtime.sessionFile === "string" ? payload.runtime.sessionFile : null;
+        if (sessionFile) {
+          const transcript = await Bun.file(sessionFile).text().catch(() => "");
+          delivered = transcript.includes(marker);
+        }
+      }
+      expect(response.status, `cross-origin prompt was accepted; fake transcript side effect=${delivered}`).toBe(403);
+      expect(await runtimeList(daemon.base)).toEqual([]);
+    } finally { await daemon.stop(); }
+  }, 60_000);
+
+  test("a DNS-rebound Host cannot authorize its own cross-origin prompt request", async () => {
+    const daemon = await startTestDaemon();
+    const marker = `rebound-origin-${crypto.randomUUID()}`;
+    try {
+      const body = JSON.stringify({ text: marker });
+      const response = await rawHttpRequest(daemon.port, [
+        `POST /api/sessions/request HTTP/1.1`,
+        `Host: rebound.invalid:${daemon.port}`,
+        `Origin: http://rebound.invalid:${daemon.port}`,
+        "Sec-Fetch-Site: same-origin",
+        "Content-Type: application/json",
+        `Content-Length: ${Buffer.byteLength(body)}`,
+        "Connection: close",
+        "",
+        body,
+      ].join("\r\n"));
+      expect(response).toMatch(/^HTTP\/1\.1 403 /);
+      expect(await runtimeList(daemon.base)).toEqual([]);
+    } finally { await daemon.stop(); }
+  }, 60_000);
+
+  test("same-origin JSON prompt submissions are accepted and recorded by the real fixture endpoint", async () => {
+    const daemon = await startTestDaemon();
+    const marker = `same-origin-prompt-${crypto.randomUUID()}`;
+    try {
+      const response = await fetch(`${daemon.base}/api/sessions/request`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          origin: new URL(daemon.base).origin,
+          "sec-fetch-site": "same-origin",
+        },
+        body: JSON.stringify({ cwd: join(daemon.root, "project"), text: marker }),
+      });
+      expect(response.status).toBe(200);
+      const payload: unknown = await response.json();
+      const sessionFile = isRecord(payload) && isRecord(payload.runtime) &&
+        typeof payload.runtime.sessionFile === "string" ? payload.runtime.sessionFile : null;
+      expect(sessionFile).toBeTruthy();
+      const transcript = await Bun.file(sessionFile!).text();
+      expect(transcript).toContain(marker);
+      expect(await runtimeList(daemon.base)).toHaveLength(1);
+    } finally { await daemon.stop(); }
+  }, 60_000);
+
+  test("same-origin non-JSON prompt bodies are rejected without starting a runtime", async () => {
+    const daemon = await startTestDaemon();
+    try {
+      const response = await fetch(`${daemon.base}/api/sessions/request`, {
+        method: "POST",
+        headers: { "content-type": "text/plain" },
+        body: JSON.stringify({ text: "wrong media type" }),
+      });
+      expect(response.status).toBe(415);
+      expect(await runtimeList(daemon.base)).toEqual([]);
+    } finally { await daemon.stop(); }
+  }, 60_000);
+
+  test("cross-origin WebSocket upgrades are rejected before a reserved runtime starts", async () => {
+    const daemon = await startTestDaemon();
+    let socket: ReturnType<typeof connectTcp> | undefined;
+    try {
+      const reserved = await createRuntime(daemon.base);
+      expect(reserved.alive).toBe(false);
+      socket = connectTcp(daemon.port, "127.0.0.1");
+      const response = await new Promise<string>((resolve, reject) => {
+        let received = "";
+        const timeout = setTimeout(() => reject(new Error("timed out waiting for WebSocket rejection")), 5_000);
+        socket!.on("error", (error) => { clearTimeout(timeout); reject(error); });
+        socket!.on("connect", () => {
+          socket!.write([
+            `GET /ws/term?runtime=${encodeURIComponent(reserved.id)} HTTP/1.1`,
+            `Host: 127.0.0.1:${daemon.port}`,
+            "Connection: Upgrade",
+            "Upgrade: websocket",
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+            "Sec-WebSocket-Version: 13",
+            "Origin: https://untrusted.invalid",
+            "Sec-Fetch-Site: cross-site",
+            "\r\n",
+          ].join("\r\n"));
+        });
+        socket!.on("data", (chunk) => {
+          received += chunk.toString();
+          if (received.includes("\r\n\r\n")) {
+            clearTimeout(timeout);
+            resolve(received);
+          }
+        });
+      });
+      expect(response).toMatch(/^HTTP\/1\.1 403 /);
+      const current = await runtimeList(daemon.base);
+      expect(current).toHaveLength(1);
+      expect(current[0]).toMatchObject({ id: reserved.id, alive: false, pid: null });
+    } finally {
+      socket?.destroy();
+      await daemon.stop();
+    }
+  }, 60_000);
+
+  test("non-browser prompt tooling without Origin or Fetch Metadata remains supported", async () => {
+    const daemon = await startTestDaemon();
+    const marker = `tooling-prompt-${crypto.randomUUID()}`;
+    try {
+      const response = await fetch(`${daemon.base}/api/sessions/request`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ cwd: join(daemon.root, "project"), text: marker }),
+      });
+      expect(response.status).toBe(200);
+      const payload: unknown = await response.json();
+      const sessionFile = isRecord(payload) && isRecord(payload.runtime) &&
+        typeof payload.runtime.sessionFile === "string" ? payload.runtime.sessionFile : null;
+      expect(sessionFile).toBeTruthy();
+      expect(await Bun.file(sessionFile!).text()).toContain(marker);
+    } finally { await daemon.stop(); }
+  }, 60_000);
+
   test("failed admission never force-stops protected or ambiguously admitted work", async () => {
     for (const ambiguous of [false, true]) {
       const daemon = await startTestDaemon({ env: {

@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   attachable,
   bindingFromStored,
+  rebindPaneBinding,
   runtimeForSession,
 } from "./lifecycle";
 import type { RuntimeInfo } from "./protocol";
@@ -57,6 +58,38 @@ describe("durable pane identity", () => {
       title: null,
       sessionFile: null,
     });
+  });
+});
+
+describe("pane rebind draft recovery", () => {
+  test("rebinding a copied binding does not duplicate recovered input", () => {
+    const previous = { runtimeId: null, title: null, sessionFile: null, orphanDraft: "recover once" };
+    const rebound = rebindPaneBinding(previous, { ...previous, cwd: "/fixture/project" });
+    expect(rebound.orphanDraft).toBe("recover once");
+  });
+
+  test("unattributed recovered input survives rebind as a separate review item", () => {
+    const previous = {
+      runtimeId: "rt-lost",
+      title: "Unidentified runtime",
+      sessionFile: null,
+      orphanDraft: "unconfirmed typed input",
+      drafts: { "/fixture/old.jsonl": "old transcript draft" },
+    };
+    const destination = {
+      runtimeId: "rt-new",
+      title: "Selected session",
+      sessionFile: "/fixture/selected.jsonl",
+      drafts: { "/fixture/selected.jsonl": "destination draft" },
+    };
+    const rebound = rebindPaneBinding(previous, destination);
+
+    expect(rebound.orphanDraft).toBe("unconfirmed typed input");
+    expect(rebound.drafts).toEqual({
+      "/fixture/old.jsonl": "old transcript draft",
+      "/fixture/selected.jsonl": "destination draft",
+    });
+    expect(rebound.drafts?.[rebound.sessionFile!]).not.toContain(rebound.orphanDraft);
   });
 });
 

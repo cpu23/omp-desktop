@@ -37,6 +37,25 @@ export function bindingForRuntime(runtime: RuntimeInfo, title?: string): PaneBin
   };
 
 }
+
+/** Preserve pending drafts when a pane changes transcript/runtime identity. */
+export function rebindPaneBinding(previous: PaneBinding, destination: PaneBinding): PaneBinding {
+  const drafts = { ...previous.drafts, ...destination.drafts };
+  if (Object.keys(drafts).length) destination.drafts = drafts;
+  else delete destination.drafts;
+
+  const draftFiles = { ...previous.draftFiles, ...destination.draftFiles };
+  if (Object.keys(draftFiles).length) destination.draftFiles = draftFiles;
+  else delete destination.draftFiles;
+
+  const orphanDraft = previous.orphanDraft === destination.orphanDraft
+    ? previous.orphanDraft ?? ""
+    : `${previous.orphanDraft ?? ""}${destination.orphanDraft ?? ""}`;
+  if (orphanDraft) destination.orphanDraft = orphanDraft;
+  else delete destination.orphanDraft;
+  return destination;
+}
+
 /** Parse a stored binding, retaining durable transcript identity and valid drafts. */
 export function bindingFromStored(entry: unknown): PaneBinding | null {
   if (!isRecord(entry)) return null;

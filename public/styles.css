@@ -1596,6 +1596,53 @@ body.session-dragging * {
 }
 
 
+.orphan-draft-review {
+  display: grid;
+  flex: 0 0 auto;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 5px 8px;
+  align-items: center;
+  max-height: 140px;
+  overflow: auto;
+  padding: 7px 9px;
+  border-bottom: 1px solid var(--line-muted);
+  background: var(--panel-raised);
+  color: var(--warn);
+  font: 10px/1.4 var(--mono);
+}
+
+.orphan-draft-review[hidden] {
+  display: none;
+}
+
+.orphan-draft-review pre {
+  grid-column: 1 / -1;
+  max-height: 70px;
+  margin: 0;
+  overflow: auto;
+  color: var(--text);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.orphan-draft-review button {
+  grid-column: 2;
+  padding: 3px 7px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+
+.orphan-draft-review button:hover,
+.orphan-draft-review button:focus-visible {
+  border-color: var(--effort-accent);
+  color: var(--effort-accent);
+}
+
 .cold-composer {
   display: grid;
   position: relative;

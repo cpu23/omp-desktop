@@ -357,9 +357,9 @@ tests and real OMP extension/process smoke checks. It does not verify the native
   browser, and file links are disabled. Daemon-origin content receives only notification-plugin permissions.
 - Configured extension tokens are required on every socket request. Socket ownership checks prevent using a
   socket replaced by another process.
-- There is no idle-session unloading. Each live session is an OMP process; daemon restarts terminate those
-  processes and restore recorded transcripts, not running tasks or unsaved input. The phone client is session-
-  centric; the desktop's pane layout is not a mobile layout service.
+- Idle-session unloading is enabled by default after 60 minutes; set the timeout to `0` to disable it. Each live
+  session is an OMP process; daemon restarts terminate those processes and restore recorded transcripts, not running
+  tasks or unsaved input. The phone client is session-centric; the desktop's pane layout is not a mobile layout service.
 - Native clipboard-image paste, pane dragging and WebGL behavior depend on the desktop environment and are not
   verified on every compositor.
 

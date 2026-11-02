@@ -1226,29 +1226,63 @@ async function testFirstSessionAndPaneWorkload(
   await captureShellScreenshot(driver, screenshotPath);
   console.log(`Captured the real four-pane terminal with acknowledged native input at ${screenshotPath}`);
 
-  const visibleTitles = () => driver.execute<string[]>(
-    `return Array.from(document.querySelectorAll("#session-list .row .title"))
-      .filter(node => {
-        const row = node.closest(".row");
-        return row && getComputedStyle(row).display !== "none" &&
-          getComputedStyle(row).visibility !== "hidden" && row.getClientRects().length > 0;
-      })
-      .map(node => node.textContent || "");`,
+  const visibleRows = () => driver.execute<Array<{ identity: string; title: string }>>(
+    `return Array.from(document.querySelectorAll("#session-list .row"))
+      .filter(row => getComputedStyle(row).display !== "none" &&
+        getComputedStyle(row).visibility !== "hidden" && row.getClientRects().length > 0)
+      .map(row => ({
+        identity: row.dataset.sessionFile ? "session:" + row.dataset.sessionFile :
+          row.dataset.runtimeId ? "runtime:" + row.dataset.runtimeId : "missing-identity",
+        title: row.querySelector(".title")?.textContent || ""
+      }));`,
   );
-  const originalTitles = await visibleTitles();
-  assert(originalTitles.includes("native search alpha"), "The known transcript title was not visible before searching.");
+  const searchSnapshot = async () => ({
+    query: await driver.execute<string>(`return document.querySelector("#search")?.value ?? "";`),
+    rows: await visibleRows(),
+  });
+  const identities = (rows: Array<{ identity: string; title: string }>) =>
+    rows.map((row) => row.identity).sort();
+  const originalSnapshot = await searchSnapshot();
+  const target = originalSnapshot.rows.find((row) => row.title === "native search alpha");
+  assert(target && target.identity !== "missing-identity",
+    `The known transcript title was not visible with a stable identity: ${JSON.stringify(originalSnapshot)}`);
+  assert(originalSnapshot.rows.every((row) => row.identity !== "missing-identity"),
+    `A visible session row omitted its stable identity: ${JSON.stringify(originalSnapshot)}`);
+  const waitForSearchState = async (
+    predicate: () => Promise<boolean> | boolean,
+    label: string,
+    before: typeof originalSnapshot,
+  ): Promise<void> => {
+    try {
+      await driver.waitFor(predicate, label);
+    } catch (error) {
+      const after = await searchSnapshot();
+      throw new Error(`${label}; search diagnostics=${JSON.stringify({ before, after })}; ${String(error)}`);
+    }
+  };
+
   await driver.clearCss("#search");
   await driver.sendKeysCss("#search", "native search alpha");
-  await driver.waitFor(async () => {
-    const titles = await visibleTitles();
-    return titles.length === 1 && titles[0] === "native search alpha";
-  }, "the known transcript title to be the only visible sidebar result");
-  const filteredTitles = await visibleTitles();
-  assert(filteredTitles.length === 1 && filteredTitles[0] === "native search alpha", `Search returned unexpected visible fixture titles: ${JSON.stringify(filteredTitles)}`);
+  await waitForSearchState(async () => {
+    const snapshot = await searchSnapshot();
+    return snapshot.query === "native search alpha" && snapshot.rows.length === 1 &&
+      snapshot.rows[0]!.identity === target.identity && snapshot.rows[0]!.title === "native search alpha";
+  }, "search to show only the known transcript identity", originalSnapshot);
+  const filteredSnapshot = await searchSnapshot();
+  assert(filteredSnapshot.rows.length === 1 && filteredSnapshot.rows[0]!.identity === target.identity &&
+      filteredSnapshot.rows[0]!.title === "native search alpha",
+    `Search returned unexpected rows: ${JSON.stringify({ before: originalSnapshot, filtered: filteredSnapshot })}`);
+
   await driver.clearCss("#search");
-  await driver.waitFor(async () => JSON.stringify(await visibleTitles()) === JSON.stringify(originalTitles),
-    "clearing search to restore the same visible session rows");
-  console.log("ok - session search filters a known transcript title and clearing restores the visible list");
+  await waitForSearchState(async () => {
+    const snapshot = await searchSnapshot();
+    return snapshot.query === "" && JSON.stringify(identities(snapshot.rows)) ===
+      JSON.stringify(identities(originalSnapshot.rows));
+  }, "clearing search to restore the same stable session identities", filteredSnapshot);
+  const restoredSnapshot = await searchSnapshot();
+  assert(JSON.stringify(identities(restoredSnapshot.rows)) === JSON.stringify(identities(originalSnapshot.rows)),
+    `Clearing search did not restore the original session identities: ${JSON.stringify({ before: originalSnapshot, filtered: filteredSnapshot, after: restoredSnapshot })}`);
+  console.log(`ok - session search filters the known transcript and restores identities; snapshots=${JSON.stringify({ before: originalSnapshot, filtered: filteredSnapshot, after: restoredSnapshot })}`);
 
   await driver.clickCss("#new-space");
   await driver.waitFor(async () => await driver.findAll("#space-tabs [role='tab']").then((items) => items.length === 2), "the second workspace space");

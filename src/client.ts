@@ -25,6 +25,7 @@ import {
   bindingForRuntime,
   bindingFromStored,
   emptyBinding,
+  rebindPaneBinding,
   runtimeForSession,
   type PaneBinding,
 } from "./lifecycle";
@@ -643,6 +644,8 @@ class Pane {
   #host: HTMLElement;
   #titleActions: HTMLElement;
   #placeholder: HTMLElement;
+  #orphanReview: HTMLElement;
+  #orphanText: HTMLElement;
   #starting: HTMLElement;
   #startupTimer: number | undefined;
   #startupFrame = false;
@@ -750,6 +753,21 @@ class Pane {
     this.#host.className = "term-host";
     this.#placeholder = document.createElement("div");
     this.#placeholder.className = "pane-placeholder";
+    this.#orphanReview = document.createElement("section");
+    this.#orphanReview.className = "orphan-draft-review";
+    this.#orphanReview.setAttribute("aria-label", "Unattributed recovered input");
+    const orphanHeading = document.createElement("strong");
+    orphanHeading.textContent = "Unconfirmed input — not sent to this session";
+    this.#orphanText = document.createElement("pre");
+    const discardOrphan = document.createElement("button");
+    discardOrphan.type = "button";
+    discardOrphan.textContent = "Discard recovered input";
+    discardOrphan.addEventListener("click", () => {
+      delete this.binding.orphanDraft;
+      this.renderPlaceholder();
+      save();
+    });
+    this.#orphanReview.append(orphanHeading, this.#orphanText, discardOrphan);
     this.#composer = document.createElement("form");
     this.#composer.className = "cold-composer";
     this.#draftInput = document.createElement("textarea");
@@ -782,7 +800,7 @@ class Pane {
         void this.#submitColdDraft();
       }
     });
-    this.#body.append(this.#placeholder, this.#host, this.#composer);
+    this.#body.append(this.#orphanReview, this.#placeholder, this.#host, this.#composer);
     this.#starting = document.createElement("div");
     this.#starting.className = "pane-starting";
     this.#starting.setAttribute("role", "status");
@@ -1040,11 +1058,6 @@ class Pane {
   #associateUnknownInputs(sessionFile: string): void {
     for (const input of this.#pendingInputs.values()) {
       if (!input.sessionFile) input.sessionFile = sessionFile;
-    }
-    if (this.binding.orphanDraft) {
-      const recovered = draftableTerminalInput(this.binding.orphanDraft);
-      this.#storeDraft(sessionFile, `${this.#draftFor(sessionFile)}${recovered}`);
-      delete this.binding.orphanDraft;
     }
   }
 
@@ -1398,12 +1411,7 @@ class Pane {
       (!binding.sessionFile && previous.cwd !== binding.cwd);
     const runtimeChanged = previous.runtimeId !== binding.runtimeId;
     if (runtimeChanged && previous.runtimeId) this.#preservePendingInputs();
-    const drafts = { ...previous.drafts, ...binding.drafts };
-    if (Object.keys(drafts).length) binding.drafts = drafts;
-    else delete binding.drafts;
-    const draftFiles = { ...previous.draftFiles, ...binding.draftFiles };
-    if (Object.keys(draftFiles).length) binding.draftFiles = draftFiles;
-    else delete binding.draftFiles;
+    binding = rebindPaneBinding(previous, binding);
     if (runtimeChanged || !binding.runtimeId) this.detach();
     if (identityChanged || (binding.runtimeId && !previous.runtimeId)) this.#cancelColdHistory();
     this.binding = binding;
@@ -1629,6 +1637,9 @@ class Pane {
   }
 
   renderPlaceholder(): void {
+    const orphanDraft = this.binding.orphanDraft ?? "";
+    this.#orphanReview.hidden = !orphanDraft;
+    this.#orphanText.textContent = orphanDraft;
     const bound = Boolean(this.binding.runtimeId);
     const sessionFile = this.binding.sessionFile;
     const coldSaved = !bound && Boolean(sessionFile);
@@ -2365,6 +2376,8 @@ function updateRuntimeSidebarRow(
   record.snapshot = snapshot;
   const className = runtime.alive ? "row live" : "row recent";
   if (record.element.className !== className) record.element.className = className;
+  record.element.dataset.runtimeId = runtime.id;
+  record.element.dataset.sessionFile = runtime.sessionFile ?? "";
   const workspace = normalizeDirectoryPath(cwd) ?? cwd;
   if (record.element.dataset.cwd !== workspace) record.element.dataset.cwd = workspace;
   const state = !daemonUp ? "Connection unavailable" : !attachable(runtime) ? "Saved · loads on request"
@@ -2401,6 +2414,8 @@ function updateRecentSidebarRow(
   record.session = session;
   record.snapshot = session;
   if (record.element.className !== "row recent") record.element.className = "row recent";
+  delete record.element.dataset.runtimeId;
+  record.element.dataset.sessionFile = session.path;
   const workspace = normalizeDirectoryPath(session.cwd) ?? session.cwd;
   if (record.element.dataset.cwd !== workspace) record.element.dataset.cwd = workspace;
   record.element.dataset.state = "Saved";
