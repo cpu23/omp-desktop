@@ -762,7 +762,20 @@ const server = Bun.serve<WsData>({
           resume = typeof body.path === "string" ? validResume(body.path) ?? undefined : undefined;
           if (!resume) return new Response("request requires an existing transcript under the session store", { status: 400 });
         }
-        const cwd = typeof body.cwd === "string" && existsSync(body.cwd) ? body.cwd : undefined;
+        let cwd: string | undefined;
+        if (body.cwd !== undefined) {
+          if (typeof body.cwd !== "string" || !isAbsolute(body.cwd)) {
+            return new Response("cwd must be an absolute existing directory", { status: 400 });
+          }
+          try {
+            if (!statSync(body.cwd).isDirectory()) {
+              return new Response("cwd must be an absolute existing directory", { status: 400 });
+            }
+          } catch {
+            return new Response("cwd must be an absolute existing directory", { status: 400 });
+          }
+          cwd = body.cwd;
+        }
         let runtime: Runtime | undefined;
         try {
           runtime = await createRequestedRuntime({

@@ -85,6 +85,23 @@ async function rawHttpRequest(port: number, request: string): Promise<string> {
 }
 
 describe("real daemon API behavior", () => {
+  test("invalid explicit request directories never fall back to the daemon project", async () => {
+    const daemon = await startTestDaemon();
+    try {
+      const regularFile = join(daemon.root, "not-a-directory.txt");
+      await Bun.write(regularFile, "fixture");
+      for (const cwd of [join(daemon.root, "missing-directory"), "relative-directory", regularFile, 42, null]) {
+        const response = await fetch(`${daemon.base}/api/sessions/request`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ cwd, text: "do not run in another project" }),
+        });
+        expect(response.status, `invalid cwd ${JSON.stringify(cwd)} must not start a fallback runtime`).toBe(400);
+        expect(await runtimeList(daemon.base)).toEqual([]);
+      }
+    } finally { await daemon.stop(); }
+  }, 60_000);
+
   test("saved history rendering forwards configured OMP arguments as argv, not shell text", async () => {
     const root = await mkdtemp(join(tmpdir(), "omp-history-configured-args-"));
     const executable = join(root, "omp with spaces");
