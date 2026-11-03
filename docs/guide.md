@@ -163,6 +163,10 @@ pending-live queue is disconnected for resynchronization rather than silently lo
 
 ### Clipboard and file drops
 
+In a terminal, **Ctrl+C** with no selection sends Escape rather than the Ctrl+C byte, so repeated presses cannot
+trigger OMP's session-exit shortcut. Existing selection-copy behavior is unchanged; unselected **Ctrl+Shift+C**
+does nothing. Use the sidebar's **Unload session** action to stop a session deliberately.
+
 Ctrl/Cmd+V and Ctrl+Shift+V are handled by the webview. Text paste retains xterm's bracketed-paste behavior;
 image paste uploads to the daemon, which stores the image and types its path into the terminal for OMP to attach.
 Supported types are PNG, JPEG, WebP and GIF, up to 32 MiB. The daemon forces the iTerm2 image protocol for
