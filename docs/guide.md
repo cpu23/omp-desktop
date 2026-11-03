@@ -333,7 +333,7 @@ The API remains loopback-only and unauthenticated; do not expose it directly to 
 | `POST /api/runtimes/:id/input` | `{data: string}`, at most 16,384 UTF-16 code units and a 128 KiB request body. |
 | `DELETE /api/runtimes/:id` | Stop and release the runtime before returning success. |
 | `GET /api/sessions/history` | Stream ANSI history for a validated saved-session path and viewport; read-only, without a resident agent. |
-| `POST /api/sessions/request` | `{path?, cwd?, text, files?}`; create/resume only for this explicit request. Respond after SDK admission, not model generation. File references preserve inline image attachments. Maximum body 128 KiB. |
+| `POST /api/sessions/request` | `{path?, cwd?, text, files?}`; create/resume only for this explicit request. Respond after SDK admission, not model generation. File references preserve inline image attachments. Maximum HTTP body and serialized IPC envelope (including transcript path and attachment paths) 128 KiB each. Oversize requests return 413 without dispatch. Fresh transcript paths are known only after startup; a final oversize rejection attempts safe idle cleanup. |
 | `GET /api/settings` | Desired/effective process limits, idle timeout and whether a restart is required. |
 | `PUT /api/settings` | Partial `{maxRuntimes?, idleTimeoutMinutes?}`; idle changes apply immediately, process-limit changes retain restart semantics. |
 | `PUT /api/state` | Workspace document; requires `X-OMP-Generation` from the current runtime-list response. Missing or stale generations return `409`. |

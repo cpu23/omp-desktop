@@ -1,3 +1,4 @@
+import { IDLE_REQUEST_TOO_LARGE } from "./idle-limits";
 import { chmod, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -59,11 +60,22 @@ describe("desktop idle IPC client", () => {
     expect(promptText).toBe(largePrompt);
     expect(await client.unload("rt-test-1", { sessionFile: statusBody.sessionFile, idleTimeoutMs: 60_000 }))
       .toEqual({ kind: "conflict", reason: "agent_active" });
+    // Exact serialized byte boundary, including multibyte text and escaped paths.
+    const envelope = { sessionFile: '/sessions/"é".jsonl', text: "", files: ["/images/é.png"] };
+    const room = 128 * 1024 - Buffer.byteLength(JSON.stringify(envelope));
+    envelope.text = "é".repeat(Math.floor(room / 2)) + "x".repeat(room % 2);
+    expect(Buffer.byteLength(JSON.stringify(envelope))).toBe(128 * 1024);
+    expect(await client.prompt("rt-test-1", envelope)).toEqual({ kind: "accepted" });
+    expect(promptText).toBe(envelope.text);
+    const beforeBoundaryRejection = requests;
+    expect(await client.prompt("rt-test-1", { ...envelope, text: envelope.text + "x" }))
+      .toEqual({ kind: "too_large", reason: IDLE_REQUEST_TOO_LARGE });
+    expect(requests).toBe(beforeBoundaryRejection);
     const beforeOversized = requests;
     expect(await client.prompt("rt-test-1", {
       sessionFile: statusBody.sessionFile,
       text: "x".repeat(128 * 1024),
-    })).toEqual({ kind: "unavailable", reason: "ipc_unavailable" });
+    })).toEqual({ kind: "too_large", reason: IDLE_REQUEST_TOO_LARGE });
     expect(requests).toBe(beforeOversized);
 
     const unauthenticated = new IdleRuntimeClient({ dir: root, token: "wrong-token" });

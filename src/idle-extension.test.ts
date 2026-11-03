@@ -83,6 +83,21 @@ describe("desktop idle service registry executable selection", () => {
     try {
       registerDesktopIdleExtension(host);
       handlers.get("session_start")?.({}, context);
+      // Exercise the real receiver independently of the client's size guard.
+      const overhead = Buffer.byteLength(JSON.stringify({ sessionFile, padding: "" }));
+      const boundaryBody = JSON.stringify({ sessionFile, padding: "x".repeat(128 * 1024 - overhead) });
+      for (const [body, expectedStatus] of [[boundaryBody, 400], [boundaryBody + " ", 413]] as const) {
+        const response = await fetch("http://localhost/unload", {
+          unix: join(socketDir, `${runtimeId}.sock`),
+          method: "POST",
+          headers: { authorization: `Bearer ${environment.OMP_DESKTOP_IDLE_IPC_TOKEN}`, "content-type": "application/json" },
+          body,
+        });
+        expect(response.status).toBe(expectedStatus);
+        expect((await response.json() as { reason: string }).reason)
+          .toBe(expectedStatus === 413 ? "body_too_large" : "invalid_idle_timeout");
+      }
+
       handlers.get("tool_execution_end")?.({
         toolCallId: "service-call",
         toolName: "bash",

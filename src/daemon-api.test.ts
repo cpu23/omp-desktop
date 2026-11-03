@@ -85,6 +85,59 @@ async function rawHttpRequest(port: number, request: string): Promise<string> {
 }
 
 describe("real daemon API behavior", () => {
+  test("session request IPC boundary includes the resolved path and attachments", async () => {
+    const daemon = await startTestDaemon();
+    try {
+      const path = await writeTestTranscript(daemon.root, "ipc-boundary");
+      const files = [join(daemon.root, 'attachment-"é".txt')];
+      const room = 128 * 1024 - Buffer.byteLength(JSON.stringify({ sessionFile: path, text: "", files }));
+      const text = "é".repeat(Math.floor(room / 2)) + "x".repeat(room % 2);
+      const send = (text: string) => fetch(`${daemon.base}/api/sessions/request`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ path, text, files }),
+      });
+      expect((await send(text + "x")).status).toBe(413);
+      expect(await runtimeList(daemon.base)).toEqual([]);
+      expect((await send(text)).status).toBe(200);
+      const transcript = await Bun.file(path).text();
+      expect(transcript).toContain(JSON.stringify(text));
+      expect(transcript).not.toContain(JSON.stringify(text + "x"));
+    } finally { await daemon.stop(); }
+  }, 60_000);
+
+  test("fresh request final envelope rejection is definite and safely retires the draft", async () => {
+    const daemon = await startTestDaemon();
+    try {
+      const text = "x".repeat(128 * 1024 - Buffer.byteLength(JSON.stringify({ sessionFile: "", text: "" })));
+      const response = await fetch(`${daemon.base}/api/sessions/request`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text }),
+      });
+      expect(response.status).toBe(413);
+      expect(await response.text()).toContain("the request was not sent");
+      const runtimes = await runtimeList(daemon.base);
+      expect(runtimes.every((runtime) => !runtime.alive)).toBe(true);
+      for (const runtime of runtimes) {
+        if (runtime.sessionFile) expect(await Bun.file(runtime.sessionFile).text()).not.toContain(text);
+      }
+    } finally { await daemon.stop(); }
+  }, 60_000);
+
+  test("near-limit ASCII session requests reject before starting a runtime", async () => {
+    const daemon = await startTestDaemon();
+    try {
+      const body = JSON.stringify({ text: "x".repeat(128 * 1024 - 11) });
+      expect(Buffer.byteLength(body)).toBe(128 * 1024);
+      const response = await fetch(`${daemon.base}/api/sessions/request`, {
+        method: "POST", headers: { "content-type": "application/json" }, body,
+      });
+      const message = await response.text();
+      const runtimes = await runtimeList(daemon.base);
+      expect({ status: response.status, message, runtimes: runtimes.length }).toEqual({
+        status: 413, message: "session request exceeds the 128 KiB IPC envelope; the request was not sent", runtimes: 0,
+      });
+    } finally { await daemon.stop(); }
+  }, 60_000);
+
   test("invalid explicit request directories never fall back to the daemon project", async () => {
     const daemon = await startTestDaemon();
     try {

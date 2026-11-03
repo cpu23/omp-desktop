@@ -15,10 +15,10 @@ import {
   type NamedBashService,
 } from "./idle-state";
 import { IMAGE_FILE_LIMIT, imageExtensionForMime } from "./image-limits";
+import { MAX_IDLE_REQUEST_BYTES } from "./idle-limits";
 
 const SOCKET_MODE = 0o600;
 const DIRECTORY_MODE = 0o700;
-const MAX_BODY_BYTES = 128 * 1024;
 const SHUTDOWN_DELAY_MS = 150;
 const SERVICE_REFRESH_MS = 60_000;
 const SERVICE_REGISTRY_TIMEOUT_MS = 1_500;
@@ -223,7 +223,7 @@ function response(value: unknown, status = 200): Response {
 
 async function readJsonBody(request: Request): Promise<{ value?: unknown; error?: "too_large" | "invalid_json" }> {
   const contentLength = request.headers.get("content-length");
-  if (contentLength !== null && /^\d+$/.test(contentLength) && Number(contentLength) > MAX_BODY_BYTES) {
+  if (contentLength !== null && /^\d+$/.test(contentLength) && Number(contentLength) > MAX_IDLE_REQUEST_BYTES) {
     return { error: "too_large" };
   }
   if (!request.body) return { error: "invalid_json" };
@@ -235,7 +235,7 @@ async function readJsonBody(request: Request): Promise<{ value?: unknown; error?
       const { done, value } = await reader.read();
       if (done) break;
       total += value.byteLength;
-      if (total > MAX_BODY_BYTES) {
+      if (total > MAX_IDLE_REQUEST_BYTES) {
         await reader.cancel();
         return { error: "too_large" };
       }

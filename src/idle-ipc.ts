@@ -1,6 +1,7 @@
 import { lstat } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { join } from "node:path";
+import { IDLE_REQUEST_TOO_LARGE, idleRequestTooLarge } from "./idle-limits";
 import { isRecord } from "./guards";
 import { isRuntimeId, type IdleRuntimeStatus } from "./idle-state";
 export type { IdleRuntimeStatus } from "./idle-state";
@@ -8,14 +9,13 @@ export type { IdleRuntimeStatus } from "./idle-state";
 
 const DEFAULT_TIMEOUT_MS = 2_500;
 const MAX_RESPONSE_BYTES = 32 * 1024;
-const MAX_REQUEST_BYTES = 128 * 1024;
-
 
 export type IdleStatusResult =
   | { kind: "available"; status: IdleRuntimeStatus }
   | { kind: "unavailable"; reason: string };
 
 export type IdleCommandResult =
+  | { kind: "too_large"; reason: string }
   | { kind: "accepted" }
   | { kind: "conflict"; reason: string }
   | { kind: "unavailable"; reason: string };
@@ -90,6 +90,7 @@ export class IdleRuntimeClient {
   }
 
   async #command(id: string, path: string, body: unknown, timeoutMs = this.#timeoutMs): Promise<IdleCommandResult> {
+    if (idleRequestTooLarge(body)) return { kind: "too_large", reason: IDLE_REQUEST_TOO_LARGE };
     const reply = await this.#request(id, "POST", path, body, timeoutMs);
     if (!reply) return { kind: "unavailable", reason: "ipc_unavailable" };
     const value = jsonFrom(reply.body);
@@ -128,7 +129,6 @@ export class IdleRuntimeClient {
     }
 
     const payload = body === undefined ? undefined : Buffer.from(JSON.stringify(body), "utf8");
-    if (payload && payload.byteLength > MAX_REQUEST_BYTES) return null;
     const { promise, resolve } = Promise.withResolvers<IpcReply | null>();
     const socket = createConnection({ path: socketPath });
     let settled = false;

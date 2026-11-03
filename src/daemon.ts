@@ -26,6 +26,7 @@ import { TerminalOutput } from "./terminal-output";
 import { IMAGE_FILE_LIMIT, imageExtensionForMime } from "./image-limits";
 import { PasteStore, PasteCapacityError } from "./paste-store";
 import { renderSessionHistory } from "./session-history";
+import { idleRequestTooLarge, IDLE_REQUEST_TOO_LARGE } from "./idle-limits";
 import { IdleRuntimeClient, type IdleRuntimeStatus } from "./idle-ipc";
 
 const HOST = process.env.OMP_DESKTOP_HOST ?? "127.0.0.1";
@@ -776,6 +777,11 @@ const server = Bun.serve<WsData>({
           }
           cwd = body.cwd;
         }
+        // A fresh transcript path is only known after startup. The empty path is
+        // a lower bound; prompt() checks the final envelope before opening IPC.
+        if (idleRequestTooLarge({ sessionFile: resume ?? "", text: body.text, files: body.files })) {
+          return new Response(IDLE_REQUEST_TOO_LARGE, { status: 413 });
+        }
         let runtime: Runtime | undefined;
         try {
           runtime = await createRequestedRuntime({
@@ -792,7 +798,7 @@ const server = Bun.serve<WsData>({
           const dispatched = await idleClient.prompt(runtime.id, {
             sessionFile: file, text: body.text, files: body.files as string[] | undefined,
           });
-          if (dispatched.kind === "conflict") {
+          if (dispatched.kind === "conflict" || dispatched.kind === "too_large") {
             if (!resume) {
               // A rejected fresh draft owns this new process, but another client
               // may have started work meanwhile. Let the SDK recheck quiescence;
@@ -812,7 +818,7 @@ const server = Bun.serve<WsData>({
                 console.warn(`omp-desktopd: rejected request cleanup unavailable: ${String(error)}`);
               }
             }
-            return new Response(dispatched.reason, { status: 409 });
+            return new Response(dispatched.reason, { status: dispatched.kind === "too_large" ? 413 : 409 });
           }
           if (dispatched.kind === "unavailable") {
             return new Response("request acknowledgement unavailable; it may have been queued. Check the session before sending again.", { status: 503 });
