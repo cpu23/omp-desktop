@@ -107,6 +107,8 @@ spaces.set(activeSpaceId, layout);
 let spaceSeq = 1;
 /** True after local restoration or the initial compatible daemon reconciliation. */
 let restoredLocal = false;
+/** A restored layout owns its empty slots as well as its bound sessions. */
+let hasSavedWorkspace = false;
 let runtimes: RuntimeInfo[] = [];
 let defaultCwd: string | null = null;
 let sessions: SessionSummaryLike[] = [];
@@ -2753,6 +2755,9 @@ function openSession(pane: Pane, session: { path: string; cwd: string; title: st
  * session (or a runtime), and explicitly closed placeholders, are never overwritten.
  */
 function adoptUnclaimedRuntimes(): void {
+  // Detached live sessions belong in the sidebar, not in a restored empty slot.
+  // Pool adoption is only a fallback for a client without a saved workspace.
+  if (hasSavedWorkspace) return;
   const claimedRuntimes = new Set<string>();
   const claimedSessions = new Set<string>();
   for (const pane of panes.values()) {
@@ -3073,6 +3078,7 @@ function applyStoredWorkspace(stored: StoredWorkspace): boolean {
       : leaves(rebuilt.tree)[0];
   }
   if (!spaces.size) return false;
+  hasSavedWorkspace = true;
   activeSpaceId = spaces.has(stored.activeSpaceId) ? stored.activeSpaceId : spaces.keys().next().value!;
   layout = spaces.get(activeSpaceId)!;
   renderLayout();

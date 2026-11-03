@@ -263,7 +263,9 @@ async function testSavedWorkspaceRestoreSignature(browser: Browser): Promise<voi
   const daemon = await startTestDaemon();
   let context: BrowserContext | undefined;
   try {
-    const runtimes = await Promise.all([createRuntime(daemon), createRuntime(daemon), createRuntime(daemon)]);
+    // The native handoff closes a pane without stopping its PTY. Its detached
+    // runtime must not occupy the other space's deliberately empty pane.
+    const runtimes = await Promise.all([createRuntime(daemon), createRuntime(daemon), createRuntime(daemon), createRuntime(daemon)]);
     const [first, second, third] = runtimes;
     await writeWorkspace(daemon, {
       spaces: [
@@ -297,6 +299,9 @@ async function testSavedWorkspaceRestoreSignature(browser: Browser): Promise<voi
     await page.waitForFunction(() => document.querySelectorAll("#panes .pane").length === 4 &&
       document.querySelectorAll("#space-tabs [role='tab']").length === 2,
     undefined, { timeout: waitTimeoutMs });
+    const cached = await page.evaluate(() => JSON.parse(localStorage.getItem("omp-desktop.layout.v1") ?? "null")) as Workspace;
+    assert.equal(workspaceSignature(cached), expectedSignature,
+      "fresh profile adopted the detached runtime into a saved empty pane");
     await waitFor(() => savedWorkspace(daemon), (workspace) => workspaceSignature(workspace) === expectedSignature,
       "fresh Chromium to restore exact saved four-pane tree, pane IDs, active space, focus, runtime and transcript bindings");
 
@@ -306,6 +311,13 @@ async function testSavedWorkspaceRestoreSignature(browser: Browser): Promise<voi
     const expectedRuntimes = runtimes.map(({ id, pid }) => [id, pid]);
     assert.deepEqual(runtimeSnapshot.runtimes.map(({ id, pid }) => [id, pid]), expectedRuntimes,
       "Chromium workspace restore changed runtime IDs or PTY PIDs");
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForFunction(() => document.querySelectorAll("#panes .pane").length === 4 &&
+      document.querySelectorAll("#space-tabs [role='tab']").length === 2,
+    undefined, { timeout: waitTimeoutMs });
+    const sameProfile = await page.evaluate(() => JSON.parse(localStorage.getItem("omp-desktop.layout.v1") ?? "null")) as Workspace;
+    assert.equal(workspaceSignature(sameProfile), expectedSignature,
+      "same-profile reload adopted the detached runtime into a saved empty pane");
     await page.evaluate(() => localStorage.clear());
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForFunction(() => document.querySelectorAll("#panes .pane").length === 4 &&
@@ -318,7 +330,7 @@ async function testSavedWorkspaceRestoreSignature(browser: Browser): Promise<voi
     assert.deepEqual(await fetch(`${daemon.base}/api/runtimes`).then((response) => response.json()).then((body: { runtimes: Array<{ id: string; pid: number | null }> }) =>
       body.runtimes.map(({ id, pid }) => [id, pid])), expectedRuntimes,
     "Chromium reload changed runtime IDs or PTY PIDs");
-    console.log("ok - exact-source Chromium fresh and cleared-profile restores preserved the four-pane/two-space tree, focus, keepEmpty, runtime/transcript bindings, and live PTY IDs");
+    console.log("ok - exact-source Chromium fresh and cleared-profile restores preserved the four-pane/two-space tree, focus, keepEmpty, runtime/transcript bindings, detached runtime, and live PTY IDs");
   } finally {
     await context?.close();
     await daemon.stop();

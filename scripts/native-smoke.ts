@@ -1407,7 +1407,7 @@ async function verifyPersistentNormalProfileAndNotifications(
     const originalSignature = workspaceSignature(originalWorkspace);
     if (expectedWorkspaceSignature !== null) {
       assert(originalSignature === expectedWorkspaceSignature,
-        "Normal production app did not load the previously saved pane/runtime workspace before changing it.");
+        `Normal production app did not load the previously saved pane/runtime workspace before changing it. Saved=${expectedWorkspaceSignature} restored=${originalSignature}`);
     }
     const targetSpace = originalWorkspace.spaces.find((space) => space.id === originalWorkspace.activeSpaceId);
     const focusedPaneId = targetSpace?.layout.focused;
