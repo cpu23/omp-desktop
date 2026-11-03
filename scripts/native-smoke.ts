@@ -604,7 +604,6 @@ function workspaceSignature(workspace: Workspace): string {
         isRecord(binding) ? {
           runtimeId: binding.runtimeId ?? null,
           sessionFile: binding.sessionFile ?? null,
-          autoResume: binding.autoResume ?? null,
           keepEmpty: binding.keepEmpty ?? null,
         } : binding,
       ])),
@@ -1107,20 +1106,25 @@ async function testFirstSessionAndPaneWorkload(
   const { driver } = shell;
   await waitConnected(driver, daemon.port);
   const base = daemon.base;
-  const beforeNewSession = await driver.waitFor(async () => {
-    const current = await runtimes(base);
-    return current.length === 1 && current[0]!.pid !== null ? current : false;
-  }, "the app's automatic initial session to attach before the explicit new-session control");
+  const initialRuntimes = await runtimes(base);
+  assert(initialRuntimes.length === 0, "A fresh daemon boot created a runtime before the user requested a message.");
   await verifyNativeResize(driver);
-  const beforeSessionIds = new Set(beforeNewSession.map((runtime) => runtime.id));
+  const beforeSessionIds = new Set(initialRuntimes.map((runtime) => runtime.id));
   await driver.clickCss("#new-session");
+  const coldComposer = await driver.waitFor(async () => {
+    const input = await driver.find("#panes .pane .cold-composer textarea").catch(() => null);
+    return input && await driver.displayed(input) ? input : false;
+  }, "#new-session to show a cold composer");
+  assert((await runtimes(base)).length === 0, "#new-session created a runtime before submission.");
+  await driver.sendKeys(coldComposer, "start-native-session");
+  await driver.clickCss("#panes .pane .cold-composer button[type='submit']");
   const created = await driver.waitFor(async () => {
     const current = await runtimes(base);
     const added = current.filter((runtime) => !beforeSessionIds.has(runtime.id));
-    return current.length === beforeNewSession.length + 1 && added.length === 1 && added[0]!.pid !== null ? added[0] : false;
-  }, "#new-session to add and attach one real daemon runtime");
+    return current.length === 1 && added.length === 1 && added[0]!.pid !== null ? added[0] : false;
+  }, "submitting the cold composer to create and attach one real daemon runtime");
   await waitForRuntimePaneReady(driver, base, created.id);
-  console.log("ok - #new-session creates a real runtime and WebSocket attachment starts its fake-OMP PTY");
+  console.log("ok - blank boot and #new-session stay cold until explicit submission, then the fake-OMP PTY attaches");
   const createdRecord = fakeOmpRecordPath(daemon.root, created.id);
   const { binding: createdBinding, textarea: terminal } = await focusRuntimePane(driver, base, created.id);
   const echo = "native-echo-✓";
@@ -1161,6 +1165,26 @@ async function testFirstSessionAndPaneWorkload(
     return item && await driver.displayed(item) ? item : false;
   }, "the second actual pane context menu");
   await driver.click(secondSplitItem);
+  await driver.waitFor(async () => (await driver.findAll("#panes .pane")).length === 4, "the four-pane layout");
+  // Splitting creates cold panes, not agents. Start each new pane through its
+  // real composer before testing native multi-runtime keyboard routing.
+  const coldPaneIds = await driver.execute<string[]>(`return Array.from(document.querySelectorAll('#panes .pane'))
+    .filter(pane => { const composer = pane.querySelector('.cold-composer'); return composer && !composer.hidden; })
+    .map(pane => pane.dataset.pane);`);
+  assert(coldPaneIds.length === 3, "Splitting one live pane must leave exactly three cold composers.");
+  assert((await runtimes(base)).length === 1, "Splitting started an agent without explicit submission.");
+  for (const [index, paneId] of coldPaneIds.entries()) {
+    const selector = `#panes .pane[data-pane=${JSON.stringify(paneId)}] .cold-composer`;
+    const before = (await runtimes(base)).length;
+    await driver.sendKeys(await driver.find(`${selector} textarea`), `native-split-${index + 1}`);
+    assert((await runtimes(base)).length === before, "Typing a split-pane draft started an agent.");
+    await driver.clickCss(`${selector} button[type='submit']`);
+    const binding = await driver.waitFor(async () =>
+      (await activePaneBindings(driver, base)).find((entry) => entry.paneId === paneId) ?? false,
+    `explicit submission to bind split pane ${paneId}`);
+    await waitForRuntimePaneReady(driver, base, binding.runtimeId);
+    assert((await runtimes(base)).length === before + 1, "Split-pane submission did not create exactly one runtime.");
+  }
   const paneBindings = await driver.waitFor(async () => {
     const bindings = await activePaneBindings(driver, base);
     return bindings.length === 4 && new Set(bindings.map((entry) => entry.runtimeId)).size === 4 ? bindings : false;
@@ -1202,29 +1226,63 @@ async function testFirstSessionAndPaneWorkload(
   await captureShellScreenshot(driver, screenshotPath);
   console.log(`Captured the real four-pane terminal with acknowledged native input at ${screenshotPath}`);
 
-  const visibleTitles = () => driver.execute<string[]>(
-    `return Array.from(document.querySelectorAll("#session-list .row .title"))
-      .filter(node => {
-        const row = node.closest(".row");
-        return row && getComputedStyle(row).display !== "none" &&
-          getComputedStyle(row).visibility !== "hidden" && row.getClientRects().length > 0;
-      })
-      .map(node => node.textContent || "");`,
+  const visibleRows = () => driver.execute<Array<{ identity: string; title: string }>>(
+    `return Array.from(document.querySelectorAll("#session-list .row"))
+      .filter(row => getComputedStyle(row).display !== "none" &&
+        getComputedStyle(row).visibility !== "hidden" && row.getClientRects().length > 0)
+      .map(row => ({
+        identity: row.dataset.sessionFile ? "session:" + row.dataset.sessionFile :
+          row.dataset.runtimeId ? "runtime:" + row.dataset.runtimeId : "missing-identity",
+        title: row.querySelector(".title")?.textContent || ""
+      }));`,
   );
-  const originalTitles = await visibleTitles();
-  assert(originalTitles.includes("native search alpha"), "The known transcript title was not visible before searching.");
+  const searchSnapshot = async () => ({
+    query: await driver.execute<string>(`return document.querySelector("#search")?.value ?? "";`),
+    rows: await visibleRows(),
+  });
+  const identities = (rows: Array<{ identity: string; title: string }>) =>
+    rows.map((row) => row.identity).sort();
+  const originalSnapshot = await searchSnapshot();
+  const target = originalSnapshot.rows.find((row) => row.title === "native search alpha");
+  assert(target && target.identity !== "missing-identity",
+    `The known transcript title was not visible with a stable identity: ${JSON.stringify(originalSnapshot)}`);
+  assert(originalSnapshot.rows.every((row) => row.identity !== "missing-identity"),
+    `A visible session row omitted its stable identity: ${JSON.stringify(originalSnapshot)}`);
+  const waitForSearchState = async (
+    predicate: () => Promise<boolean> | boolean,
+    label: string,
+    before: typeof originalSnapshot,
+  ): Promise<void> => {
+    try {
+      await driver.waitFor(predicate, label);
+    } catch (error) {
+      const after = await searchSnapshot();
+      throw new Error(`${label}; search diagnostics=${JSON.stringify({ before, after })}; ${String(error)}`);
+    }
+  };
+
   await driver.clearCss("#search");
   await driver.sendKeysCss("#search", "native search alpha");
-  await driver.waitFor(async () => {
-    const titles = await visibleTitles();
-    return titles.length === 1 && titles[0] === "native search alpha";
-  }, "the known transcript title to be the only visible sidebar result");
-  const filteredTitles = await visibleTitles();
-  assert(filteredTitles.length === 1 && filteredTitles[0] === "native search alpha", `Search returned unexpected visible fixture titles: ${JSON.stringify(filteredTitles)}`);
+  await waitForSearchState(async () => {
+    const snapshot = await searchSnapshot();
+    return snapshot.query === "native search alpha" && snapshot.rows.length === 1 &&
+      snapshot.rows[0]!.identity === target.identity && snapshot.rows[0]!.title === "native search alpha";
+  }, "search to show only the known transcript identity", originalSnapshot);
+  const filteredSnapshot = await searchSnapshot();
+  assert(filteredSnapshot.rows.length === 1 && filteredSnapshot.rows[0]!.identity === target.identity &&
+      filteredSnapshot.rows[0]!.title === "native search alpha",
+    `Search returned unexpected rows: ${JSON.stringify({ before: originalSnapshot, filtered: filteredSnapshot })}`);
+
   await driver.clearCss("#search");
-  await driver.waitFor(async () => JSON.stringify(await visibleTitles()) === JSON.stringify(originalTitles),
-    "clearing search to restore the same visible session rows");
-  console.log("ok - session search filters a known transcript title and clearing restores the visible list");
+  await waitForSearchState(async () => {
+    const snapshot = await searchSnapshot();
+    return snapshot.query === "" && JSON.stringify(identities(snapshot.rows)) ===
+      JSON.stringify(identities(originalSnapshot.rows));
+  }, "clearing search to restore the same stable session identities", filteredSnapshot);
+  const restoredSnapshot = await searchSnapshot();
+  assert(JSON.stringify(identities(restoredSnapshot.rows)) === JSON.stringify(identities(originalSnapshot.rows)),
+    `Clearing search did not restore the original session identities: ${JSON.stringify({ before: originalSnapshot, filtered: filteredSnapshot, after: restoredSnapshot })}`);
+  console.log(`ok - session search filters the known transcript and restores identities; snapshots=${JSON.stringify({ before: originalSnapshot, filtered: filteredSnapshot, after: restoredSnapshot })}`);
 
   await driver.clickCss("#new-space");
   await driver.waitFor(async () => await driver.findAll("#space-tabs [role='tab']").then((items) => items.length === 2), "the second workspace space");
@@ -1266,7 +1324,7 @@ async function testFirstSessionAndPaneWorkload(
   const toStop = paneBindings[3]!;
   const stopped = (await runtimes(base)).find((runtime) => runtime.id === toStop.runtimeId);
   assert(stopped?.pid !== null && stopped?.pid !== undefined, "Chosen explicit-stop runtime has no PTY pid.");
-  const row = await driver.find(`#session-list .row[title*="${toStop.runtimeId}"] .kill`);
+  const row = await driver.find(`#session-list .row[data-runtime-id="${toStop.runtimeId}"] .kill`);
   await driver.click(row);
   await driver.waitFor(async () => !(await runtimes(base)).some((runtime) => runtime.id === toStop.runtimeId), "explicit session stop to remove the runtime");
   await waitFor("the explicitly stopped PTY to be reaped", async () => !(await isProcessAlive(stopped.pid!)));
@@ -1349,7 +1407,7 @@ async function verifyPersistentNormalProfileAndNotifications(
     const originalSignature = workspaceSignature(originalWorkspace);
     if (expectedWorkspaceSignature !== null) {
       assert(originalSignature === expectedWorkspaceSignature,
-        "Normal production app did not load the previously saved pane/runtime workspace before changing it.");
+        `Normal production app did not load the previously saved pane/runtime workspace before changing it. Saved=${expectedWorkspaceSignature} restored=${originalSignature}`);
     }
     const targetSpace = originalWorkspace.spaces.find((space) => space.id === originalWorkspace.activeSpaceId);
     const focusedPaneId = targetSpace?.layout.focused;
@@ -1965,8 +2023,16 @@ async function testConnectionRetry(parent: string, binary: string, busAddress: s
     await waitConnected(shell.driver, customPort);
     const buildResponse = await fetch(`${daemon.base}/api/build`);
     assert(buildResponse.ok, "Retry did not connect the app to the real daemon build endpoint.");
-    if ((await runtimes(daemon.base)).length === 0) await shell.driver.clickCss("#new-session");
-    await waitFor("Retry's new-session control to create a usable real daemon runtime", async () => {
+    assert((await runtimes(daemon.base)).length === 0, "Retry recovery created a runtime during blank boot.");
+    await shell.driver.clickCss("#new-session");
+    const composer = await shell.driver.waitFor(async () => {
+      const input = await shell!.driver.find("#panes .pane .cold-composer textarea").catch(() => null);
+      return input && await shell!.driver.displayed(input) ? input : false;
+    }, "Retry recovery to show a cold new-session composer");
+    assert((await runtimes(daemon.base)).length === 0, "Retry's new-session control created a runtime before submission.");
+    await shell.driver.sendKeys(composer, "retry-session");
+    await shell.driver.clickCss("#panes .pane .cold-composer button[type='submit']");
+    await waitFor("Retry's submitted cold draft to create a usable real daemon runtime", async () => {
       const current = await runtimes(daemon!.base);
       return current.some((runtime) => runtime.pid !== null && runtime.alive) ? true : false;
     });
@@ -2347,8 +2413,8 @@ function normalPreferenceState(root: AccessibilityNode): {
   notifications: boolean | null;
   notificationStatus: string | null;
 } {
-  const folders = accessibleGroupButtons(root, "Sidebar view", ["Folders", "Sessions"])
-    .find((node) => accessibleOptionName(node.name) === "folders");
+  const folders = accessibleGroupButtons(root, "Sidebar view", ["Workspaces", "Sessions"])
+    .find((node) => accessibleOptionName(node.name) === "workspaces");
   const motion = accessibleGroupButtons(root, "Working indicator motion", ["Off", "System", "On"])
     .find((node) => accessibleOptionName(node.name) === "off");
   const notifications = accessibleGroupButtons(root, "Completion notifications", ["Off", "On"]);
@@ -2398,7 +2464,7 @@ async function setNormalGroupToggle(
 
 async function setNormalPreferences(shell: NormalShell): Promise<AccessibilityNode> {
   await openNormalSettings(shell);
-  await setNormalGroupToggle(shell, "Sidebar view", "Folders", ["Folders", "Sessions"], true);
+  await setNormalGroupToggle(shell, "Sidebar view", "Workspaces", ["Workspaces", "Sessions"], true);
   await setNormalGroupToggle(shell, "Working indicator motion", "Off", ["Off", "System", "On"], true);
   await setNormalGroupToggle(shell, "Completion notifications", "Off", ["Off", "On"], true);
   const tree = await waitForAccessibleTree(shell, "real notification permission to be granted", (snapshot) => {
@@ -2671,16 +2737,18 @@ async function testInitialNativeInput(parent: string, binary: string, busAddress
     configureX11Input(profile, display.display);
     shell = await openShell(profile, daemon.port, binary);
     await waitConnected(shell.driver, daemon.port);
-    const beforeSession = await waitFor("the fresh app's automatic first runtime", async () => {
+    assert((await runtimes(daemon.base)).length === 0, "First boot created a runtime before user input.");
+    await shell.driver.clickCss("#new-session");
+    const composer = await shell.driver.waitFor(async () => {
+      const input = await shell!.driver.find("#panes .pane .cold-composer textarea").catch(() => null);
+      return input && await shell!.driver.displayed(input) ? input : false;
+    }, "the fresh app's cold new-session composer");
+    assert((await runtimes(daemon.base)).length === 0, "New session created a runtime before explicit submission.");
+    await shell.driver.sendKeys(composer, "start-native-input");
+    await shell.driver.clickCss("#panes .pane .cold-composer button[type='submit']");
+    const runtime = await waitFor("the submitted cold composer to create one real runtime", async () => {
       const current = await runtimes(daemon!.base);
       return current.length === 1 && current[0]!.pid !== null ? current[0] : false;
-    });
-    const beforeIds = new Set([beforeSession.id]);
-    await shell.driver.clickCss("#new-session");
-    const runtime = await waitFor("the #new-session button to add one real runtime", async () => {
-      const current = await runtimes(daemon!.base);
-      const added = current.filter((entry) => !beforeIds.has(entry.id));
-      return current.length === 2 && added.length === 1 && added[0]!.pid !== null ? added[0] : false;
     });
     await waitForRuntimePaneReady(shell.driver, daemon.base, runtime.id);
     const { binding, textarea } = await focusRuntimePane(shell.driver, daemon.base, runtime.id);

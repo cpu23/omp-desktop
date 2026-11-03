@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
+import { chmod, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { connect as connectTcp } from "node:net";
 import { IMAGE_FILE_LIMIT } from "./image-limits";
 import { isRecord } from "./guards";
 import { parseServerMessage } from "./protocol";
@@ -60,7 +63,363 @@ function inputRequest(base: string, runtimeId: string, body: BodyInit): Promise<
   });
 }
 
+async function rawHttpRequest(port: number, request: string): Promise<string> {
+  const socket = connectTcp(port, "127.0.0.1");
+  try {
+    return await new Promise<string>((resolve, reject) => {
+      let received = "";
+      const timeout = setTimeout(() => reject(new Error("timed out waiting for raw HTTP response")), 5_000);
+      socket.once("error", (error) => { clearTimeout(timeout); reject(error); });
+      socket.once("connect", () => socket.write(request));
+      socket.on("data", (chunk) => {
+        received += chunk.toString();
+        if (received.includes("\r\n\r\n")) {
+          clearTimeout(timeout);
+          resolve(received);
+        }
+      });
+    });
+  } finally {
+    socket.destroy();
+  }
+}
+
 describe("real daemon API behavior", () => {
+  test("session request IPC boundary includes the resolved path and attachments", async () => {
+    const daemon = await startTestDaemon();
+    try {
+      const path = await writeTestTranscript(daemon.root, "ipc-boundary");
+      const files = [join(daemon.root, 'attachment-"é".txt')];
+      const room = 128 * 1024 - Buffer.byteLength(JSON.stringify({ sessionFile: path, text: "", files }));
+      const text = "é".repeat(Math.floor(room / 2)) + "x".repeat(room % 2);
+      const send = (text: string) => fetch(`${daemon.base}/api/sessions/request`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ path, text, files }),
+      });
+      expect((await send(text + "x")).status).toBe(413);
+      expect(await runtimeList(daemon.base)).toEqual([]);
+      expect((await send(text)).status).toBe(200);
+      const transcript = await Bun.file(path).text();
+      expect(transcript).toContain(JSON.stringify(text));
+      expect(transcript).not.toContain(JSON.stringify(text + "x"));
+    } finally { await daemon.stop(); }
+  }, 60_000);
+
+  test("fresh request final envelope rejection is definite and safely retires the draft", async () => {
+    const daemon = await startTestDaemon();
+    try {
+      const text = "x".repeat(128 * 1024 - Buffer.byteLength(JSON.stringify({ sessionFile: "", text: "" })));
+      const response = await fetch(`${daemon.base}/api/sessions/request`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text }),
+      });
+      expect(response.status).toBe(413);
+      expect(await response.text()).toContain("the request was not sent");
+      const runtimes = await runtimeList(daemon.base);
+      expect(runtimes.every((runtime) => !runtime.alive)).toBe(true);
+      for (const runtime of runtimes) {
+        if (runtime.sessionFile) expect(await Bun.file(runtime.sessionFile).text()).not.toContain(text);
+      }
+    } finally { await daemon.stop(); }
+  }, 60_000);
+
+  test("near-limit ASCII session requests reject before starting a runtime", async () => {
+    const daemon = await startTestDaemon();
+    try {
+      const body = JSON.stringify({ text: "x".repeat(128 * 1024 - 11) });
+      expect(Buffer.byteLength(body)).toBe(128 * 1024);
+      const response = await fetch(`${daemon.base}/api/sessions/request`, {
+        method: "POST", headers: { "content-type": "application/json" }, body,
+      });
+      const message = await response.text();
+      const runtimes = await runtimeList(daemon.base);
+      expect({ status: response.status, message, runtimes: runtimes.length }).toEqual({
+        status: 413, message: "session request exceeds the 128 KiB IPC envelope; the request was not sent", runtimes: 0,
+      });
+    } finally { await daemon.stop(); }
+  }, 60_000);
+
+  test("invalid explicit request directories never fall back to the daemon project", async () => {
+    const daemon = await startTestDaemon();
+    try {
+      const regularFile = join(daemon.root, "not-a-directory.txt");
+      await Bun.write(regularFile, "fixture");
+      for (const cwd of [join(daemon.root, "missing-directory"), "relative-directory", regularFile, 42, null]) {
+        const response = await fetch(`${daemon.base}/api/sessions/request`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ cwd, text: "do not run in another project" }),
+        });
+        expect(response.status, `invalid cwd ${JSON.stringify(cwd)} must not start a fallback runtime`).toBe(400);
+        expect(await runtimeList(daemon.base)).toEqual([]);
+      }
+    } finally { await daemon.stop(); }
+  }, 60_000);
+
+  test("saved history rendering forwards configured OMP arguments as argv, not shell text", async () => {
+    const root = await mkdtemp(join(tmpdir(), "omp-history-configured-args-"));
+    const executable = join(root, "omp with spaces");
+    const invocationPath = join(root, "argv.txt");
+    await writeFile(executable,
+      `#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(invocationPath)}\nprintf 'configured history output\\n'\n`);
+    await chmod(executable, 0o700);
+    const configuredArgs = ["--fixture-option", "fixed;literal"];
+    const daemon = await startTestDaemon({ omp: executable, args: configuredArgs });
+    try {
+      const transcript = await writeTestTranscript(daemon.root, "configured-history-render-args");
+      const response = await fetch(`${daemon.base}/api/sessions/history?path=${encodeURIComponent(transcript)}&cols=80&rows=24`);
+      expect(response.status).toBe(200);
+      expect(await response.text()).toContain("configured history output");
+      expect((await readFile(invocationPath, "utf8")).trimEnd().split("\n")).toEqual([
+        ...configuredArgs, "render", transcript, "--width", "80", "--height", "24",
+      ]);
+    } finally {
+      await daemon.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("cross-origin simple prompt submissions are rejected before any runtime or transcript side effect", async () => {
+    const daemon = await startTestDaemon();
+    const marker = `blocked-cross-origin-${crypto.randomUUID()}`;
+    try {
+      const response = await fetch(`${daemon.base}/api/sessions/request`, {
+        method: "POST",
+        headers: {
+          "content-type": "text/plain",
+          origin: "https://untrusted.invalid",
+          "sec-fetch-site": "cross-site",
+        },
+        body: JSON.stringify({ text: marker }),
+      });
+      let delivered = false;
+      if (response.ok) {
+        const payload: unknown = await response.json();
+        const sessionFile = isRecord(payload) && isRecord(payload.runtime) &&
+          typeof payload.runtime.sessionFile === "string" ? payload.runtime.sessionFile : null;
+        if (sessionFile) {
+          const transcript = await Bun.file(sessionFile).text().catch(() => "");
+          delivered = transcript.includes(marker);
+        }
+      }
+      expect(response.status, `cross-origin prompt was accepted; fake transcript side effect=${delivered}`).toBe(403);
+      expect(await runtimeList(daemon.base)).toEqual([]);
+    } finally { await daemon.stop(); }
+  }, 60_000);
+
+  test("a DNS-rebound Host cannot authorize its own cross-origin prompt request", async () => {
+    const daemon = await startTestDaemon();
+    const marker = `rebound-origin-${crypto.randomUUID()}`;
+    try {
+      const body = JSON.stringify({ text: marker });
+      const response = await rawHttpRequest(daemon.port, [
+        `POST /api/sessions/request HTTP/1.1`,
+        `Host: rebound.invalid:${daemon.port}`,
+        `Origin: http://rebound.invalid:${daemon.port}`,
+        "Sec-Fetch-Site: same-origin",
+        "Content-Type: application/json",
+        `Content-Length: ${Buffer.byteLength(body)}`,
+        "Connection: close",
+        "",
+        body,
+      ].join("\r\n"));
+      expect(response).toMatch(/^HTTP\/1\.1 403 /);
+      expect(await runtimeList(daemon.base)).toEqual([]);
+    } finally { await daemon.stop(); }
+  }, 60_000);
+
+  test("DNS-rebound GET API requests cannot read sessions or start a reserved runtime", async () => {
+    const daemon = await startTestDaemon();
+    try {
+      const transcript = await writeTestTranscript(daemon.root, "rebound-get-history", {
+        title: "private rebound history",
+        firstPrompt: "private transcript contents",
+      });
+      const reserved = await createRuntime(daemon.base);
+      const reboundGet = (path: string) => rawHttpRequest(daemon.port, [
+        `GET ${path} HTTP/1.1`,
+        `Host: rebound.invalid:${daemon.port}`,
+        `Origin: http://rebound.invalid:${daemon.port}`,
+        "Sec-Fetch-Site: same-origin",
+        "Connection: close",
+        "",
+        "",
+      ].join("\r\n"));
+      const sessions = await reboundGet("/api/sessions");
+      const history = await reboundGet(`/api/sessions/history?path=${encodeURIComponent(transcript)}`);
+      const screen = await reboundGet(`/api/runtimes/${reserved.id}/screen`);
+
+      const responseStatus = (response: string) => Number(response.match(/^HTTP\/1\.1 (\d+)/)?.[1] ?? 0);
+      const runtimesAfterRebound = await runtimeList(daemon.base);
+      expect({
+        sessions: responseStatus(sessions),
+        history: responseStatus(history),
+        screen: responseStatus(screen),
+        runtime: runtimesAfterRebound.find((entry) => entry.id === reserved.id),
+      }).toEqual({
+        sessions: 403,
+        history: 403,
+        screen: 403,
+        runtime: expect.objectContaining({ alive: false, pid: null }),
+      });
+
+      const headerlessRebound = await rawHttpRequest(daemon.port, [
+        "GET /api/sessions HTTP/1.1",
+        `Host: rebound.invalid:${daemon.port}`,
+        "Connection: close", "", "",
+      ].join("\r\n"));
+      expect(headerlessRebound).toMatch(/^HTTP\/1\.1 403 /);
+      const appRead = await fetch(`${daemon.base}/api/sessions`, {
+        headers: { "sec-fetch-site": "same-origin" },
+      });
+      expect(appRead.status).toBe(200);
+      const localToolRead = await fetch(`${daemon.base}/api/sessions`);
+      expect(localToolRead.status).toBe(200);
+      const navigationRead = await fetch(`${daemon.base}/api/sessions`, {
+        headers: { "sec-fetch-site": "none" },
+      });
+      expect(navigationRead.status).toBe(200);
+      const documentNavigation = await rawHttpRequest(daemon.port, [
+        "GET / HTTP/1.1",
+        `Host: 127.0.0.1:${daemon.port}`,
+        "Sec-Fetch-Site: none",
+        "Connection: close",
+        "",
+        "",
+      ].join("\r\n"));
+      expect(documentNavigation).toMatch(/^HTTP\/1\.1 200 /);
+    } finally { await daemon.stop(); }
+  }, 60_000);
+
+  test("same-origin JSON prompt submissions are accepted and recorded by the real fixture endpoint", async () => {
+    const daemon = await startTestDaemon();
+    const marker = `same-origin-prompt-${crypto.randomUUID()}`;
+    try {
+      const response = await fetch(`${daemon.base}/api/sessions/request`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          origin: new URL(daemon.base).origin,
+          "sec-fetch-site": "same-origin",
+        },
+        body: JSON.stringify({ cwd: join(daemon.root, "project"), text: marker }),
+      });
+      expect(response.status).toBe(200);
+      const payload: unknown = await response.json();
+      const sessionFile = isRecord(payload) && isRecord(payload.runtime) &&
+        typeof payload.runtime.sessionFile === "string" ? payload.runtime.sessionFile : null;
+      expect(sessionFile).toBeTruthy();
+      const transcript = await Bun.file(sessionFile!).text();
+      expect(transcript).toContain(marker);
+      expect(await runtimeList(daemon.base)).toHaveLength(1);
+    } finally { await daemon.stop(); }
+  }, 60_000);
+
+  test("same-origin non-JSON prompt bodies are rejected without starting a runtime", async () => {
+    const daemon = await startTestDaemon();
+    try {
+      const response = await fetch(`${daemon.base}/api/sessions/request`, {
+        method: "POST",
+        headers: { "content-type": "text/plain" },
+        body: JSON.stringify({ text: "wrong media type" }),
+      });
+      expect(response.status).toBe(415);
+      expect(await runtimeList(daemon.base)).toEqual([]);
+    } finally { await daemon.stop(); }
+  }, 60_000);
+
+  test("cross-origin WebSocket upgrades are rejected before a reserved runtime starts", async () => {
+    const daemon = await startTestDaemon();
+    let socket: ReturnType<typeof connectTcp> | undefined;
+    try {
+      const reserved = await createRuntime(daemon.base);
+      expect(reserved.alive).toBe(false);
+      socket = connectTcp(daemon.port, "127.0.0.1");
+      const response = await new Promise<string>((resolve, reject) => {
+        let received = "";
+        const timeout = setTimeout(() => reject(new Error("timed out waiting for WebSocket rejection")), 5_000);
+        socket!.on("error", (error) => { clearTimeout(timeout); reject(error); });
+        socket!.on("connect", () => {
+          socket!.write([
+            `GET /ws/term?runtime=${encodeURIComponent(reserved.id)} HTTP/1.1`,
+            `Host: 127.0.0.1:${daemon.port}`,
+            "Connection: Upgrade",
+            "Upgrade: websocket",
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+            "Sec-WebSocket-Version: 13",
+            "Origin: https://untrusted.invalid",
+            "Sec-Fetch-Site: cross-site",
+            "\r\n",
+          ].join("\r\n"));
+        });
+        socket!.on("data", (chunk) => {
+          received += chunk.toString();
+          if (received.includes("\r\n\r\n")) {
+            clearTimeout(timeout);
+            resolve(received);
+          }
+        });
+      });
+      expect(response).toMatch(/^HTTP\/1\.1 403 /);
+      const current = await runtimeList(daemon.base);
+      expect(current).toHaveLength(1);
+      expect(current[0]).toMatchObject({ id: reserved.id, alive: false, pid: null });
+    } finally {
+      socket?.destroy();
+      await daemon.stop();
+    }
+  }, 60_000);
+
+  test("non-browser prompt tooling without Origin or Fetch Metadata remains supported", async () => {
+    const daemon = await startTestDaemon();
+    const marker = `tooling-prompt-${crypto.randomUUID()}`;
+    try {
+      const response = await fetch(`${daemon.base}/api/sessions/request`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ cwd: join(daemon.root, "project"), text: marker }),
+      });
+      expect(response.status).toBe(200);
+      const payload: unknown = await response.json();
+      const sessionFile = isRecord(payload) && isRecord(payload.runtime) &&
+        typeof payload.runtime.sessionFile === "string" ? payload.runtime.sessionFile : null;
+      expect(sessionFile).toBeTruthy();
+      expect(await Bun.file(sessionFile!).text()).toContain(marker);
+    } finally { await daemon.stop(); }
+  }, 60_000);
+
+  test("failed admission never force-stops protected or ambiguously admitted work", async () => {
+    for (const ambiguous of [false, true]) {
+      const daemon = await startTestDaemon({ env: {
+        OMP_DESKTOP_TEST_REJECT_PROMPT: ambiguous ? "unavailable" : "1",
+        OMP_DESKTOP_TEST_PROTECT_UNLOAD: "1",
+      } });
+      try {
+        const response = await fetch(`${daemon.base}/api/sessions/request`, {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ cwd: join(daemon.root, "project"), text: "protected request" }),
+        });
+        expect(response.status).toBe(ambiguous ? 503 : 409);
+        const remaining = await runtimeList(daemon.base);
+        expect(remaining).toHaveLength(1);
+        expect(remaining[0]!.alive).toBe(true);
+      } finally { await daemon.stop(); }
+    }
+  }, 60_000);
+  test("rejected new requests retire only their unadmitted runtime", async () => {
+    const daemon = await startTestDaemon({ env: { OMP_DESKTOP_TEST_REJECT_PROMPT: "1" } });
+    try {
+      const path = await writeTestTranscript(daemon.root, "existing-rejected-request");
+      const existing = await createRuntime(daemon.base, { resume: path });
+      for (const request of [{ cwd: join(daemon.root, "project") }, { path }]) {
+        const response = await fetch(`${daemon.base}/api/sessions/request`, {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ ...request, text: "rejected before admission" }),
+        });
+        expect(response.status).toBe(409);
+        expect((await runtimeList(daemon.base)).map((runtime) => runtime.id)).toEqual([existing.id]);
+      }
+    } finally { await daemon.stop(); }
+  }, 60_000);
   test("reserves runtimes, starts one PTY on WebSocket attach, and preserves exact input", async () => {
     const daemon = await startTestDaemon();
     let ws: WebSocket | null = null;
@@ -119,9 +478,15 @@ describe("real daemon API behavior", () => {
         const snapshot: unknown = await response.json();
         return isRecord(snapshot) && typeof snapshot.screen === "string" && snapshot.screen.includes("ACK:api-byte-check-✓");
       }, "the exact acknowledged input in the screen snapshot");
+      const wsData = "acknowledged-ws-input\n";
+      ws.send(JSON.stringify({ type: "input", id: "input-1", data: wsData }));
+      await waitFor(
+        () => messages.some((entry) => entry.parsed?.type === "inputAck" && entry.parsed.id === "input-1"),
+        "accepted WebSocket input acknowledgement",
+      );
       await waitFor(async () => {
         const bytes = await Bun.file(fakeOmpRecordPath(daemon.root, reserved.id)).arrayBuffer().catch(() => null);
-        return bytes !== null && Buffer.from(bytes).equals(Buffer.from(data));
+        return bytes !== null && Buffer.from(bytes).equals(Buffer.from(data + wsData));
       }, "the fake OMP's exact PTY input bytes");
       expect(await runtimeList(daemon.base)).toHaveLength(1);
     } finally {
@@ -226,6 +591,30 @@ describe("real daemon API behavior", () => {
       const summary = indexPayload.sessions.find((entry) => isRecord(entry) && entry.path === valid);
       expect(isRecord(summary) && summary.title).toBe(title);
       expect(isRecord(summary) && typeof summary.costUsd === "number" && Number.isFinite(summary.costUsd)).toBe(true);
+    } finally {
+      await daemon.stop();
+    }
+  }, 60_000);
+
+  test("history and request paths reject session-store symlink escapes without starting an agent", async () => {
+    const daemon = await startTestDaemon();
+    try {
+      const fixture = await writeTestTranscript(daemon.root, "inside-history-root");
+      const outside = join(daemon.root, "outside-session.jsonl");
+      await Bun.write(outside, '{"type":"session","id":"outside"}\n');
+      const escaped = join(testSessionsRoot(daemon.root), "-test-fixtures", "escape.jsonl");
+      await symlink(outside, escaped);
+      for (const path of [outside, escaped, `${fixture}/not-a-file.jsonl`]) {
+        const history = await fetch(`${daemon.base}/api/sessions/history?path=${encodeURIComponent(path)}`);
+        expect(history.status).toBe(400);
+        const request = await fetch(`${daemon.base}/api/sessions/request`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ path, text: "must not execute" }),
+        });
+        expect(request.status).toBe(400);
+      }
+      expect(await runtimeList(daemon.base)).toEqual([]);
     } finally {
       await daemon.stop();
     }
@@ -408,7 +797,13 @@ describe("real daemon API behavior", () => {
         body: JSON.stringify({ resume: archivedPath }),
       });
       expect(resumedArchive.status).toBe(400);
-      expect(await resumedArchive.text()).toContain("archived");
+      const requestedArchive = await fetch(`${daemon.base}/api/sessions/request`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ path: archivedPath, text: "Do not revive an archived conversation" }),
+      });
+      expect(requestedArchive.status).toBe(400);
+      expect((await runtimeList(daemon.base)).map((entry) => entry.id)).toEqual([otherRuntime.id]);
 
       const afterArchive = await readIndex(1);
       expect(afterArchive.archivedPaths).toContain(archivedPath);
@@ -501,24 +896,29 @@ describe("real daemon API behavior", () => {
   test("archive and overlapping resumes leave no hidden runtime", async () => {
     const daemon = await startTestDaemon();
     try {
-      for (const archiveFirst of [false, true]) {
-        const path = await writeTestTranscript(daemon.root, `overlapping-archive-${archiveFirst}`);
+      for (const [route, archiveFirst] of [
+        ["runtimes", false], ["runtimes", true],
+        ["sessions/request", false], ["sessions/request", true],
+      ] as const) {
+        const path = await writeTestTranscript(daemon.root, `overlapping-archive-${route}-${archiveFirst}`);
         const send = (route: string, body: unknown) => fetch(`${daemon.base}/api/${route}`, {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(body),
         });
+        const resumeBody = route === "runtimes" ? { resume: path } : { path, text: "Concurrent explicit request" };
         const requests = archiveFirst
-          ? [send("sessions/archive", { path }), send("runtimes", { resume: path })]
-          : [send("runtimes", { resume: path }), send("sessions/archive", { path })];
+          ? [send("sessions/archive", { path }), send(route, resumeBody)]
+          : [send(route, resumeBody), send("sessions/archive", { path })];
         const responses = await Promise.all(requests);
         const archive = responses[archiveFirst ? 0 : 1]!;
         const resume = responses[archiveFirst ? 1 : 0]!;
         expect(archive.status).toBe(200);
-        expect([200, 400]).toContain(resume.status);
+        expect(route === "runtimes" ? [200, 400] : [200, 400, 503]).toContain(resume.status);
         expect((await runtimeList(daemon.base)).some((runtime) => runtime.sessionFile === path)).toBe(false);
         // Future resumes must not recreate an invisible process either.
         expect((await send("runtimes", { resume: path })).status).toBe(400);
+        expect((await send("sessions/request", { path, text: "Must remain archived" })).status).toBe(400);
       }
       await daemon.restart();
       expect(await runtimeList(daemon.base)).toEqual([]);

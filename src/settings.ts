@@ -1,16 +1,7 @@
 /**
- * Daemon-owned settings.
- *
- * The runtime limit is the one setting the daemon must know before it starts:
- * it sizes the pool and bounds the restore of the durable session ledger. The
- * browser client edits it through `GET/PUT /api/settings`, but the value lives
- * here — one small file next to the workspace state — so a wiped browser
- * profile or a different port cannot silently reset it.
- *
- * Precedence is deliberate and stable: a saved value always wins, with
- * `OMP_DESKTOP_MAX_RUNTIMES` as the deployment fallback and 16 as the default.
- * A saved value that is malformed is ignored (never trusted halfway), so the
- * daemon still starts with a usable limit.
+ * Daemon-owned runtime settings, persisted independently of browser storage.
+ * The pool limit applies after restart; idle timeout changes apply immediately.
+ * Saved values take precedence over deployment environment fallbacks.
  */
 import { mkdir, open, readFile, rename, stat, unlink } from "node:fs/promises";
 import { dirname } from "node:path";
@@ -18,6 +9,9 @@ import { isRecord } from "./guards";
 
 /** The limit used when neither a saved setting nor the environment supplies one. */
 export const DEFAULT_MAX_RUNTIMES = 16;
+/** Continuous, authoritatively idle time before a saved runtime may unload. */
+export const DEFAULT_IDLE_TIMEOUT_MINUTES = 60;
+const MAX_IDLE_TIMEOUT_MINUTES = Math.floor(Number.MAX_SAFE_INTEGER / 60_000);
 
 /** Settings documents larger than this are treated as malformed. */
 export const SETTINGS_LIMIT_BYTES = 64 * 1024;
@@ -28,6 +22,8 @@ export type SettingsPayload = {
   maxRuntimes: number;
   /** The limit this daemon actually enforces until it restarts. */
   effectiveMaxRuntimes: number;
+  /** Continuous idle minutes before unloading; zero disables automatic unloading. */
+  idleTimeoutMinutes: number;
   /** True when changing `maxRuntimes` to `effectiveMaxRuntimes` needs a restart. */
   restartRequired: boolean;
 };
@@ -69,12 +65,31 @@ export function resolveMaxRuntimes(
   if (env !== null) return { maxRuntimes: env, source: "env" };
   return { maxRuntimes: DEFAULT_MAX_RUNTIMES, source: "default" };
 }
+export function isIdleTimeoutMinutes(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) &&
+    value >= 0 && value <= MAX_IDLE_TIMEOUT_MINUTES;
+}
+
+export function resolveIdleTimeoutMinutes(saved: unknown, envFallback: string | undefined): number {
+  if (isIdleTimeoutMinutes(saved)) return saved;
+  if (typeof envFallback === "string" && /^[0-9]+$/.test(envFallback.trim())) {
+    const parsed = Number(envFallback.trim());
+    if (isIdleTimeoutMinutes(parsed)) return parsed;
+  }
+  return DEFAULT_IDLE_TIMEOUT_MINUTES;
+}
+
 
 /** Build the API payload; `restartRequired` is exactly "saved differs from running". */
-export function settingsPayload(maxRuntimes: number, effectiveMaxRuntimes: number): SettingsPayload {
+export function settingsPayload(
+  maxRuntimes: number,
+  effectiveMaxRuntimes: number,
+  idleTimeoutMinutes: number,
+): SettingsPayload {
   return {
     maxRuntimes,
     effectiveMaxRuntimes,
+    idleTimeoutMinutes,
     restartRequired: maxRuntimes !== effectiveMaxRuntimes,
   };
 }
@@ -82,6 +97,8 @@ export function settingsPayload(maxRuntimes: number, effectiveMaxRuntimes: numbe
 export type StoredSettings = {
   /** A valid saved limit, or null when absent or unusable. */
   maxRuntimes: number | null;
+  /** Null in pre-timeout settings files, or when the document is unusable. */
+  idleTimeoutMinutes: number | null;
   /** True when a file with unusable content exists (the caller may warn). */
   malformed: boolean;
 };
@@ -131,20 +148,20 @@ export class DaemonSettingsStore {
   }
 
   /**
-   * Reads the saved limit. A missing file is not malformed. A corrupt,
-   * oversized, wrong-version, or invalid-limit document yields
-   * `{ maxRuntimes: null, malformed: true }`: the daemon falls back instead of
-   * trusting part of it.
+   * Reads saved settings, accepting version-one files written before the idle
+   * timeout existed. A malformed document is ignored as a whole.
    */
   async read(): Promise<StoredSettings> {
     let text: string;
     try {
       const info = await stat(this.file);
-      if (info.size > SETTINGS_LIMIT_BYTES) return { maxRuntimes: null, malformed: true };
+      if (info.size > SETTINGS_LIMIT_BYTES) {
+        return { maxRuntimes: null, idleTimeoutMinutes: null, malformed: true };
+      }
       text = await readFile(this.file, "utf8");
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        return { maxRuntimes: null, malformed: false };
+        return { maxRuntimes: null, idleTimeoutMinutes: null, malformed: false };
       }
       throw error;
     }
@@ -152,26 +169,40 @@ export class DaemonSettingsStore {
     try {
       value = JSON.parse(text);
     } catch {
-      return { maxRuntimes: null, malformed: true };
+      return { maxRuntimes: null, idleTimeoutMinutes: null, malformed: true };
     }
-    if (!isRecord(value) || value.version !== 1 || !isPositiveInteger(value.maxRuntimes)) {
-      return { maxRuntimes: null, malformed: true };
+    if (!isRecord(value) || value.version !== 1 ||
+        (value.maxRuntimes === undefined && value.idleTimeoutMinutes === undefined) ||
+        (value.maxRuntimes !== undefined && !isPositiveInteger(value.maxRuntimes)) ||
+        (value.idleTimeoutMinutes !== undefined && !isIdleTimeoutMinutes(value.idleTimeoutMinutes))) {
+      return { maxRuntimes: null, idleTimeoutMinutes: null, malformed: true };
     }
-    return { maxRuntimes: value.maxRuntimes, malformed: false };
+    return {
+      maxRuntimes: value.maxRuntimes ?? null,
+      idleTimeoutMinutes: value.idleTimeoutMinutes ?? null,
+      malformed: false,
+    };
   }
 
   /**
-   * Persists a validated limit. Rejects invalid limits instead of writing a
-   * document that `read()` would discard. Writes are serialized so the last
-   * accepted limit is the one on disk.
+   * Persists a validated settings snapshot. Writes are serialized so the last
+   * accepted snapshot is the one on disk.
    */
-  save(maxRuntimes: number): Promise<void> {
-    if (!isPositiveInteger(maxRuntimes)) {
+  save(settings: Pick<StoredSettings, "maxRuntimes" | "idleTimeoutMinutes">): Promise<void> {
+    const { maxRuntimes, idleTimeoutMinutes } = settings;
+    if (maxRuntimes !== null && !isPositiveInteger(maxRuntimes)) {
       return Promise.reject(new Error(`max runtimes must be a positive integer (got ${String(maxRuntimes)})`));
+    }
+    if (idleTimeoutMinutes !== null && !isIdleTimeoutMinutes(idleTimeoutMinutes)) {
+      return Promise.reject(new Error("idle timeout must be non-negative whole minutes"));
+    }
+    if (maxRuntimes === null && idleTimeoutMinutes === null) {
+      return Promise.reject(new Error("at least one setting must be configured"));
     }
     const text = JSON.stringify({
       version: 1,
-      maxRuntimes,
+      ...(maxRuntimes !== null ? { maxRuntimes } : {}),
+      ...(idleTimeoutMinutes !== null ? { idleTimeoutMinutes } : {}),
       savedAt: new Date().toISOString(),
     });
     const write = (): Promise<void> => writeTextAtomically(this.file, text);

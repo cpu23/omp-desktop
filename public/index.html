@@ -16,14 +16,25 @@
     <div id="app">
       <aside id="sidebar">
         <div class="side-block side-search">
+          <div class="sidebar-heading">
+            <span id="sidebar-title">Workspaces</span>
+            <button id="add-workspace" class="sidebar-toggle" type="button" title="Add workspace" aria-label="Add workspace">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+                <path d="M3 7V5h6l2 2h10v3" />
+                <path d="M3 10h18l-2 9H2l1-9Z" />
+                <path d="M16 13v5m-2.5-2.5h5" />
+              </svg>
+            </button>
+            <button id="new-session" class="sidebar-toggle" type="button" title="Start a new omp session in the focused pane" aria-label="Start a new omp session in the focused pane">+</button>
+            <button id="sidebar-settings-open" class="sidebar-toggle" type="button" title="Sidebar settings" aria-label="Sidebar settings" aria-controls="sidebar-settings" aria-expanded="false">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68h.08a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09A1.65 1.65 0 0 0 15 4.6a1.65 1.65 0 0 0 1.82.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.32 9v.08a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09A1.65 1.65 0 0 0 19.4 15Z" />
+                <circle cx="12" cy="12" r="3" />
+              </svg>
+            </button>
+          </div>
           <input id="search" type="search" placeholder="search sessions…" autocomplete="off" spellcheck="false" />
-          <button id="new-session" class="sidebar-toggle" type="button" title="Start a new omp session in the focused pane" aria-label="Start a new omp session in the focused pane">+</button>
-          <button id="sidebar-settings-open" class="sidebar-toggle" type="button" title="Sidebar settings" aria-label="Sidebar settings" aria-controls="sidebar-settings" aria-expanded="false">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68h.08a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09A1.65 1.65 0 0 0 15 4.6a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.32 9v.08a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09A1.65 1.65 0 0 0 19.4 15Z" />
-              <circle cx="12" cy="12" r="3" />
-            </svg>
-          </button>
+          <p id="workspace-picker-status" class="workspace-picker-status" role="status" aria-live="polite" aria-atomic="true" hidden></p>
         </div>
         <div id="session-list" class="side-list"></div>
         <section id="sidebar-settings" class="side-settings" aria-label="Sidebar settings" hidden>
@@ -47,7 +58,7 @@
               <span class="motion-label">Session view</span>
               <div class="settings-options">
                 <button type="button" data-sidebar-view="sessions">Sessions</button>
-                <button type="button" data-sidebar-view="folders">Folders</button>
+                <button type="button" data-sidebar-view="workspaces">Workspaces</button>
               </div>
             </div>
             <div class="motion-control" role="group" aria-label="Working indicator motion">
@@ -109,11 +120,30 @@
                 <button id="runtime-limit-save" type="button">Save</button>
               </div>
               <span id="runtime-limit-status" class="shortcut-message" role="status" aria-live="polite"></span>
+              <p id="idle-timeout-help" class="runtime-limit-help">
+                Unload confidently idle runtimes after this many minutes; 0 disables automatic unloading. Changing
+                this timeout applies immediately.
+              </p>
+              <div class="runtime-limit-row">
+                <label class="motion-label" for="idle-timeout-input">Idle timeout (minutes)</label>
+                <input
+                  id="idle-timeout-input"
+                  type="number"
+                  inputmode="numeric"
+                  min="0"
+                  step="1"
+                  value="60"
+                  autocomplete="off"
+                  aria-describedby="idle-timeout-help"
+                />
+                <button id="idle-timeout-save" type="button">Save</button>
+              </div>
+              <span id="idle-timeout-status" class="shortcut-message" role="status" aria-live="polite"></span>
               <div id="runtime-limit-restart" class="runtime-limit-restart" hidden>
                 <p id="runtime-limit-restart-warning" class="runtime-limit-warn">
-                  Restart to apply the saved limit. Restarting stops every running session: in-progress work and
-                  unsaved input are lost. Sessions with a saved transcript resume automatically afterwards; their
-                  running processes are not preserved.
+                  Restart to apply the saved limit. Restarting stops every running session; in-progress work and
+                  unsaved terminal input are lost. Saved transcripts remain readable and load only after you submit
+                  a message; their running processes are not preserved.
                 </p>
                 <button
                   id="runtime-limit-restart-button"

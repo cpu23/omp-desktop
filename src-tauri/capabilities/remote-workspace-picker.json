@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/remote-schema.json",
+  "identifier": "remote-workspace-picker",
+  "description": "Allow the loopback desktop client to select one workspace directory.",
+  "windows": ["main"],
+  "local": false,
+  "remote": {
+    "urls": ["http://127.0.0.1:*"]
+  },
+  "permissions": ["allow-select-workspace-directory"]
+}

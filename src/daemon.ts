@@ -1,7 +1,8 @@
 import { isAbsolute, join, resolve } from "node:path";
-import { existsSync, readFileSync } from "node:fs";
+import { isIP } from "node:net";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { RuntimeManager, RuntimeCapacityError, PendingRuntimeCapacityError } from "./manager";
+import { RuntimeManager, RuntimeCapacityError, PendingRuntimeCapacityError, type SpawnRequest } from "./manager";
 import { listSessions, readSessionCwd } from "./sessions";
 import { SessionTitleStore } from "./session-titles";
 import { SessionArchiveStore } from "./session-archives";
@@ -11,8 +12,10 @@ import { PresentationReader } from "./presentation";
 import { STATE_LIMIT_BYTES, WorkspaceStateStore, RuntimeLedgerStore } from "./state";
 import {
   DaemonSettingsStore,
+  isIdleTimeoutMinutes,
   isPositiveInteger,
   resolveMaxRuntimes,
+  resolveIdleTimeoutMinutes,
   settingsPayload,
 } from "./settings";
 import { activeSystemdUnit } from "./systemd";
@@ -20,8 +23,11 @@ import type { Runtime } from "./runtime";
 import { createWebAssets } from "./web-assets";
 import { conditionalJson, readLimitedBytes, BodyLimitError } from "./http-response";
 import { TerminalOutput } from "./terminal-output";
-import { IMAGE_FILE_LIMIT } from "./image-limits";
+import { IMAGE_FILE_LIMIT, imageExtensionForMime } from "./image-limits";
 import { PasteStore, PasteCapacityError } from "./paste-store";
+import { renderSessionHistory } from "./session-history";
+import { idleRequestTooLarge, IDLE_REQUEST_TOO_LARGE } from "./idle-limits";
+import { IdleRuntimeClient, type IdleRuntimeStatus } from "./idle-ipc";
 
 const HOST = process.env.OMP_DESKTOP_HOST ?? "127.0.0.1";
 const PORT = Number(process.env.OMP_DESKTOP_PORT ?? 4180);
@@ -46,12 +52,6 @@ const SESSIONS_DIR =
   process.env.OMP_DESKTOP_SESSIONS_DIR ?? join(process.env.HOME ?? "", ".omp/agent/sessions");
 const SESSIONS_ROOT = resolve(SESSIONS_DIR);
 const PASTE_DIR = process.env.OMP_DESKTOP_PASTE_DIR ?? join(tmpdir(), "omp-desktop-pastes");
-const PASTE_TYPES: Record<string, string> = {
-  "image/png": "png",
-  "image/jpeg": "jpg",
-  "image/webp": "webp",
-  "image/gif": "gif",
-};
 const pasteStore = new PasteStore(PASTE_DIR);
 // Durable workspace state (layout, pins, settings). The client caches it in
 // browser storage and mirrors every change here, so a reboot, a cleared browser
@@ -89,7 +89,7 @@ const savedSettings = await settingsStore.read().catch((error: unknown) => {
   console.warn(
     `omp-desktopd: could not read settings ${SETTINGS_FILE}: ${error instanceof Error ? error.message : String(error)}`,
   );
-  return { maxRuntimes: null, malformed: false };
+  return { maxRuntimes: null, idleTimeoutMinutes: null, malformed: false };
 });
 if (savedSettings.malformed) {
   console.warn(`omp-desktopd: ignoring malformed settings file ${SETTINGS_FILE}`);
@@ -97,6 +97,14 @@ if (savedSettings.malformed) {
 const initialLimit = resolveMaxRuntimes(savedSettings.maxRuntimes, process.env.OMP_DESKTOP_MAX_RUNTIMES);
 const EFFECTIVE_MAX_RUNTIMES = initialLimit.maxRuntimes;
 let desiredMaxRuntimes = initialLimit.maxRuntimes;
+let idleTimeoutMinutes = resolveIdleTimeoutMinutes(
+  savedSettings.idleTimeoutMinutes,
+  process.env.OMP_DESKTOP_IDLE_TIMEOUT_MINUTES,
+);
+let customMaxRuntimes = savedSettings.maxRuntimes;
+let customIdleTimeoutMinutes = savedSettings.idleTimeoutMinutes;
+/** Partial setting writes must merge against the last committed snapshot. */
+let settingsWrite = Promise.resolve();
 // Empty OMP_DESKTOP_OVERLAY disables the overlay: non-omp binaries (smoke test's
 // bash) reject unknown flags.
 const OVERLAY_ARGS = OMP_OVERLAY ? ["--config", OMP_OVERLAY] : [];
@@ -144,10 +152,14 @@ if (!MOBILE_TOKEN) {
 // runtime, so `/api/runtimes` (polled every 2.5s per tab) cannot stall on a
 // wedged socket.
 const presentationReader = new PresentationReader({ dir: MOBILE_IPC_DIR, token: MOBILE_TOKEN ?? null });
+const IDLE_IPC_DIR = join(STATE_DIR, "idle");
+const IDLE_IPC_TOKEN = `${crypto.randomUUID()}${crypto.randomUUID()}`;
+const idleClient = new IdleRuntimeClient({ dir: IDLE_IPC_DIR, token: IDLE_IPC_TOKEN, timeoutMs: 1500 });
+const IDLE_EXTENSION = join(ROOT, "src", "idle-extension.ts");
 
 const manager = new RuntimeManager({
   file: OMP_BIN,
-  args: [...OVERLAY_ARGS, ...OMP_ARGS, ...EXTENSION_ARGS],
+  args: [...OVERLAY_ARGS, ...OMP_ARGS, ...EXTENSION_ARGS, "-e", IDLE_EXTENSION],
   cwd: CWD,
   cols: 120,
   rows: 32,
@@ -164,6 +176,8 @@ const manager = new RuntimeManager({
     PI_FORCE_IMAGE_PROTOCOL: process.env.PI_FORCE_IMAGE_PROTOCOL ?? "iterm2",
     OMP_MOBILE_STATE_DIR: MOBILE_IPC_DIR,
     OMP_MOBILE_IPC_DIR: MOBILE_IPC_DIR,
+    OMP_DESKTOP_IDLE_IPC_DIR: IDLE_IPC_DIR,
+    OMP_DESKTOP_IDLE_IPC_TOKEN: IDLE_IPC_TOKEN,
     ...(MOBILE_TOKEN ? { OMP_MOBILE_IPC_TOKEN: MOBILE_TOKEN } : {}),
   },
 });
@@ -171,6 +185,32 @@ const manager = new RuntimeManager({
 const webAssets = await createWebAssets(ROOT);
 const BUILD = webAssets.build;
 const NO_STORE = { "cache-control": "no-store" };
+const MUTATING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+
+function trustedOrigins(port: number): Set<string> {
+  const hosts = new Set(["127.0.0.1", "localhost"]);
+  const configuredHost = HOST.toLowerCase().replace(/^\[|\]$/g, "");
+  if (configuredHost === "localhost" || configuredHost === "::1" ||
+      (isIP(configuredHost) === 4 && configuredHost.startsWith("127."))) {
+    hosts.add(configuredHost);
+  }
+  return new Set([...hosts].map((host) =>
+    new URL(`http://${host.includes(":") ? `[${host}]` : host}:${port}`).origin,
+  ));
+}
+
+/** Reject browser requests that do not originate from a trusted loopback daemon origin.
+ *  Requests without browser provenance headers remain available to local tools. */
+function sameOriginRequest(req: Request, requestUrl: URL, port: number): boolean {
+  const allowedOrigins = trustedOrigins(port);
+  if (!allowedOrigins.has(requestUrl.origin)) return false;
+  const origin = req.headers.get("origin");
+  if (origin !== null && (origin !== requestUrl.origin || !allowedOrigins.has(origin))) return false;
+  const fetchSite = req.headers.get("sec-fetch-site");
+  if (fetchSite === null) return true;
+  if (fetchSite === "none") return req.method === "GET" && allowedOrigins.has(requestUrl.origin);
+  return fetchSite === "same-origin" && allowedOrigins.has(requestUrl.origin);
+}
 
 
 type WsData = { runtime?: Runtime; output?: TerminalOutput; unsubData?: () => void; unsubExit?: () => void };
@@ -183,7 +223,161 @@ function validResume(path: string | undefined): string | null {
   if (!path || !isAbsolute(path) || !path.endsWith(".jsonl")) return null;
   const absolute = resolve(path);
   if (!absolute.startsWith(`${SESSIONS_ROOT}/`)) return null;
-  return existsSync(absolute) ? absolute : null;
+  try {
+    const canonicalRoot = realpathSync(SESSIONS_ROOT);
+    const canonicalFile = realpathSync(absolute);
+    return canonicalFile.startsWith(`${canonicalRoot}/`) && statSync(canonicalFile).isFile() ? absolute : null;
+  } catch {
+    return null;
+  }
+}
+type UnloadAttempt = { runtime: Runtime; done: Promise<void> };
+const unloadingBySession = new Map<string, UnloadAttempt>();
+const unloadingRuntimes = new Set<Runtime>();
+const requestingSessions = new Map<string, number>();
+let idleSweepTimer: Timer | null = null;
+let idleSweepBusy = false;
+
+class RuntimeUnavailableError extends Error {}
+class SessionIdentityError extends Error {}
+class ArchivedSessionError extends Error {}
+
+async function waitForUnload(done: Promise<void>): Promise<void> {
+  const expired = Promise.withResolvers<never>();
+  const timer = setTimeout(
+    () => expired.reject(new RuntimeUnavailableError("session is still unloading; its transcript is safe to read")),
+    15_000,
+  );
+  try {
+    await Promise.race([done, expired.promise]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Requests serialize behind a graceful unload; reads never call this path. */
+function createRequestedRuntime(request: SpawnRequest): Promise<Runtime> {
+  const file = request.resume;
+  if (!file) return allocateRequestedRuntime(request);
+  return withSessionOperation(file, async () => {
+    if ((await sessionArchiveStore.read()).includes(file)) {
+      throw new ArchivedSessionError("archived sessions cannot be resumed");
+    }
+    return allocateRequestedRuntime(request);
+  });
+}
+
+async function allocateRequestedRuntime(request: SpawnRequest): Promise<Runtime> {
+  const file = request.resume;
+  if (file) requestingSessions.set(file, (requestingSessions.get(file) ?? 0) + 1);
+  try {
+    const unloading = file ? unloadingBySession.get(file) : undefined;
+    if (unloading) await waitForUnload(unloading.done);
+    if (shuttingDown) throw new RuntimeUnavailableError("daemon shutting down");
+    const runtime = await manager.create(
+      request,
+      desiredMaxRuntimes < EFFECTIVE_MAX_RUNTIMES ? { maxRuntimes: desiredMaxRuntimes } : {},
+    );
+    runtime.lastInputAt = Date.now();
+    return runtime;
+  } finally {
+    if (file) {
+      const remaining = (requestingSessions.get(file) ?? 1) - 1;
+      if (remaining === 0) requestingSessions.delete(file);
+      else requestingSessions.set(file, remaining);
+    }
+  }
+}
+
+async function waitForActivity(runtime: Runtime, expectedFile?: string): Promise<IdleRuntimeStatus> {
+  const deadline = Date.now() + 15_000;
+  while (runtime.alive && !shuttingDown && Date.now() < deadline) {
+    const result = await idleClient.status(runtime.id);
+    if (result.kind === "available") {
+      if (result.status.unloading) throw new RuntimeUnavailableError("session is unloading; send again after it closes");
+      const file = result.status.sessionFile;
+      if (file !== null) {
+        if (expectedFile && file !== expectedFile) {
+          throw new SessionIdentityError("the runtime opened a different transcript; the request was not sent");
+        }
+        return result.status;
+      }
+    }
+    await Bun.sleep(100);
+  }
+  throw new RuntimeUnavailableError("session did not become ready; the request was not sent");
+}
+
+
+/** The host, not a cached status or terminal-byte heuristic, commits the shutdown. */
+function beginIdleUnload(runtime: Runtime, file: string, timeoutMs: number): void {
+  const settled = Promise.withResolvers<void>();
+  const attempt = { runtime, done: settled.promise };
+  unloadingBySession.set(file, attempt);
+  unloadingRuntimes.add(runtime);
+  void (async () => {
+    const inputAt = runtime.lastInputAt ?? runtime.startedAt?.getTime() ?? Date.now();
+    if (idleTimeoutMinutes * 60_000 !== timeoutMs ||
+        Date.now() - inputAt < timeoutMs || requestingSessions.has(file)) return;
+    const result = await idleClient.unload(runtime.id, { sessionFile: file, idleTimeoutMs: timeoutMs });
+    let accepted = result.kind === "accepted";
+    if (result.kind === "unavailable") {
+      // A lost acknowledgement might conceal an accepted shutdown. Keep input
+      // fenced until fresh host state proves rejection or the process exits.
+      while (runtime.alive && !shuttingDown) {
+        const fresh = await idleClient.status(runtime.id);
+        if (fresh.kind === "available") {
+          accepted = fresh.status.unloading;
+          break;
+        }
+        await Bun.sleep(250);
+      }
+    }
+    if (!accepted) return;
+    while (runtime.alive && !shuttingDown) {
+      const fresh = await idleClient.status(runtime.id);
+      if (fresh.kind === "available" && !fresh.status.unloading) return;
+      await Bun.sleep(250);
+    }
+    if (shuttingDown) return;
+    if (exitSaveTimer !== null) {
+      clearTimeout(exitSaveTimer);
+      exitSaveTimer = null;
+    }
+    writeLedger();
+    await ledgerWrite;
+    console.log(`omp-desktopd unloaded idle session ${file}`);
+  })().catch((error) => {
+    console.warn(`omp-desktopd idle unload failed: ${error instanceof Error ? error.message : String(error)}`);
+  }).finally(() => {
+    if (unloadingBySession.get(file) === attempt) unloadingBySession.delete(file);
+    unloadingRuntimes.delete(runtime);
+    settled.resolve();
+  });
+}
+
+async function sweepIdleRuntimes(): Promise<void> {
+  if (idleSweepBusy || shuttingDown || idleTimeoutMinutes === 0) return;
+  idleSweepBusy = true;
+  const timeoutMs = idleTimeoutMinutes * 60_000;
+  try {
+    for (const info of manager.list()) {
+      const runtime = manager.get(info.id);
+      const file = runtime?.sessionFile;
+      if (!runtime?.alive || !file || unloadingBySession.has(file) || requestingSessions.has(file)) continue;
+      const inputAt = runtime.lastInputAt ?? runtime.startedAt?.getTime() ?? Date.now();
+      if (Date.now() - inputAt < timeoutMs) continue;
+      const state = await idleClient.status(runtime.id);
+      if (shuttingDown || idleTimeoutMinutes * 60_000 !== timeoutMs) return;
+      if (state.kind !== "available" || state.status.unloading || state.status.sessionFile !== file ||
+          state.status.reasons.length !== 0 || state.status.idleSince === null ||
+          Date.now() - state.status.idleSince < timeoutMs ||
+          !runtime.alive || manager.get(runtime.id) !== runtime) continue;
+      beginIdleUnload(runtime, file, timeoutMs);
+    }
+  } finally {
+    idleSweepBusy = false;
+  }
 }
 
 /**
@@ -320,11 +514,19 @@ const server = Bun.serve<WsData>({
   port: PORT,
   async fetch(req, srv) {
     const url = new URL(req.url);
+    const websocketUpgrade = req.headers.get("upgrade")?.toLowerCase() === "websocket";
+    const listenPort = server.port;
+    const apiRequest = url.pathname.startsWith("/api/");
+    if ((apiRequest || MUTATING_METHODS.has(req.method) || websocketUpgrade) &&
+        (listenPort === undefined || !sameOriginRequest(req, url, listenPort))) {
+      return new Response("cross-origin request rejected", { status: 403 });
+    }
     if (
       url.pathname === "/api/runtimes" ||
       url.pathname.startsWith("/api/runtimes/") ||
       url.pathname === "/api/settings" ||
       url.pathname === "/api/restart" ||
+      url.pathname === "/api/sessions/request" ||
       url.pathname === "/api/sessions/archive" ||
       url.pathname === "/ws/term"
     ) {
@@ -342,38 +544,50 @@ const server = Bun.serve<WsData>({
     }
     switch (`${req.method} ${url.pathname}`) {
       case "GET /api/settings":
-        return conditionalJson(req, settingsPayload(desiredMaxRuntimes, EFFECTIVE_MAX_RUNTIMES));
+        return conditionalJson(req, settingsPayload(desiredMaxRuntimes, EFFECTIVE_MAX_RUNTIMES, idleTimeoutMinutes));
       case "PUT /api/settings": {
         const body: unknown = await req.json().catch(() => null);
-        if (!isRecord(body) || !isPositiveInteger(body.maxRuntimes)) {
+        if (!isRecord(body) || (body.maxRuntimes === undefined && body.idleTimeoutMinutes === undefined) ||
+            (body.maxRuntimes !== undefined && !isPositiveInteger(body.maxRuntimes)) ||
+            (body.idleTimeoutMinutes !== undefined && !isIdleTimeoutMinutes(body.idleTimeoutMinutes))) {
           return new Response(
-            "maxRuntimes must be a positive integer (for example 16); the current limit was not changed",
+            "settings require maxRuntimes as a positive integer and/or idleTimeoutMinutes as non-negative whole minutes (0 disables unloading)",
             { status: 400 },
           );
         }
-        const maxRuntimes = body.maxRuntimes;
-        // Restore is bounded by the limit, so accepting a lower limit than the
-        // sessions that would come back would silently drop them on restart.
-        // Reject the save instead of letting a restart lose work.
-        const live = manager.liveSessions().length;
-        if (maxRuntimes < live) {
-          return new Response(
-            `cannot set the runtime limit to ${maxRuntimes}: ${live} live session(s) would not fit after a restart. Stop sessions first or choose at least ${live}.`,
-            { status: 400 },
-          );
-        }
+        const previous = settingsWrite;
+        const write = Promise.withResolvers<void>();
+        settingsWrite = write.promise;
+        await previous;
         try {
-          await settingsStore.save(maxRuntimes);
+          const maxRuntimes = (body.maxRuntimes as number | undefined) ?? desiredMaxRuntimes;
+          const nextIdleTimeout = (body.idleTimeoutMinutes as number | undefined) ?? idleTimeoutMinutes;
+          const nextCustomMax = body.maxRuntimes === undefined ? customMaxRuntimes : maxRuntimes;
+          const nextCustomIdle = body.idleTimeoutMinutes === undefined ? customIdleTimeoutMinutes : nextIdleTimeout;
+          // A smaller restart pool must still fit every session it would restore.
+          const live = manager.liveSessions().length;
+          if (body.maxRuntimes !== undefined && maxRuntimes < live) {
+            return new Response(
+              `cannot set the runtime limit to ${maxRuntimes}: ${live} live session(s) would not fit after a restart. Stop sessions first or choose at least ${live}.`,
+              { status: 400 },
+            );
+          }
+          await settingsStore.save({ maxRuntimes: nextCustomMax, idleTimeoutMinutes: nextCustomIdle });
+          customMaxRuntimes = nextCustomMax;
+          customIdleTimeoutMinutes = nextCustomIdle;
+          desiredMaxRuntimes = maxRuntimes;
+          idleTimeoutMinutes = nextIdleTimeout;
+          return Response.json(settingsPayload(desiredMaxRuntimes, EFFECTIVE_MAX_RUNTIMES, idleTimeoutMinutes), {
+            headers: NO_STORE,
+          });
         } catch (error) {
           return new Response(
             `settings save failed: ${error instanceof Error ? error.message : String(error)}`,
             { status: 500 },
           );
+        } finally {
+          write.resolve();
         }
-        desiredMaxRuntimes = maxRuntimes;
-        return Response.json(settingsPayload(desiredMaxRuntimes, EFFECTIVE_MAX_RUNTIMES), {
-          headers: NO_STORE,
-        });
       }
       case "POST /api/restart": {
         if (restartScheduled) {
@@ -441,7 +655,7 @@ const server = Bun.serve<WsData>({
         // bytes land in a file and the pane types the path — what a terminal with
         // image paste does.
         const type = (req.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
-        const ext = PASTE_TYPES[type];
+        const ext = imageExtensionForMime(type);
         if (!ext) return new Response("unsupported image type", { status: 415 });
         let bytes: Uint8Array;
         try {
@@ -499,20 +713,12 @@ const server = Bun.serve<WsData>({
           // read, so concurrent requests cannot all pass a pre-check. Resuming a
           // transcript that is already live still reuses that process (and is
           // therefore allowed even at the limit).
-          const create = async () => {
-            if (resume && (await sessionArchiveStore.read()).includes(resume)) return null;
-            return manager.create(
-              {
-                cwd,
-                resume,
-                cols: typeof body.cols === "number" ? body.cols : undefined,
-                rows: typeof body.rows === "number" ? body.rows : undefined,
-              },
-              desiredMaxRuntimes < EFFECTIVE_MAX_RUNTIMES ? { maxRuntimes: desiredMaxRuntimes } : {},
-            );
-          };
-          const runtime = resume ? await withSessionOperation(resume, create) : await create();
-          if (!runtime) return new Response("archived sessions cannot be resumed", { status: 400 });
+          const runtime = await createRequestedRuntime({
+            cwd,
+            resume,
+            cols: typeof body.cols === "number" ? body.cols : undefined,
+            rows: typeof body.rows === "number" ? body.rows : undefined,
+          });
           return Response.json({ runtime: runtime.info() }, { headers: NO_STORE });
         } catch (error) {
           if (error instanceof PendingRuntimeCapacityError) {
@@ -529,7 +735,103 @@ const server = Bun.serve<WsData>({
               { status: 409 },
             );
           }
+          if (error instanceof ArchivedSessionError) return new Response(error.message, { status: 400 });
+          if (error instanceof RuntimeUnavailableError) return new Response(error.message, { status: 503 });
           throw error;
+        }
+      }
+      case "POST /api/sessions/request": {
+        const contentType = (req.headers.get("content-type") ?? "").split(";", 1)[0]!.trim().toLowerCase();
+        if (contentType !== "application/json") {
+          return new Response("session requests require application/json", { status: 415 });
+        }
+        let body: unknown;
+        try {
+          body = JSON.parse(new TextDecoder().decode(await readLimitedBytes(req, 128 * 1024)));
+        } catch (error) {
+          return new Response("invalid session request", { status: error instanceof BodyLimitError ? 413 : 400 });
+        }
+        if (!isRecord(body) || typeof body.text !== "string" || !body.text.trim()) {
+          return new Response("a nonempty session request is required", { status: 400 });
+        }
+        if (body.files !== undefined && (!Array.isArray(body.files) ||
+            body.files.some((path) => typeof path !== "string" || !path || /[\u0000-\u001f\u007f]/.test(path)))) {
+          return new Response("invalid attachment paths", { status: 400 });
+        }
+        let resume: string | undefined;
+        if (body.path !== undefined) {
+          resume = typeof body.path === "string" ? validResume(body.path) ?? undefined : undefined;
+          if (!resume) return new Response("request requires an existing transcript under the session store", { status: 400 });
+        }
+        let cwd: string | undefined;
+        if (body.cwd !== undefined) {
+          if (typeof body.cwd !== "string" || !isAbsolute(body.cwd)) {
+            return new Response("cwd must be an absolute existing directory", { status: 400 });
+          }
+          try {
+            if (!statSync(body.cwd).isDirectory()) {
+              return new Response("cwd must be an absolute existing directory", { status: 400 });
+            }
+          } catch {
+            return new Response("cwd must be an absolute existing directory", { status: 400 });
+          }
+          cwd = body.cwd;
+        }
+        // A fresh transcript path is only known after startup. The empty path is
+        // a lower bound; prompt() checks the final envelope before opening IPC.
+        if (idleRequestTooLarge({ sessionFile: resume ?? "", text: body.text, files: body.files })) {
+          return new Response(IDLE_REQUEST_TOO_LARGE, { status: 413 });
+        }
+        let runtime: Runtime | undefined;
+        try {
+          runtime = await createRequestedRuntime({
+            resume,
+            cwd,
+            cols: typeof body.cols === "number" ? body.cols : undefined,
+            rows: typeof body.rows === "number" ? body.rows : undefined,
+          });
+          runtime.start();
+          const ready = await waitForActivity(runtime, resume);
+          const file = ready.sessionFile;
+          if (file === null) throw new RuntimeUnavailableError("session has no transcript yet; the request was not sent");
+          runtime.lastInputAt = Date.now();
+          const dispatched = await idleClient.prompt(runtime.id, {
+            sessionFile: file, text: body.text, files: body.files as string[] | undefined,
+          });
+          if (dispatched.kind === "conflict" || dispatched.kind === "too_large") {
+            if (!resume) {
+              // A rejected fresh draft owns this new process, but another client
+              // may have started work meanwhile. Let the SDK recheck quiescence;
+              // never force-kill on rejection or an ambiguous acknowledgement.
+              try {
+                const status = await idleClient.status(runtime.id);
+                if (status.kind === "available" && status.status.idleSince !== null && status.status.reasons.length === 0) {
+                  const remaining = 1 - (Date.now() - status.status.idleSince);
+                  if (remaining > 0) await Bun.sleep(remaining);
+                }
+                const retired = await idleClient.unload(runtime.id, { sessionFile: file, idleTimeoutMs: 1 });
+                if (retired.kind === "accepted") {
+                  const deadline = Date.now() + 2000;
+                  while (runtime.alive && Date.now() < deadline) await Bun.sleep(25);
+                }
+              } catch (error) {
+                console.warn(`omp-desktopd: rejected request cleanup unavailable: ${String(error)}`);
+              }
+            }
+            return new Response(dispatched.reason, { status: dispatched.kind === "too_large" ? 413 : 409 });
+          }
+          if (dispatched.kind === "unavailable") {
+            return new Response("request acknowledgement unavailable; it may have been queued. Check the session before sending again.", { status: 503 });
+          }
+          return Response.json({ runtime: runtime.info() }, { headers: NO_STORE });
+        } catch (error) {
+          if (runtime && !runtime.alive && manager.get(runtime.id) === runtime) await manager.kill(runtime.id);
+          if (error instanceof ArchivedSessionError) return new Response(error.message, { status: 400 });
+          if (error instanceof RuntimeCapacityError) {
+            return new Response("session limit reached; stop a session or raise the runtime limit in Settings", { status: 409 });
+          }
+          if (error instanceof SessionIdentityError) return new Response(error.message, { status: 409 });
+          return new Response(error instanceof Error ? error.message : "session request unavailable", { status: 503 });
         }
       }
       case "POST /api/sessions/title": {
@@ -588,6 +890,13 @@ const server = Bun.serve<WsData>({
         });
         return conditionalJson(req, { sessions, archivedPaths });
       }
+      case "GET /api/sessions/history": {
+        const file = validResume(url.searchParams.get("path") ?? undefined);
+        if (!file) return new Response("history requires an existing transcript under the session store", { status: 400 });
+        const cols = Number(url.searchParams.get("cols") ?? 120);
+        const rows = Number(url.searchParams.get("rows") ?? 32);
+        return renderSessionHistory({ file, cols, rows, omp: OMP_BIN, args: OMP_ARGS, signal: req.signal });
+      }
       default:
         break;
     }
@@ -618,6 +927,9 @@ const server = Bun.serve<WsData>({
         }
         if (!isRecord(body) || typeof body.data !== "string" || body.data.length > MAX_RUNTIME_INPUT_CODE_UNITS) {
           return new Response(`terminal input must contain at most ${MAX_RUNTIME_INPUT_CODE_UNITS} characters`, { status: 400 });
+        }
+        if (!runtime.alive || unloadingRuntimes.has(runtime)) {
+          return new Response("session is unloading; input was not accepted", { status: 409 });
         }
         runtime.write(body.data);
         return Response.json({ ok: true }, { headers: NO_STORE });
@@ -664,13 +976,24 @@ const server = Bun.serve<WsData>({
         output.send(JSON.stringify(message));
       });
     },
-    message(ws, raw) {
+    async message(ws, raw) {
       const runtime = ws.data.runtime;
       if (!runtime || typeof raw !== "string") return;
       const msg = parseClientMessage(raw);
       if (!msg) return;
-      if (msg.type === "input") runtime.write(msg.data);
-      else runtime.resize(msg.cols, msg.rows);
+      if (msg.type === "input") {
+        const unloading = runtime.sessionFile ? unloadingBySession.get(runtime.sessionFile) : undefined;
+        if (unloading?.runtime === runtime) await unloading.done;
+        if (!runtime.alive || unloadingRuntimes.has(runtime) || manager.get(runtime.id) !== runtime) {
+          ws.close(1012, "Session unloaded; unacknowledged input remains a draft");
+          return;
+        }
+        runtime.write(msg.data);
+        if (msg.id) {
+          const ack: ServerMessage = { type: "inputAck", id: msg.id };
+          ws.data.output?.send(JSON.stringify(ack));
+        }
+      } else runtime.resize(msg.cols, msg.rows);
     },
     drain(ws) {
       ws.data.output?.drain();
@@ -819,6 +1142,10 @@ function shutdown(code = 0): void {
   // the sessions ending. A pending exit save is a child death that the same
   // teardown caused, so it must not land either.
   shuttingDown = true;
+  if (idleSweepTimer !== null) {
+    clearInterval(idleSweepTimer);
+    idleSweepTimer = null;
+  }
   if (exitSaveTimer !== null) {
     clearTimeout(exitSaveTimer);
     exitSaveTimer = null;
@@ -837,3 +1164,12 @@ process.on("SIGTERM", () => shutdown(0));
 process.on("exit", () => { void manager.killAll("SIGKILL"); });
 
 const poolReady = restorePool();
+void poolReady.then(() => {
+  if (shuttingDown) return;
+  idleSweepTimer = setInterval(() => {
+    void sweepIdleRuntimes().catch((error) => {
+      console.warn(`omp-desktopd idle sweep failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  }, 60_000);
+  idleSweepTimer.unref();
+});

@@ -21,7 +21,10 @@ fn main() {
             shell::focus_main_window(app);
         }))
         .plugin(tauri_plugin_notification::init())
-        .invoke_handler(tauri::generate_handler![shell::connect])
+        .invoke_handler(tauri::generate_handler![
+            shell::connect,
+            shell::select_workspace_directory
+        ])
         .setup(|app| {
             shell::build_main_window(app.handle())?;
             Ok(())

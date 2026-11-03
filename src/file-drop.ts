@@ -1,6 +1,8 @@
 const NATIVE_FILE_DROP_EVENT = "omp-desktop-file-drop";
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
 
+export type FileReference = { path: string; text: string };
+
 export type FileDropOptions = {
   /** Receives original filesystem paths, or paths returned by `upload`. */
   onPaths: (paths: readonly string[]) => void;
@@ -58,17 +60,17 @@ export function wireFileDrop(element: HTMLElement, options: FileDropOptions): ()
 }
 
 /** Sends shell-quoted paths as plain terminal input; no newline is ever sent. */
-export function insertFilePaths(socket: WebSocket | null, paths: readonly string[]): boolean {
-  if (!socket || socket.readyState !== WebSocket.OPEN) return false;
-  const input = safePaths(paths).map((path) => `'${path.replace(/'/g, "'\\''")}'`).join(" ");
-  if (!input) return false;
-
-  try {
-    socket.send(JSON.stringify({ type: "input", data: `${input} ` }));
-    return true;
-  } catch {
-    return false;
-  }
+export function insertFilePaths(
+  sendInput: ((data: string, files?: readonly FileReference[]) => boolean) | null,
+  paths: readonly string[],
+  includeReferences = false,
+): boolean {
+  const safe = safePaths(paths);
+  const quoted = safe.map((path) => `'${path.replace(/'/g, "'\\''")}'`);
+  const input = quoted.join(" ");
+  if (!input.length || !sendInput) return false;
+  const files = includeReferences ? safe.map((path, index) => ({ path, text: quoted[index]! })) : undefined;
+  return sendInput(`${input} `, files);
 }
 
 async function resolveDroppedPaths(

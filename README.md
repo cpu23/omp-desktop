@@ -8,7 +8,7 @@ live and saved sessions. Closing a pane or window does not stop its session.
 
 ## Requirements
 
-- Bun 1.3+, Git and OMP 18.x on `PATH`; run `omp` once to complete provider setup.
+- Bun 1.3+, Git and OMP 18.13.1+ on `PATH`; run `omp` once to complete provider setup.
 - Linux native builds additionally require Rust 1.92+, pkg-config, a C toolchain, and GTK4/WebKitGTK 6 development
   packages; see the [native setup guide](docs/guide.md#native-linux-app). Native macOS/Windows builds use Tauri.
 
@@ -20,7 +20,8 @@ From the folder where you keep projects:
 git clone https://github.com/cpu23/omp-desktop.git && cd omp-desktop && bun install --frozen-lockfile && bun run start
 ```
 
-Open <http://127.0.0.1:4180> and select **+** beside the session search. Keep the terminal running.
+Open <http://127.0.0.1:4180>, write a message, and select **Send** to start an agent. Opening or creating a pane
+alone does not start one. Keep the terminal running.
 
 For a native Linux window, install [Rust 1.92+](https://rustup.rs) and the [system GTK4/WebKitGTK 6 development
 packages](docs/guide.md#native-linux-app), then run `bun run app:install` from `omp-desktop/`. Open **OMP Desktop**
@@ -31,7 +32,7 @@ from your application menu; the daemon above must remain running.
 ## Spaces and files
 
 - Click **+** to add a space. Drag a pane or sidebar session onto another space's tab to move/open it there.
-- Drag a space tab left or right to reorder workspaces. The active space stays selected, and the order is saved across restarts.
+- Drag a space tab left or right to reorder spaces. The active space stays selected, and the order is saved across restarts.
 - Drop files onto a pane to insert their paths without submitting. Native drops preserve original paths for all
   file types; file contents are not uploaded.
 - Closing a pane only detaches its view. Output continues in the daemon; use the sidebar stop action to end a
@@ -39,14 +40,25 @@ from your application menu; the daemon above must remain running.
 
 ## Sessions and settings
 
-- Panes show **Starting session…** while a new session initializes, hiding transient startup protocol text.
-  Existing sessions reappear after replay; startup exits and disconnects uncover their output immediately.
+- Panes show **Starting session…** while an agent initializes. Live panes replay daemon terminal state;
+  saved panes use a short-lived read-only transcript renderer.
+
+- **Workspaces** is the default sidebar view. In the native app, use the folder-plus icon to add a directory
+  through the system chooser, starting at your home folder. Empty workspaces remain available after a reload.
+- Running and saved sessions share one list, pinned first then newest conversation activity. Workspace rows
+  show titles without repeating their directory; working and unread-completion indicators remain visible.
+- Use **+** beside a workspace to prepare a new-session draft there, or select a workspace and use the header **+**.
+  The workspace button appears only on heading hover or keyboard focus.
+  Each submitted request accepts at most 16 unique image attachments and 32 MiB of image data in total; repeated paths are encoded once.
+- Opening a running session reattaches; opening a saved one reads its history without loading an agent.
+  Select **Send** or press **Ctrl+Enter** / **⌘Enter** to create or resume the agent. Plain Enter inserts a newline.
+- Truly idle agents unload gracefully after **60 minutes**. Change **Settings → Sessions → Idle timeout (minutes)**
+  without restarting; **0** disables unloading. Execution, sleeps, background jobs, subagents, queued delivery,
+  pending dialogs and unsent terminal input prevent unloading. Unknown activity also prevents unloading.
+- Settings retains a flat **Sessions** view with Pinned and Sessions sections. Pin/stop controls appear on hover or keyboard focus.
 - Click a pane's session title to edit it. **Enter** or the Save icon saves; clicking away or the Cancel icon discards the edit. Escape has no special action.
   Custom titles are limited to 1,024 UTF-16 code units after trimming. They persist in Desktop and appear in the sidebar without modifying OMP transcripts.
 
-- **Loaded → Pinned → Recent:** each session appears only in its highest applicable section. Recent is ordered by
-  last conversation activity. Thin, inset dividers separate the groups. Click a section label to collapse or expand it.
-- Rows show the directory and title; secondary pin/stop controls appear on hover or keyboard focus.
 - Right-click a session for an icon menu: **Edit title**, **Pin/Unpin**, **Unload session**, and **Archive**.
   Unload stops the runtime while preserving its transcript. Archive stops the runtime and persistently hides the session from the sidebar without deleting its transcript.
   Archived sessions cannot be resumed through Desktop, including from an existing pane; their transcript files remain on disk.
@@ -63,6 +75,16 @@ from your application menu; the daemon above must remain running.
 </details>
 
 ## Unreleased
+
+- Default the sidebar to Workspaces, add a home-rooted native directory chooser on Linux/macOS/Windows, persist
+  empty workspaces and selection, and prepare new-session drafts in the selected directory.
+- Unify running and saved conversations instead of separating Loaded/Recent sections; omit redundant directory
+  subtitles inside workspace groups.
+- Reveal each workspace's add-session button only on heading hover or keyboard focus, without shifting layout.
+- Unload confidently idle agents after a configurable 60-minute grace period, with live settings and graceful
+  SDK shutdown rather than forced termination. Protect running work, background jobs, subagents and pending input.
+- Read saved transcripts without a resident agent; start or resume only on explicit submission. Preserve local
+  drafts across navigation and send dropped/pasted image attachments with cold requests.
 
 - Edit session titles with explicit Save/Cancel icons, Enter to save, and click-away to discard.
 - Add an icon-based sidebar context menu for editing, pinning, unloading, and non-destructive archiving.
@@ -106,7 +128,7 @@ bun test
 bun run scripts/daemon-smoke.ts
 ```
 
-The broader `bun run smoke` exercises the OMP PTY integration and requires OMP 18.x on `PATH`. For a native Linux
+The broader `bun run smoke` exercises the OMP PTY integration and requires OMP 18.13.1+ on `PATH`. For a native Linux
 build, install Rust 1.92+ and the [system packages listed in the guide](docs/guide.md#native-linux-app), then run:
 
 ```sh

@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Core APIs for the bundled connection page. Loopback daemon content receives only the separate, notification-only capability.",
+  "description": "Core APIs for the bundled connection page. Loopback daemon content receives only its scoped notification and workspace-picker capabilities.",
   "windows": ["main"],
   "local": true,
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "allow-connect"]
 }

@@ -1,7 +1,8 @@
 import { trimSelectionHighlight } from "./selection";
 import {
   applySidebarState, onSidebarStateChange, sidebarFolderView, sidebarFolderExpanded,
-  toggleSidebarFolder, STORE_KEY as SIDEBAR_KEY,
+  toggleSidebarFolder, sidebarWorkspaces, sidebarActiveWorkspace, selectSidebarWorkspace,
+  normalizeDirectoryPath, STORE_KEY as SIDEBAR_KEY,
 } from "./sidebar";
 import { doneIndicator, workingIndicator } from "./working-indicator";
 import { CompletionTracker } from "./completion-tracker";
@@ -15,7 +16,7 @@ import { shouldUseDomFallbackForSoftwareWebgl } from "./webgl-renderer";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { isRecord } from "./guards";
 import { isNativeShell } from "./native-shell";
-import { insertFilePaths, wireFileDrop } from "./file-drop";
+import { insertFilePaths, wireFileDrop, type FileReference } from "./file-drop";
 import { initializeHotkeys } from "./hotkeys";
 import { syncRuntimeLimit } from "./runtime-limit";
 import { splitInputChunks } from "./client-input";
@@ -24,22 +25,11 @@ import {
   bindingForRuntime,
   bindingFromStored,
   emptyBinding,
-  intentAfterExit,
-  intentAfterRuntimeLoss,
-  pendingResumes,
+  rebindPaneBinding,
+  runtimeForSession,
   type PaneBinding,
 } from "./lifecycle";
-import {
-  parsePasteResponse,
-  parseRuntimesResponse,
-  parseRuntimeOne,
-  parseServerMessage,
-  parseSessionList,
-  parseStateResponse,
-  type RuntimeInfo,
-  type ServerMessage,
-  type SessionSummaryLike,
-} from "./protocol";
+import { parsePasteResponse, parseRuntimesResponse, parseRuntimeOne, parseServerMessage, parseSessionList, parseStateResponse, type RuntimeInfo, type ServerMessage, type SessionSummaryLike } from "./protocol";
 
 // Sidebar preferences share the durable-save path with panes, pins and font size.
 onSidebarStateChange(() => {
@@ -117,7 +107,10 @@ spaces.set(activeSpaceId, layout);
 let spaceSeq = 1;
 /** True after local restoration or the initial compatible daemon reconciliation. */
 let restoredLocal = false;
+/** A restored layout owns its empty slots as well as its bound sessions. */
+let hasSavedWorkspace = false;
 let runtimes: RuntimeInfo[] = [];
+let defaultCwd: string | null = null;
 let sessions: SessionSummaryLike[] = [];
 let daemonUp = false;
 /** Generation of the daemon that last answered: changes on every daemon restart. */
@@ -453,7 +446,7 @@ function handlePaneDrop(paneId: string, payload: Record<string, unknown>): void 
   if (payload.kind === "pane" && typeof payload.paneId === "string") swapPanes(payload.paneId, paneId);
   else if (payload.kind === "runtime" && typeof payload.runtimeId === "string") {
     const runtime = runtimes.find((candidate) => candidate.id === payload.runtimeId);
-    if (runtime) pane.bind(bindingForRuntime(runtime, daemonId, displayTitle(runtime)));
+    if (runtime) pane.bind(bindingForRuntime(runtime, displayTitle(runtime)));
   } else if (payload.kind === "session" && typeof payload.path === "string"
       && typeof payload.cwd === "string" && typeof payload.title === "string") {
     void openSession(pane, { path: payload.path, cwd: payload.cwd, title: payload.title });
@@ -505,6 +498,7 @@ async function refreshRuntimes(options: { restore?: boolean } = {}): Promise<boo
   const previousGeneration = daemonId;
   daemonUp = true;
   daemonId = payload.generation;
+  defaultCwd = payload.defaultCwd;
   const generationChanged = previousGeneration !== daemonId;
   if (generationChanged) {
     stateGate = "pending";
@@ -528,61 +522,23 @@ async function refreshRuntimes(options: { restore?: boolean } = {}): Promise<boo
     void completionNotifications.notifyCompletion(runtime.id, displayTitle(runtime));
   });
   renderSidebar();
-  // One pass per pane clears vanished bindings (keeping a resume claim only when
-  // the daemon restarted) and reattaches runtimes that are still alive.
+  // A daemon restart may bring back ledger runtimes; panes only adopt entries
+  // already present and never recreate missing sessions.
   for (const pane of panes.values()) pane.syncFromRuntimes();
   setStatus("", "ok");
   if (generationChanged && options.restore !== false) await reconcileWorkspaceState();
   if (options.restore !== false && stateGate === "pending") return true;
-  // Reopen panes whose session came back after boot; the boot path passes
-  // restore:false so adoption finishes before anything is resumed.
-  if (options.restore !== false) {
-    void restoreWantedSessions().then(() => {
-      if (!adoptPending) return;
-      if (runtimes.length > adoptSeen) {
-        adoptSeen = runtimes.length;
-        adoptUnclaimedRuntimes();
-      } else {
-        adoptPending = false;
-      }
-    });
+  if (options.restore !== false && adoptPending) {
+    if (runtimes.length > adoptSeen) {
+      adoptSeen = runtimes.length;
+      adoptUnclaimedRuntimes();
+    } else {
+      adoptPending = false;
+    }
   }
   return true;
 }
 
-/**
- * POST /api/runtimes with its HTTP status kept: a 400 is the daemon refusing a
- * transcript (gone or not under the session store) and must end a pane's resume
- * claim, while a transport or capacity failure is retried later. A refusal also
- * carries the daemon's own explanation (a full pool names the limit and what to
- * change), which callers show instead of an opaque status code.
- */
-async function requestRuntime(
-  request: { cwd?: string; resume?: string },
-  notify = true,
-): Promise<{ runtime: RuntimeInfo | null; status: number | null; error: string | null }> {
-  let res: Response;
-  try {
-    res = await fetch("/api/runtimes", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(request),
-    });
-  } catch {
-    return { runtime: null, status: null, error: null };
-  }
-  if (!res.ok) {
-    const body = (await res.text().catch(() => "")).trim();
-    const error = body || `the daemon refused the request (HTTP ${res.status})`;
-    if (notify) setStatus(error, "warn");
-    return { runtime: null, status: res.status, error };
-  }
-  const runtime = parseRuntimeOne(await res.json().catch(() => null));
-  if (!runtime) return { runtime: null, status: res.status, error: null };
-  runtimes = [...runtimes.filter((candidate) => candidate.id !== runtime.id), runtime];
-  renderSidebar();
-  return { runtime, status: res.status, error: null };
-}
 
 async function refreshSessions(): Promise<void> {
   const search = searchEl.value.trim();
@@ -666,6 +622,18 @@ function drawnMetrics(term: Terminal): CellMetrics | null {
   return { cellW: box.width / cols, cellH: box.height / rows };
 }
 
+/** Keep prompt text from terminal input, not cursor/status reports or escape keys. */
+function draftableTerminalInput(data: string): string {
+  return data
+    .replace(/\x1b\[(?:200|201)~/g, "")
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "")
+    .replace(/\x1bP[\s\S]*?\x1b\\/g, "")
+    .replace(/\x1b[@-_]/g, "")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
+    .replace(/\r\n?/g, "\n");
+}
+
 class Pane {
   readonly id: string;
   readonly el: HTMLElement;
@@ -678,6 +646,8 @@ class Pane {
   #host: HTMLElement;
   #titleActions: HTMLElement;
   #placeholder: HTMLElement;
+  #orphanReview: HTMLElement;
+  #orphanText: HTMLElement;
   #starting: HTMLElement;
   #startupTimer: number | undefined;
   #startupFrame = false;
@@ -690,8 +660,19 @@ class Pane {
   #observer: ResizeObserver;
   #resizeTimer: number | undefined;
   #replaying = false;
-  /** Start/resume refusal (e.g. a full pool) shown until the pane binds again. */
-  #notice: string | null = null;
+  #composer: HTMLElement;
+  #draftInput: HTMLTextAreaElement;
+  #submitButton: HTMLButtonElement;
+  #composerStatus: HTMLElement;
+  #historyController: AbortController | null = null;
+  #historyKey = "";
+  #historyReady = false;
+  #historyError: string | null = null;
+  #historyLoading = false;
+  #submissions = new Map<string, { text: string }>();
+  #draftSaveTimer: number | undefined;
+  #pendingInputs = new Map<string, { data: string; sessionFile: string | null }>();
+  #inputSequence = 0;
   #selectionEvents = new AbortController();
   #selectionRevision = 0;
   #disposeFileDrop: (() => void) | null = null;
@@ -774,7 +755,54 @@ class Pane {
     this.#host.className = "term-host";
     this.#placeholder = document.createElement("div");
     this.#placeholder.className = "pane-placeholder";
-    this.#body.append(this.#placeholder, this.#host);
+    this.#orphanReview = document.createElement("section");
+    this.#orphanReview.className = "orphan-draft-review";
+    this.#orphanReview.setAttribute("aria-label", "Unattributed recovered input");
+    const orphanHeading = document.createElement("strong");
+    orphanHeading.textContent = "Recovered input — review before reuse; not automatically resent";
+    this.#orphanText = document.createElement("pre");
+    const discardOrphan = document.createElement("button");
+    discardOrphan.type = "button";
+    discardOrphan.textContent = "Discard recovered input";
+    discardOrphan.addEventListener("click", () => {
+      delete this.binding.orphanDraft;
+      this.renderPlaceholder();
+      save();
+    });
+    this.#orphanReview.append(orphanHeading, this.#orphanText, discardOrphan);
+    this.#composer = document.createElement("form");
+    this.#composer.className = "cold-composer";
+    this.#draftInput = document.createElement("textarea");
+    this.#draftInput.rows = 2;
+    this.#draftInput.placeholder = "Write a message. Submit to load or start this session.";
+    this.#draftInput.setAttribute("aria-label", "Message this session");
+    this.#submitButton = document.createElement("button");
+    this.#submitButton.type = "submit";
+    this.#submitButton.textContent = "Send";
+    this.#composerStatus = document.createElement("span");
+    this.#composerStatus.className = "cold-composer-status";
+    this.#composerStatus.setAttribute("role", "status");
+    this.#composerStatus.setAttribute("aria-live", "polite");
+    this.#composer.append(this.#draftInput, this.#submitButton, this.#composerStatus);
+    this.#composer.addEventListener("submit", (event) => {
+      event.preventDefault();
+      void this.#submitColdDraft();
+    });
+    this.#draftInput.value = this.#draftFor(this.binding.sessionFile);
+    this.#draftInput.addEventListener("input", () => {
+      this.#storeCurrentDraft(this.#draftInput.value);
+      this.#composerStatus.textContent = "";
+      this.#updateComposer();
+      window.clearTimeout(this.#draftSaveTimer);
+      this.#draftSaveTimer = window.setTimeout(() => save(), 250);
+    });
+    this.#draftInput.addEventListener("keydown", (event) => {
+      if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+        event.preventDefault();
+        void this.#submitColdDraft();
+      }
+    });
+    this.#body.append(this.#orphanReview, this.#placeholder, this.#host, this.#composer);
     this.#starting = document.createElement("div");
     this.#starting.className = "pane-starting";
     this.#starting.setAttribute("role", "status");
@@ -862,13 +890,7 @@ class Pane {
       if (this.#startupFrame && !this.#replaying) this.#finishStartup();
     });
     this.term.loadAddon(new WebLinksAddon(openTerminalLink));
-    this.term.onData((data) => {
-      const socket = this.ws;
-      if (socket?.readyState !== WebSocket.OPEN) return;
-      for (const chunk of splitInputChunks(data)) {
-        socket.send(JSON.stringify({ type: "input", data: chunk }));
-      }
-    });
+    this.term.onData((data) => this.#sendInput(data));
     this.term.onSelectionChange(() => { this.#selectionRevision++; });
     this.term.onScroll(() => this.#syncJumpLatest());
     this.term.onWriteParsed(() => this.#syncJumpLatest());
@@ -893,14 +915,16 @@ class Pane {
     }, { signal: this.#selectionEvents.signal });
     window.addEventListener("blur", () => { selecting = false; }, { signal: this.#selectionEvents.signal });
     this.el.append(header, this.#body);
-    this.el.addEventListener("mousedown", () => this.focus());
+    this.el.addEventListener("mousedown", (event) =>
+      this.focus(event.target instanceof Node && this.#host.contains(event.target)),
+    );
     this.#observer = new ResizeObserver(() => this.#scheduleFit());
     this.#observer.observe(this.#body);
 
     wireSessionDrag(header, { kind: "pane", paneId: this.id });
     this.#wireDrop();
     this.#disposeFileDrop = wireFileDrop(this.el, {
-      onPaths: (paths) => insertFilePaths(this.ws, paths),
+      onPaths: (paths) => insertFilePaths((data, files) => this.#sendOrStageInput(data, files), paths, !this.binding.runtimeId),
       upload: uploadPaste,
     });
     // xterm stops paste propagation at its textarea. Capture image files before
@@ -909,9 +933,324 @@ class Pane {
     this.renderPlaceholder();
   }
 
+  get #submitting(): boolean {
+    const identity = this.#draftIdentity(this.binding.sessionFile);
+    return identity !== null && this.#submissions.has(identity);
+  }
+
+  #draftIdentity(sessionFile: string | null, cwd = this.binding.cwd): string | null {
+    return sessionFile ?? (cwd ? `new:${cwd}` : null);
+  }
+
+  #draftFor(sessionFile: string | null, cwd = this.binding.cwd): string {
+    const key = this.#draftIdentity(sessionFile, cwd);
+    const draft = key ? this.binding.drafts?.[key] : this.binding.orphanDraft;
+    return typeof draft === "string" ? draft : "";
+  }
+
+  #storeDraft(identity: string, text: string): void {
+    const drafts = this.binding.drafts ?? (this.binding.drafts = {});
+    if (text) drafts[identity] = text;
+    else {
+      delete drafts[identity];
+      delete this.binding.draftFiles?.[identity];
+      if (this.binding.draftFiles && Object.keys(this.binding.draftFiles).length === 0) delete this.binding.draftFiles;
+    }
+    if (Object.keys(drafts).length === 0) delete this.binding.drafts;
+  }
+
+  #storeCurrentDraft(text: string): void {
+    const identity = this.#draftIdentity(this.binding.sessionFile);
+    if (identity) this.#storeDraft(identity, text);
+    else if (text) this.binding.orphanDraft = text;
+    else delete this.binding.orphanDraft;
+  }
+
+  #updateComposer(): void {
+    const cold = !this.binding.runtimeId && Boolean(this.binding.sessionFile || this.binding.cwd);
+    this.#composer.hidden = !cold;
+    this.#draftInput.placeholder = this.binding.sessionFile
+      ? "Write a message. Submit to load this saved session."
+      : "Write a message. Submit to start this session.";
+    this.#draftInput.disabled = this.#submitting;
+    this.#submitButton.disabled = this.#submitting || !this.#draftInput.value.trim();
+  }
+
+  #sendOrStageInput(data: string, files?: readonly FileReference[]): boolean {
+    if (this.binding.runtimeId) return this.#sendInput(data);
+    if (!this.binding.sessionFile && !this.binding.cwd) {
+      const cwd = sidebarActiveWorkspace() ?? defaultCwd;
+      if (!cwd) return false;
+      const next = { ...this.binding, cwd };
+      delete next.keepEmpty;
+      this.bind(next);
+    }
+    if ((!this.binding.sessionFile && !this.binding.cwd) || this.#submitting) return false;
+    const value = this.#draftInput.value;
+    const focused = document.activeElement === this.#draftInput;
+    const start = focused ? this.#draftInput.selectionStart : value.length;
+    const end = focused ? this.#draftInput.selectionEnd : value.length;
+    const before = value.slice(0, start);
+    const separator = before && !/\s$/.test(before) && !/^\s/.test(data) ? " " : "";
+    this.#draftInput.setRangeText(`${separator}${data}`, start, end, "end");
+    if (files?.length) {
+      const identity = this.#draftIdentity(this.binding.sessionFile);
+      if (identity) {
+        const byDraft = this.binding.draftFiles ?? (this.binding.draftFiles = {});
+        const refs = byDraft[identity] ?? (byDraft[identity] = []);
+        for (const file of files) refs.push(file);
+      }
+    }
+    this.#draftInput.dispatchEvent(new Event("input", { bubbles: true }));
+    return true;
+  }
+
+  #sendInput(data: string): boolean {
+    const socket = this.ws;
+    if (socket?.readyState !== WebSocket.OPEN || !this.binding.runtimeId) return false;
+    try {
+      for (const chunk of splitInputChunks(data)) {
+        const id = `i${++this.#inputSequence}`;
+        this.#pendingInputs.set(id, { data: chunk, sessionFile: this.binding.sessionFile });
+        socket.send(JSON.stringify({ type: "input", id, data: chunk }));
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  #preservePendingInput(sessionFile: string | null): void {
+    if (!sessionFile) return;
+    const chunks: string[] = [];
+    for (const [id, input] of this.#pendingInputs) {
+      if (input.sessionFile !== sessionFile) continue;
+      chunks.push(input.data);
+      this.#pendingInputs.delete(id);
+    }
+    const recovered = draftableTerminalInput(chunks.join(""));
+    if (!recovered) return;
+    this.#storeDraft(sessionFile, `${this.#draftFor(sessionFile)}${recovered}`);
+    this.#draftInput.value = this.#draftFor(sessionFile);
+    save();
+  }
+
+  #preservePendingInputs(): void {
+    const sessionFiles = new Set(
+      [...this.#pendingInputs.values()]
+        .map((input) => input.sessionFile)
+        .filter((path): path is string => path !== null),
+    );
+    for (const sessionFile of sessionFiles) this.#preservePendingInput(sessionFile);
+    const unknown: string[] = [];
+    for (const [id, input] of this.#pendingInputs) {
+      if (input.sessionFile !== null) continue;
+      unknown.push(input.data);
+      this.#pendingInputs.delete(id);
+    }
+    const recovered = draftableTerminalInput(unknown.join(""));
+    if (recovered) {
+      const identity = this.#draftIdentity(this.binding.sessionFile);
+      if (identity) this.#storeDraft(identity, `${this.#draftFor(this.binding.sessionFile)}${recovered}`);
+      else this.binding.orphanDraft = `${this.binding.orphanDraft ?? ""}${recovered}`;
+      save();
+    }
+  }
+
+  /** Keep close-raced terminal input visible in the surviving pane, never resend it. */
+  preservePendingForClose(): void {
+    const recovered = draftableTerminalInput(
+      [...this.#pendingInputs.values()].map((input) => input.data).join(""),
+    );
+    this.#pendingInputs.clear();
+    if (recovered) this.binding.orphanDraft = `${this.binding.orphanDraft ?? ""}${recovered}`;
+  }
+
+  #associateUnknownInputs(sessionFile: string): void {
+    for (const input of this.#pendingInputs.values()) {
+      if (!input.sessionFile) input.sessionFile = sessionFile;
+    }
+  }
+
+  async #submitColdDraft(): Promise<void> {
+    const path = this.binding.sessionFile;
+    const cwd = path ? sessionSummary(path)?.cwd ?? this.binding.cwd : this.binding.cwd;
+    const text = this.#draftInput.value;
+    if ((!path && !cwd) || this.binding.runtimeId || this.#submitting || !text.trim()) return;
+    const binding = this.binding;
+    const generation = daemonId;
+    const identity = this.#draftIdentity(path, cwd);
+    if (!identity) return;
+    const paths = new Set<string>();
+    for (const file of this.binding.draftFiles?.[identity] ?? []) {
+      if (text.includes(file.text)) paths.add(file.path);
+    }
+    const submission = { text };
+    const isCurrent = () =>
+      panes.get(this.id) === this && this.#draftIdentity(this.binding.sessionFile) === identity &&
+      !this.binding.runtimeId && daemonId === generation;
+    this.#submissions.set(identity, submission);
+    if (this.#historyLoading) this.#cancelColdHistory();
+    this.#composerStatus.textContent = "Sending request…";
+    this.#updateComposer();
+    try {
+      const res = await fetch("/api/sessions/request", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          ...(path ? { path } : {}),
+          ...(cwd ? { cwd } : {}),
+          text,
+          ...(paths.size ? { files: [...paths] } : {}),
+          cols: this.term.cols,
+          rows: this.term.rows,
+        }),
+      });
+      if (!res.ok) {
+        const message = (await res.text().catch(() => "")).trim() ||
+          `The session request failed (HTTP ${res.status}).`;
+        if (isCurrent()) this.#composerStatus.textContent = message;
+        return;
+      }
+      const runtime = parseRuntimeOne(await res.json().catch(() => null));
+      if (!runtime) {
+        if (isCurrent()) this.#composerStatus.textContent = "The daemon returned an invalid session response.";
+        return;
+      }
+      if (path && runtime.sessionFile && runtime.sessionFile !== path) {
+        if (isCurrent()) this.#composerStatus.textContent = "The daemon attached a different saved session.";
+        return;
+      }
+      if (this.binding.drafts?.[identity] === text) this.#storeDraft(identity, "");
+      const current = isCurrent();
+      if (current && this.#draftInput.value === text) this.#draftInput.value = "";
+      save();
+      if (daemonId === generation) {
+        runtimes = [...runtimes.filter((candidate) => candidate.id !== runtime.id), runtime];
+        renderSidebar();
+      }
+      if (!current) return;
+      if (path) runtime.sessionFile = path;
+      this.#composerStatus.textContent = "";
+      const next = bindingForRuntime(runtime, binding.title ?? displayTitle(runtime));
+      next.cwd = runtime.cwd || cwd;
+      next.drafts = this.binding.drafts;
+      this.bind(next);
+    } catch {
+      if (isCurrent()) this.#composerStatus.textContent = "The daemon could not be reached; your draft is still here.";
+    } finally {
+      if (this.#submissions.get(identity) === submission) this.#submissions.delete(identity);
+      this.#updateComposer();
+      if (isCurrent() && !this.binding.runtimeId) this.renderPlaceholder();
+    }
+  }
+
+  #ensureColdHistory(): void {
+    const sessionFile = this.binding.sessionFile;
+    if (!sessionFile || this.binding.runtimeId || !this.visible || this.#submitting) return;
+    const cols = Math.max(1, this.term.cols);
+    const rows = Math.max(1, this.term.rows);
+    const key = `${daemonId ?? ""}\u0000${sessionFile}\u0000${cols}x${rows}`;
+    if (this.#historyKey === key) return;
+    this.#historyController?.abort();
+    const controller = new AbortController();
+    this.#historyController = controller;
+    this.#historyKey = key;
+    this.#historyReady = false;
+    this.#historyError = null;
+    this.#historyLoading = true;
+    this.#replaying = true;
+    this.term.reset();
+    // Piped renderer output has LF endings, without a PTY's CR translation.
+    this.term.options.convertEol = true;
+    this.#placeholderKey = "";
+    this.renderPlaceholder();
+    const query = new URLSearchParams({ path: sessionFile, cols: String(cols), rows: String(rows) });
+    void this.#readColdHistory(sessionFile, key, controller, query);
+  }
+
+  async #readColdHistory(
+    sessionFile: string,
+    key: string,
+    controller: AbortController,
+    query: URLSearchParams,
+  ): Promise<void> {
+    const current = () =>
+      this.#historyController === controller &&
+      this.#historyKey === key &&
+      this.binding.sessionFile === sessionFile &&
+      this.binding.runtimeId === null &&
+      panes.get(this.id) === this;
+    let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+    try {
+      const response = await fetch(`/api/sessions/history?${query}`, { signal: controller.signal, cache: "no-store" });
+      if (!response.ok) throw new Error(`Saved history is unavailable (HTTP ${response.status}).`);
+      if (!response.body) throw new Error("The daemon returned no saved history.");
+      reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!current()) return;
+        const output = decoder.decode(value, { stream: true });
+        if (output) {
+          const parsed = Promise.withResolvers<void>();
+          this.term.write(output, parsed.resolve);
+          await parsed.promise;
+        }
+      }
+      const finalOutput = decoder.decode();
+      if (finalOutput) {
+        const parsed = Promise.withResolvers<void>();
+        this.term.write(finalOutput, parsed.resolve);
+        await parsed.promise;
+      }
+      if (!current()) return;
+      this.#historyLoading = false;
+      this.#historyReady = true;
+      this.#historyError = null;
+      this.#replaying = false;
+      this.#fitGrid();
+      this.term.scrollToBottom();
+      this.#placeholderKey = "";
+      this.renderPlaceholder();
+      this.#ensureColdHistory();
+    } catch (error) {
+      if (!current() || controller.signal.aborted) return;
+      this.term.reset();
+      this.#historyLoading = false;
+      this.#historyReady = false;
+      this.#historyError = error instanceof Error ? error.message : "Saved history is unavailable.";
+      this.#replaying = false;
+      this.#placeholderKey = "";
+      this.renderPlaceholder();
+    } finally {
+      await reader?.cancel().catch(() => undefined);
+      if (this.#historyController === controller && controller.signal.aborted) {
+        this.#historyLoading = false;
+        this.#replaying = false;
+      }
+    }
+  }
+
+  #cancelColdHistory(): void {
+    this.#historyController?.abort();
+    this.#historyController = null;
+    this.#historyKey = "";
+    this.#historyReady = false;
+    this.#historyError = null;
+    this.#historyLoading = false;
+    this.#replaying = false;
+  }
+
+  #retryColdHistory(): void {
+    this.#historyKey = "";
+    this.#ensureColdHistory();
+  }
+
   #syncJumpLatest(): void {
     const buffer = this.term.buffer.active;
-    const hidden = !this.binding.runtimeId ||
+    const hidden = (!this.binding.runtimeId && !this.binding.sessionFile) ||
       buffer.type !== "normal" || buffer.baseY - buffer.viewportY < this.term.rows;
     if (this.#jumpLatest.hidden !== hidden) this.#jumpLatest.hidden = hidden;
   }
@@ -973,14 +1312,17 @@ class Pane {
       setStatus("image paste failed", "warn");
       return;
     }
-    const socket = this.ws;
-    if (socket?.readyState !== WebSocket.OPEN) {
-      setStatus("image saved, but this pane has no live session", "warn");
+    if (!this.#sendOrStageInput(`${path} `, [{ path, text: path }])) {
+      setStatus("image saved, but could not add its path to this pane", "warn");
       return;
     }
-    socket.send(JSON.stringify({ type: "input", data: `${path} ` }));
-    setStatus("image path typed", "ok");
-    this.term.focus();
+    if (this.binding.runtimeId) {
+      setStatus("image path typed", "ok");
+      this.term.focus();
+    } else {
+      setStatus("image path added to the draft", "ok");
+      this.#draftInput.focus();
+    }
   }
 
   #wireDrop(): void {
@@ -995,7 +1337,7 @@ class Pane {
     });
   }
 
-  focus(): void {
+  focus(terminal = false): void {
     const owner = spaceForPane(this.id);
     if (owner && owner.id !== activeSpaceId) switchSpace(owner.id);
     const acknowledged = acknowledgeCompletion(this.binding.runtimeId);
@@ -1008,7 +1350,11 @@ class Pane {
       expandedPaneId = this.id;
       renderLayout(true);
     }
-    this.term.focus();
+    if (!terminal && !this.binding.runtimeId && (this.binding.sessionFile || this.binding.cwd)) {
+      this.#draftInput.focus();
+    } else {
+      this.term.focus();
+    }
   }
 
   #scheduleFit(): void {
@@ -1021,6 +1367,7 @@ class Pane {
     if (!this.visible || this.#replaying) return;
     this.#fitGrid();
     this.sendResize();
+    if (!this.binding.runtimeId && this.binding.sessionFile) this.#ensureColdHistory();
   }
 
   /** Marks a pane tree move that may discard the renderer's pixels. */
@@ -1035,6 +1382,7 @@ class Pane {
     // Another view of this runtime may have changed the PTY's geometry while
     // this space was hidden. Reassert it even if our own grid did not change.
     this.sendResize(true);
+    if (!this.binding.runtimeId && this.binding.sessionFile) this.#ensureColdHistory();
     if (this.#needsRepaint) {
       // The DOM/GPU renderer can lose its pixels when the pane tree is moved,
       // but a live replay on an attached pane already paints its own writes.
@@ -1067,15 +1415,22 @@ class Pane {
     this.ws.send(JSON.stringify({ type: "resize", cols: this.term.cols, rows: this.term.rows }));
   }
 
-  bind(binding: PaneBinding): void {
+  bind(binding: PaneBinding, mergePreviousRecovery = true): void {
     this.#finishTitleEdit(false);
-    const changed = this.binding.runtimeId !== binding.runtimeId;
-    if (changed || !binding.runtimeId) this.detach();
+    const previous = this.binding;
+    const identityChanged = previous.sessionFile !== binding.sessionFile ||
+      (!binding.sessionFile && previous.cwd !== binding.cwd);
+    const runtimeChanged = previous.runtimeId !== binding.runtimeId;
+    if (runtimeChanged && previous.runtimeId) this.#preservePendingInputs();
+    if (mergePreviousRecovery) binding = rebindPaneBinding(previous, binding);
+    if (runtimeChanged || !binding.runtimeId) this.detach();
+    if (identityChanged || (binding.runtimeId && !previous.runtimeId)) this.#cancelColdHistory();
     this.binding = binding;
-    this.#notice = null;
+    if (identityChanged || runtimeChanged) this.#draftInput.value = this.#draftFor(binding.sessionFile);
+    this.#composerStatus.textContent = "";
     acknowledgeCompletion(binding.runtimeId);
+    if (!binding.runtimeId && !binding.sessionFile) this.term.reset();
     this.renderPlaceholder();
-    // Selecting the current session must not replay it or add another stream.
     if (binding.runtimeId && !this.ws) this.attach();
     this.renderHeader();
     save();
@@ -1110,6 +1465,7 @@ class Pane {
     // A pane owns one stream. Rebinding must stop its previous subscription
     // before replacing the socket that detach() knows how to close.
     this.detach();
+    this.term.options.convertEol = false;
     const runtime = runtimes.find((candidate) => candidate.id === runtimeId);
     if (!runtime) {
       this.runtimeGone();
@@ -1137,13 +1493,10 @@ class Pane {
     socket.onopen = () => {
       if (this.ws !== socket) return;
       this.term.reset();
-      // The daemon may not have sniffed the session file yet (or ever, for a
-      // session started this instant); keep a known transcript identity instead
-      // of overwriting it with null.
-      if (runtime.sessionFile) this.binding.sessionFile = runtime.sessionFile;
-      // Attached means live under the daemon that answered this open.
-      this.binding.autoResume = true;
-      this.binding.daemonGeneration = daemonId;
+      if (runtime.sessionFile) {
+        this.binding.sessionFile = runtime.sessionFile;
+        this.#associateUnknownInputs(runtime.sessionFile);
+      }
       if (layout.focused === this.id && this.visible) this.term.focus();
       save();
     };
@@ -1194,98 +1547,64 @@ class Pane {
 
   #handleControl(msg: ServerMessage | null): void {
     if (!msg) return;
+    if (msg.type === "inputAck") {
+      this.#pendingInputs.delete(msg.id);
+      return;
+    }
     if (msg.type === "hello") {
       this.binding.title = displayTitle(msg.runtime);
-      // Same rule as onopen: an unknown file must not erase the one the pane
-      // already holds, or a resume would lose its transcript identity until the
-      // next sniff.
-      if (msg.runtime.sessionFile) this.binding.sessionFile = msg.runtime.sessionFile;
+      if (msg.runtime.sessionFile) {
+        this.binding.sessionFile = msg.runtime.sessionFile;
+        this.#associateUnknownInputs(msg.runtime.sessionFile);
+      }
       this.renderHeader();
       renderSidebar();
-      // Persist the sniffed session file: it is the identity auto-resume and the
-      // placeholder's manual resume both need.
       save();
     } else if (msg.type === "exit") {
       this.#finishStartup();
-      this.#stateEl.textContent = `exited ${msg.exitCode ?? "?"}`;
-      // A process that ended is finished, not restarted; only a daemon-wide
-      // shutdown defers the pane's claim to be live to the next daemon start.
-      const next = intentAfterExit(this.binding, msg.daemonShutdown);
-      if (next !== this.binding.autoResume) {
-        this.binding.autoResume = next;
-        save();
-      }
+      this.runtimeGone();
     }
   }
 
   runtimeGone(): void {
+    this.#preservePendingInputs();
     this.detach();
-    // Drop the id but keep the title/session file: the placeholder then offers
-    // "resume this session" instead of a frozen screen with no way back.
     this.binding.runtimeId = null;
-    // Keep the resume claim only when the runtime may have died with its daemon;
-    // a loss under the same daemon (kill button, another client, omp exiting) is
-    // final, and a pane without a transcript has nothing to reopen.
-    this.binding.autoResume = intentAfterRuntimeLoss(this.binding, { up: daemonUp, generation: daemonId });
-    this.#stateEl.textContent = "exited";
+    this.#stateEl.textContent = this.binding.sessionFile ? "saved" : "exited";
+    this.#draftInput.value = this.#draftFor(this.binding.sessionFile);
     this.renderHeader();
     this.renderPlaceholder();
     save();
   }
 
-  /** The user stopped this pane's session: never resume it on a later start. */
-  clearLiveIntent(): void {
-    if (!this.binding.autoResume) return;
-    this.binding.autoResume = false;
-    save();
-  }
-
   syncFromRuntimes(): void {
-    // An unreplied refresh means the daemon is unreachable, not that every
-    // runtime is gone: never clear a binding from missing data.
+    if (this.#submitting && !this.binding.runtimeId) return;
     if (!daemonUp) {
       this.renderPlaceholder();
       return;
     }
-    const runtimeId = this.binding.runtimeId;
-    if (!runtimeId) {
-      this.renderPlaceholder();
-      return;
-    }
-    const runtime = runtimes.find((candidate) => candidate.id === runtimeId);
-    if (!runtime) {
-      // Gone for good: stopped under this daemon or lost with it. runtimeGone()
-      // decides whether the pane keeps its resume claim.
-      this.runtimeGone();
-      this.renderPlaceholder();
-      return;
-    }
-    if (!attachable(runtime)) {
-      // An exited process is final: attaching would start the session again.
-      // A reserved runtime (never attached, `alive:false` until the daemon
-      // spawns it) is attachable and must not be mistaken for a dead one.
-      // A socket that watched the exit keeps the frozen "exited" screen; a
-      // fresh page falls back to the placeholder (and its manual resume).
-      if (!this.ws) this.runtimeGone();
-      this.renderPlaceholder();
-      return;
-    }
-    // The runtime is authoritative about which transcript it is writing. If omp
-    // switched sessions in the TUI after this binding was saved, adopt the
-    // transcript it is actually on; a matching runtime id is the same process,
-    // not a reused name.
-    this.#stateEl.textContent = "";
-    const title = displayTitle(runtime);
-    const adoptFile = runtime.sessionFile && runtime.sessionFile !== this.binding.sessionFile
-      ? runtime.sessionFile
+    const current = this.binding.runtimeId
+      ? runtimes.find((candidate) => candidate.id === this.binding.runtimeId) ?? null
       : null;
-    if (adoptFile) this.binding.sessionFile = adoptFile;
-    if (title !== this.binding.title || adoptFile || this.binding.daemonGeneration !== daemonId || !this.binding.autoResume) {
-      this.binding.title = title;
-      this.binding.autoResume = true;
-      this.binding.daemonGeneration = daemonId;
-      this.renderHeader();
-      save();
+    const runtime = current && attachable(current)
+      ? current
+      : runtimeForSession(this.binding.sessionFile, runtimes);
+    if (!runtime) {
+      if (this.binding.runtimeId) this.runtimeGone();
+      else this.renderPlaceholder();
+      return;
+    }
+    if (runtime.id !== this.binding.runtimeId) {
+      this.bind(bindingForRuntime(runtime, displayTitle(runtime)));
+      return;
+    }
+    const title = displayTitle(runtime);
+    const sessionFile = runtime.sessionFile ?? this.binding.sessionFile;
+    if (title !== this.binding.title || sessionFile !== this.binding.sessionFile || runtime.cwd !== this.binding.cwd) {
+      const next = bindingForRuntime(runtime, title);
+      next.sessionFile = sessionFile;
+      next.drafts = this.binding.drafts;
+      this.bind(next);
     }
     if (!this.ws && this.retry !== Number.POSITIVE_INFINITY) this.attach();
     this.renderPlaceholder();
@@ -1319,7 +1638,7 @@ class Pane {
   renderHeader(): void {
     const sessionFile = this.binding.sessionFile ?? "";
     const session = sessionFile ? sessionSummary(sessionFile) ?? null : null;
-    const title = this.binding.title ?? "no session";
+    const title = this.binding.title ?? (this.binding.cwd ? "New session" : "no session");
     syncPinButton(this.#pin, session);
     if (!this.#editingTitle && this.#titleEl.value !== title) this.#titleEl.value = title;
     this.#titleEl.style.width = `${Math.max(2, this.#titleEl.value.length + 2)}ch`;
@@ -1329,69 +1648,76 @@ class Pane {
   }
 
   renderPlaceholder(): void {
+    const orphanDraft = this.binding.orphanDraft ?? "";
+    this.#orphanReview.hidden = !orphanDraft;
+    this.#orphanText.textContent = orphanDraft;
     const bound = Boolean(this.binding.runtimeId);
-    const display = bound ? "none" : "flex";
-    if (this.#placeholder.style.display !== display) this.#placeholder.style.display = display;
-    const hostDisplay = bound ? "" : "none";
+    const sessionFile = this.binding.sessionFile;
+    const coldSaved = !bound && Boolean(sessionFile);
+    const coldNew = !bound && !sessionFile && Boolean(this.binding.cwd);
+    const cold = coldSaved || coldNew;
+    const hostDisplay = bound || cold ? "" : "none";
     if (this.#host.style.display !== hostDisplay) this.#host.style.display = hostDisplay;
+    this.#updateComposer();
+    if (coldSaved) {
+      if (this.visible && !this.#replaying) this.#fitGrid();
+      this.#ensureColdHistory();
+    }
+    const historyReady = coldSaved && this.#historyReady;
+    const placeholderDisplay = bound || coldNew || historyReady ? "none" : "flex";
+    if (this.#placeholder.style.display !== placeholderDisplay) this.#placeholder.style.display = placeholderDisplay;
+    this.#placeholder.classList.toggle("pane-placeholder-cold", coldSaved && !historyReady);
     this.#syncJumpLatest();
     if (bound) {
       this.#placeholderKey = "bound";
       return;
     }
+    if (coldNew) {
+      this.#placeholderKey = "new-session";
+      this.#stateEl.textContent = "draft";
+      return;
+    }
+    if (historyReady) {
+      this.#placeholderKey = "history-ready";
+      this.#stateEl.textContent = "saved";
+      return;
+    }
     const title = this.binding.title;
-    const sessionFile = this.binding.sessionFile;
-    const known = sessionFile ? sessionSummary(sessionFile) : undefined;
-    const key = JSON.stringify([title, this.#notice, sessionFile, known?.cwd ?? ""]);
+    const key = JSON.stringify([
+      title,
+      this.binding.orphanDraft ?? "",
+      this.#historyLoading,
+      this.#historyError,
+      sessionFile,
+    ]);
     if (this.#placeholderKey === key) return;
     this.#placeholderKey = key;
     this.#placeholder.replaceChildren();
     const text = document.createElement("div");
-    text.textContent = title
-      ? `${title} — not running`
-      : "empty pane — choose a session from the sidebar or start one";
+    text.textContent = coldSaved
+      ? this.#historyError ?? "Loading saved history…"
+      : title
+        ? `${title} — not running`
+        : this.binding.orphanDraft
+          ? "Unconfirmed terminal input was retained, but this runtime has no saved transcript."
+          : "empty pane — choose a session from the sidebar or start one";
     this.#placeholder.append(text);
-    if (this.#notice) {
-      // The daemon's own words (e.g. the pool is full and where to change the
-      // limit), kept next to the buttons that can retry it.
-      const notice = document.createElement("div");
-      notice.className = "pane-notice";
-      notice.textContent = this.#notice;
-      this.#placeholder.append(notice);
+    if (this.#historyError && coldSaved) {
+      const retry = document.createElement("button");
+      retry.textContent = "retry history read";
+      retry.addEventListener("click", () => this.#retryColdHistory());
+      this.#placeholder.append(retry);
     }
-    const row = document.createElement("div");
-    row.style.display = "flex";
-    row.style.gap = "8px";
-    if (sessionFile) {
-      // Pins keep older transcripts reachable, so they carry the fallback cwd too;
-      // the daemon resolves the recorded cwd itself when the file has one.
-      const resume = document.createElement("button");
-      resume.textContent = "resume this session";
-      resume.addEventListener("click", () =>
-        void openSession(this, {
-          path: sessionFile,
-          cwd: known?.cwd ?? "",
-          title: this.binding.title ?? "session",
-        }),
-      );
-      row.append(resume);
+    if (!coldSaved) {
+      const row = document.createElement("div");
+      row.style.display = "flex";
+      row.style.gap = "8px";
+      const start = document.createElement("button");
+      start.textContent = "new session here";
+      start.addEventListener("click", () => newSession(this));
+      row.append(start);
+      this.#placeholder.append(row);
     }
-    const start = document.createElement("button");
-    start.textContent = "new session here";
-    start.addEventListener("click", () => void newSession(this));
-    row.append(start);
-    this.#placeholder.append(row);
-  }
-
-  /**
-   * Record why starting or resuming a session in this pane failed, so the reason
-   * (e.g. the pool is full) survives the next status-chip refresh. Only the
-   * placeholder can show it; a bound pane reports through the status chip.
-   */
-  showStartFailure(text: string): void {
-    if (this.binding.runtimeId) return;
-    this.#notice = text;
-    this.renderPlaceholder();
   }
 
   destroy(): void {
@@ -1399,6 +1725,9 @@ class Pane {
     this.#observer.disconnect();
     this.#disposeFileDrop?.();
     this.#disposeFileDrop = null;
+    window.clearTimeout(this.#resizeTimer);
+    window.clearTimeout(this.#draftSaveTimer);
+    this.#cancelColdHistory();
     this.detach();
     this.term.dispose();
     this.el.remove();
@@ -1531,6 +1860,16 @@ function closePane(paneId: string): void {
     return;
   }
   const removed = ids.length === 4 && alreadyClosed ? [alreadyClosed, paneId] : [paneId];
+  const survivorId = ids.find((id) => !removed.includes(id));
+  const survivor = survivorId ? panes.get(survivorId) : null;
+  if (survivor) {
+    for (const id of removed) {
+      const closing = panes.get(id);
+      if (!closing) continue;
+      closing.preservePendingForClose();
+      survivor.bind(rebindPaneBinding(closing.binding, survivor.binding));
+    }
+  }
   for (const id of removed) {
     const remaining = removeLeaf(layout.tree, id);
     if (!remaining) return;
@@ -1676,17 +2015,52 @@ function closeSpace(id: string): void {
   if (!stored) return;
   const order = [...spaces.keys()];
   const index = order.indexOf(id);
+  const closingPanes = leaves(stored.tree).map((paneId) => panes.get(paneId)).filter((pane): pane is Pane => pane !== undefined);
   closePaneMenu();
-  for (const paneId of leaves(stored.tree)) {
-    panes.get(paneId)?.destroy();
-    panes.delete(paneId);
+
+  const closingLastSpace = spaces.size === 1;
+  let recoveryTarget: Pane | null = null;
+  for (const pane of closingPanes) pane.preservePendingForClose();
+  if (closingLastSpace) {
+    // Capture ACK-raced bytes before createSpace saves any workspace snapshot.
+    createSpace();
+    recoveryTarget = focusedPane();
+    if (recoveryTarget) {
+      recoveryTarget.binding.keepEmpty = true;
+      const coldDraftSource = closingPanes.find((pane) => {
+        const binding = pane.binding;
+        if (binding.runtimeId) return false;
+        const identity = binding.sessionFile ?? (binding.cwd ? `new:${binding.cwd}` : null);
+        if (!identity) return false;
+        return Boolean(binding.drafts?.[identity] || binding.draftFiles?.[identity]?.length);
+      });
+      if (coldDraftSource) {
+        recoveryTarget.binding.cwd = coldDraftSource.binding.cwd;
+        recoveryTarget.binding.sessionFile = coldDraftSource.binding.sessionFile;
+        recoveryTarget.binding.title = coldDraftSource.binding.title;
+      }
+    }
+  } else {
+    const destinationId = activeSpaceId === id
+      ? order.filter((spaceId) => spaceId !== id)[Math.min(index, spaces.size - 2)]
+      : activeSpaceId;
+    const destination = destinationId ? spaces.get(destinationId) : undefined;
+    const targetPaneId = destination?.focused && leaves(destination.tree).includes(destination.focused)
+      ? destination.focused
+      : destination ? leaves(destination.tree)[0] : undefined;
+    recoveryTarget = targetPaneId ? panes.get(targetPaneId) ?? null : null;
+  }
+
+  for (const closing of closingPanes) {
+    if (recoveryTarget && closing !== recoveryTarget) {
+      recoveryTarget.bind(rebindPaneBinding(closing.binding, recoveryTarget.binding));
+    }
+  }
+  for (const closing of closingPanes) {
+    closing.destroy();
+    panes.delete(closing.id);
   }
   spaces.delete(id);
-  if (spaces.size === 0) {
-    createSpace();
-    focusedPane()?.bind({ ...emptyBinding(), keepEmpty: true });
-    return;
-  }
   if (activeSpaceId === id) {
     const remaining = [...spaces.keys()];
     activeSpaceId = remaining[Math.min(index, remaining.length - 1)];
@@ -1780,7 +2154,7 @@ function handleSpaceDrop(spaceId: string, payload: Record<string, unknown>): voi
     switchSpace(spaceId);
     const pane = focusedPane();
     if (pane) {
-      pane.bind(bindingForRuntime(runtime, daemonId, displayTitle(runtime)));
+      pane.bind(bindingForRuntime(runtime, displayTitle(runtime)));
       pane.focus();
     }
     return;
@@ -1814,8 +2188,8 @@ function swapPanes(aId: string, bId: string): void {
   const b = panes.get(bId);
   if (!a || !b) return;
   const binding = a.binding;
-  a.bind(b.binding);
-  b.bind(binding);
+  a.bind(b.binding, false);
+  b.bind(binding, false);
 }
 
 function togglePaneFocus(): void {
@@ -1955,6 +2329,8 @@ function syncPinButton(button: HTMLButtonElement, session: SessionSummaryLike | 
 function createSidebarRow(kind: "runtime" | "session"): SidebarRowRecord {
   const element = document.createElement("div");
   const name = document.createElement("span");
+  element.tabIndex = 0;
+  element.setAttribute("role", "button");
   name.className = "name";
   const sub = document.createElement("span");
   sub.className = "sub";
@@ -1996,11 +2372,18 @@ function createSidebarRow(kind: "runtime" | "session"): SidebarRowRecord {
   element.addEventListener("click", () => {
     const pane = focusedPane();
     if (!pane) return;
+    const cwd = record.element.dataset.cwd;
+    if (cwd) selectSidebarWorkspace(cwd);
     if (record.runtime) {
-      pane.bind(bindingForRuntime(record.runtime, daemonId, displayTitle(record.runtime)));
+      pane.bind(bindingForRuntime(record.runtime, displayTitle(record.runtime)));
     } else if (record.session) {
       void openSession(pane, record.session);
     }
+  });
+  element.addEventListener("keydown", (event) => {
+    if (event.target !== element || (event.key !== "Enter" && event.key !== " ")) return;
+    event.preventDefault();
+    element.click();
   });
   wireSessionDrag(element, () => record.dragPayload);
   return record;
@@ -2039,14 +2422,24 @@ function updateRuntimeSidebarRow(
   title: string,
   cwd: string,
   snapshot: SessionSummaryLike | null,
+  workspaceView: boolean,
 ): void {
+  if (workspaceView && (title === cwd || title === cwd.replace(/^\/home\/[^/]+/, "~") || title === runtime.id)) {
+    title = "New session";
+  }
   record.runtime = runtime;
   record.session = null;
   record.snapshot = snapshot;
-  const className = runtime.alive ? "row live loaded" : "row recent loaded";
+  const className = runtime.alive ? "row live" : "row recent";
   if (record.element.className !== className) record.element.className = className;
-  if (record.element.dataset.cwd !== cwd) record.element.dataset.cwd = cwd;
-  const rowTitle = `${cwd}\n${runtime.sessionFile ?? "(session file not known yet)"}\n${runtime.id}`;
+  record.element.dataset.runtimeId = runtime.id;
+  record.element.dataset.sessionFile = runtime.sessionFile ?? "";
+  const workspace = normalizeDirectoryPath(cwd) ?? cwd;
+  if (record.element.dataset.cwd !== workspace) record.element.dataset.cwd = workspace;
+  const state = !daemonUp ? "Connection unavailable" : !attachable(runtime) ? "Saved · loads on request"
+    : runtime.presentation?.agentActive ? "Working" : runtime.alive ? "Running" : "Starting";
+  record.element.dataset.state = state;
+  const rowTitle = `${title}\n${state}\n${cwd}\n${runtime.sessionFile ?? "(session file not known yet)"}`;
   if (record.element.title !== rowTitle) record.element.title = rowTitle;
   const accent = runtimeAccent(runtime);
   if (record.element.style.getPropertyValue("--row-accent") !== accent) {
@@ -2062,7 +2455,7 @@ function updateRuntimeSidebarRow(
         : "none"
     : "none";
   updateSidebarRowName(record, title, indicator);
-  const sub = cwd.replace(/^\/home\/[^/]+/, "~") || "/";
+  const sub = workspaceView ? "" : cwd.replace(/^\/home\/[^/]+/, "~") || "/";
   updateSidebarRowSub(record, `runtime\u0000${sub}`, sub);
   record.dragPayload.runtimeId = runtime.id;
   syncPinButton(record.pin, record.snapshot);
@@ -2071,16 +2464,22 @@ function updateRuntimeSidebarRow(
 function updateRecentSidebarRow(
   record: SidebarRowRecord,
   session: SessionSummaryLike,
+  workspaceView: boolean,
 ): void {
   record.runtime = null;
   record.session = session;
   record.snapshot = session;
   if (record.element.className !== "row recent") record.element.className = "row recent";
-  if (record.element.dataset.cwd !== session.cwd) record.element.dataset.cwd = session.cwd;
-  const rowTitle = `${session.cwd}\n${session.path}`;
+  delete record.element.dataset.runtimeId;
+  record.element.dataset.sessionFile = session.path;
+  const workspace = normalizeDirectoryPath(session.cwd) ?? session.cwd;
+  if (record.element.dataset.cwd !== workspace) record.element.dataset.cwd = workspace;
+  record.element.dataset.state = "Saved";
+  const rowTitle = `${session.title}\nSaved · loads on request\n${session.cwd}\n${session.path}`;
   if (record.element.title !== rowTitle) record.element.title = rowTitle;
-  updateSidebarRowName(record, session.title || session.cwd, "none");
-  const cwd = session.cwd.replace(/^\/home\/[^/]+/, "~") || "/";
+  const title = workspaceView && (!session.title || session.title === session.cwd) ? "New session" : session.title || session.cwd;
+  updateSidebarRowName(record, title, "none");
+  const cwd = workspaceView ? "" : session.cwd.replace(/^\/home\/[^/]+/, "~") || "/";
   updateSidebarRowSub(record, `session\u0000${cwd}`, cwd);
   record.dragPayload.path = session.path;
   record.dragPayload.cwd = session.cwd;
@@ -2116,15 +2515,31 @@ function folderRecord(cwd: string): SidebarFolderRecord {
   const label = document.createElement("span");
   label.className = "folder-label";
   heading.append(marker, label);
+  const add = document.createElement("button");
+  add.type = "button";
+  add.className = "workspace-new-session";
+  const name = cwd.split("/").filter(Boolean).pop() ?? cwd;
+  add.title = `New session in ${name}`;
+  add.setAttribute("aria-label", add.title);
+  add.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>';
+  add.addEventListener("click", () => {
+    selectSidebarWorkspace(cwd);
+    const pane = focusedPane();
+    if (pane) void newSession(pane, true, cwd);
+  });
+  const header = document.createElement("div");
+  header.className = "workspace-heading";
+  header.append(heading, add);
   const contents = document.createElement("div");
   contents.className = "folder-sessions";
   contents.id = `sidebar-folder-${++sidebarFolderSeq}`;
   heading.setAttribute("aria-controls", contents.id);
   heading.addEventListener("click", () => {
+    selectSidebarWorkspace(cwd);
     toggleSidebarFolder(cwd);
     heading.focus();
   });
-  element.append(heading, contents);
+  element.append(header, contents);
   const record = { element, heading, marker, label, contents };
   sidebarFolders.set(cwd, record);
   return record;
@@ -2132,9 +2547,12 @@ function folderRecord(cwd: string): SidebarFolderRecord {
 
 function updateFolder(record: SidebarFolderRecord, cwd: string): void {
   const expanded = sidebarFolderExpanded(cwd);
-  const marker = expanded ? "▾" : "▸";
-  if (record.marker.textContent !== marker) record.marker.textContent = marker;
-  const label = cwd.replace(/^\/home\/[^/]+/, "~") || "(unknown folder)";
+  const marker = expanded
+    ? '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M3 8V5h6l2 2h10v3M3 10h19l-3 10H2L3 10Z"/></svg>'
+    : '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M3 7V5h6l2 2h10v13H3V7Z"/></svg>';
+  if (record.marker.innerHTML !== marker) record.marker.innerHTML = marker;
+  record.heading.classList.toggle("active", cwd === sidebarActiveWorkspace());
+  const label = cwd.split("/").filter(Boolean).pop() ?? (cwd || "Ungrouped");
   if (record.label.textContent !== label) record.label.textContent = label;
   if (record.heading.getAttribute("aria-expanded") !== String(expanded)) {
     record.heading.setAttribute("aria-expanded", String(expanded));
@@ -2160,7 +2578,7 @@ function renderSidebar(): void {
   }
   const liveFiles = new Set<string>();
   for (const runtime of runtimes) {
-    if (runtime.sessionFile) liveFiles.add(runtime.sessionFile);
+    if (attachable(runtime) && runtime.sessionFile) liveFiles.add(runtime.sessionFile);
   }
   let pinsChanged = false;
   pinnedSessions = pinnedSessions.map((pin) => {
@@ -2179,7 +2597,11 @@ function renderSidebar(): void {
       return `${displayTitle(runtime)} ${summary?.cwd ?? runtime.cwd}`.toLowerCase().includes(query);
     })
     : runtimes;
-  const visibleRuntimes = liveRuntimes.filter((runtime) => !runtime.sessionFile || !archivedPaths.has(runtime.sessionFile));
+  // Exited transcripts belong to the same saved-session list, not a stale runtime row.
+  const visibleRuntimes = liveRuntimes.filter((runtime) =>
+    (attachable(runtime) || !runtime.sessionFile) &&
+    (!runtime.sessionFile || !archivedPaths.has(runtime.sessionFile))
+  );
   const candidates = new Map(pinnedSessions.map((session) => [session.path, session]));
   for (const session of sessions) candidates.set(session.path, session);
   const recent = [...candidates.values()].filter((session) =>
@@ -2205,7 +2627,7 @@ function renderSidebar(): void {
     const snapshot = runtime.sessionFile
       ? summary ?? pinnedSessions.find((entry) => entry.path === runtime.sessionFile) ?? null
       : null;
-    updateRuntimeSidebarRow(record, runtime, title, cwd, snapshot);
+    updateRuntimeSidebarRow(record, runtime, title, cwd, snapshot, folderView);
     loadedRows.push(record);
   }
   for (const session of recent) {
@@ -2213,7 +2635,7 @@ function renderSidebar(): void {
     activeKeys.add(key);
     const record = sidebarRows.get(key) ?? createSidebarRow("session");
     sidebarRows.set(key, record);
-    updateRecentSidebarRow(record, session);
+    updateRecentSidebarRow(record, session, folderView);
     (pinnedPaths.has(session.path) ? pinnedRows : otherRows).push(record);
   }
   for (const [key, record] of sidebarRows) {
@@ -2222,9 +2644,19 @@ function renderSidebar(): void {
     sidebarRows.delete(key);
   }
 
-  const rows = [...loadedRows, ...pinnedRows, ...otherRows];
+  // Runtime residency is an implementation detail: keep pinned chats first,
+  // then order running and saved chats together by conversation activity.
+  const rows = [...loadedRows, ...pinnedRows, ...otherRows].sort((a, b) => {
+    const aPath = a.runtime?.sessionFile ?? a.session?.path ?? "";
+    const bPath = b.runtime?.sessionFile ?? b.session?.path ?? "";
+    const pinOrder = Number(pinnedPaths.has(bPath)) - Number(pinnedPaths.has(aPath));
+    if (pinOrder) return pinOrder;
+    const aActivity = Date.parse(a.snapshot?.updatedAt ?? a.runtime?.startedAt ?? "") || 0;
+    const bActivity = Date.parse(b.snapshot?.updatedAt ?? b.runtime?.startedAt ?? "") || 0;
+    return bActivity - aActivity || aPath.localeCompare(bPath);
+  });
   const desiredTopLevel: HTMLElement[] = [];
-  if (rows.length === 0) {
+  if (rows.length === 0 && (!folderView || sidebarWorkspaces().length === 0 || query !== "")) {
     if (!sidebarEmpty) {
       sidebarEmpty = document.createElement("div");
       sidebarEmpty.className = "side-empty";
@@ -2235,6 +2667,7 @@ function renderSidebar(): void {
   }
 
   const rowsByFolder = new Map<string, SidebarRowRecord[]>();
+  for (const cwd of sidebarWorkspaces()) rowsByFolder.set(cwd, []);
   for (const row of rows) {
     const cwd = row.element.dataset.cwd ?? "";
     const folderRows = rowsByFolder.get(cwd) ?? [];
@@ -2243,16 +2676,18 @@ function renderSidebar(): void {
   }
   if (folderView) {
     for (const [cwd, folderRows] of rowsByFolder) {
+      if (query && folderRows.length === 0 && !cwd.toLowerCase().includes(query)) continue;
       const folder = folderRecord(cwd);
       updateFolder(folder, cwd);
       reconcileChildren(folder.contents, folderRows.map((row) => row.element));
       desiredTopLevel.push(folder.element);
     }
   } else {
+    const pinned = rows.filter((row) => pinnedPaths.has(row.runtime?.sessionFile ?? row.session?.path ?? ""));
+    const unpinned = rows.filter((row) => !pinnedPaths.has(row.runtime?.sessionFile ?? row.session?.path ?? ""));
     for (const [label, sectionRows] of [
-      ["Loaded", loadedRows],
-      ["Pinned", pinnedRows],
-      ["Recent", otherRows],
+      ["Pinned", pinned],
+      ["Sessions", unpinned],
     ] as const) {
       if (sectionRows.length === 0) continue;
       let heading = sidebarHeadings.get(label);
@@ -2268,7 +2703,7 @@ function renderSidebar(): void {
         sidebarHeadings.set(label, heading);
       }
       const expanded = !collapsedSidebarSections.has(label);
-      const text = `${expanded ? "▾" : "▸"} ${label === "Loaded" ? `${label} · ${sectionRows.length}` : label}`;
+      const text = `${expanded ? "▾" : "▸"} ${label} · ${sectionRows.length}`;
       if (heading.textContent !== text) heading.textContent = text;
       heading.setAttribute("aria-expanded", String(expanded));
       desiredTopLevel.push(heading);
@@ -2289,128 +2724,40 @@ function focusedPane(): Pane | null {
 }
 
 async function killRuntime(id: string): Promise<void> {
-  // An explicit stop: the pane keeps its transcript identity but must not be
-  // resumed by a later app start, even if the daemon restarts afterwards.
-  for (const pane of panes.values()) {
-    if (pane.binding.runtimeId === id) pane.clearLiveIntent();
-  }
   await getJson(`/api/runtimes/${encodeURIComponent(id)}`, { method: "DELETE" });
   await refreshRuntimes();
 }
 
-async function newSession(pane: Pane, focus = true): Promise<void> {
-  const binding = pane.binding;
-  const { runtime, error } = await requestRuntime({});
-  // A pending creation must not replace a newer selection or revive a closed pane.
-  if (panes.get(pane.id) !== pane || pane.binding !== binding) return;
-  if (!runtime) {
-    // Starting is where a full pool is felt, so leave the daemon's reason in the
-    // pane that asked, not only in the truncated status chip.
-    if (error) pane.showStartFailure(error);
-    return;
-  }
-  pane.bind(bindingForRuntime(runtime, daemonId, displayTitle(runtime)));
+function newSession(pane: Pane, focus = true, cwd = sidebarActiveWorkspace() ?? defaultCwd): void {
+  pane.bind({
+    runtimeId: null,
+    title: null,
+    sessionFile: null,
+    ...(cwd ? { cwd } : {}),
+  });
   if (focus) pane.focus();
 }
 
-/** Attach a saved session to a pane: reuse an attachable runtime for it if one exists, else resume. */
-async function openSession(pane: Pane, session: { path: string; cwd: string; title: string }): Promise<void> {
-  const live = runtimes.find((runtime) => attachable(runtime) && runtime.sessionFile === session.path);
-  if (live) {
-    pane.bind(bindingForRuntime(live, daemonId, session.title));
-    pane.focus();
-    return;
-  }
-  setStatus("resuming…", "idle");
-  const binding = pane.binding;
-  const { runtime, error } = await requestRuntime({ resume: session.path, cwd: session.cwd });
-  if (!runtime) {
-    if (error && panes.get(pane.id) === pane && pane.binding === binding) pane.showStartFailure(error);
-    return;
-  }
-  // Keep the requested transcript as the runtime's identity until omp sniffs
-  // its own: a second click must adopt this runtime, not spawn a sibling.
-  if (!runtime.sessionFile) runtime.sessionFile = session.path;
-  pane.bind(bindingForRuntime(runtime, daemonId, session.title));
+/** Bind a saved session read-only unless an attachable runtime already owns it. */
+function openSession(pane: Pane, session: { path: string; cwd: string; title: string }): void {
+  const live = runtimeForSession(session.path, runtimes);
+  if (live) pane.bind(bindingForRuntime(live, session.title));
+  else pane.bind({ runtimeId: null, title: session.title, sessionFile: session.path, cwd: session.cwd });
   pane.focus();
 }
 
-// ---------------------------------------------------------------- restoration
-
-/** When each transcript was last asked to reopen, to space retries of transient failures. */
-const resumeAttempts = new Map<string, number>();
-/** Transient failures (capacity, transport) are retried no sooner than this. */
-const RESUME_RETRY_MS = 15_000;
-let restoring = false;
+// ---------------------------------------------------------------- runtime adoption
 
 /**
- * Reopen every transcript a pane claims live but no runtime is writing. Panes
- * keep that claim across a daemon restart (the only way their runtime can be
- * lost without a stop), so this runs once the boot document is in memory and on
- * every later refresh: a daemon that went away and came back puts formerly live
- * sessions back on a live process instead of a "not running" placeholder.
- * Transcripts another pane (or another client) already has live are adopted,
- * never duplicated.
- *
- * This is pane reattachment and legacy workspace migration. The daemon restores
- * its complete durable pool before serving runtime requests, including sessions
- * with no pane or client open; its transcript-level dedupe also covers this path.
- */
-async function restoreWantedSessions(): Promise<void> {
-  if (!daemonUp || restoring) return;
-  const wanted = pendingResumes([...panes.values()].map((pane) => pane.binding), runtimes);
-  if (wanted.length === 0) return;
-  restoring = true;
-  try {
-    for (const { sessionFile, live } of wanted) {
-      const group = (): Pane[] =>
-        [...panes.values()].filter((pane) =>
-          pane.binding.autoResume && pane.binding.runtimeId === null && pane.binding.sessionFile === sessionFile,
-        );
-      if (group().length === 0) continue;
-      if (live) {
-        for (const pane of group()) pane.bind(bindingForRuntime(live, daemonId, displayTitle(live)));
-        continue;
-      }
-      const last = resumeAttempts.get(sessionFile) ?? 0;
-      if (Date.now() - last < RESUME_RETRY_MS) continue;
-      resumeAttempts.set(sessionFile, Date.now());
-      const summary = sessionSummary(sessionFile);
-      setStatus(`resuming ${summary?.title ?? sessionFile}…`, "idle");
-      const { runtime, status, error } = await requestRuntime({ resume: sessionFile, cwd: summary?.cwd ?? "" }, false);
-      if (runtime) {
-        resumeAttempts.delete(sessionFile);
-        if (!runtime.sessionFile) runtime.sessionFile = sessionFile;
-        for (const pane of group()) {
-          pane.bind(bindingForRuntime(runtime, daemonId, summary?.title ?? displayTitle(runtime)));
-        }
-      } else if (status === 400) {
-        // The daemon refuses the transcript itself (gone, or not under the
-        // session store): stop claiming it is live. The placeholder keeps a
-        // manual resume in case the file comes back.
-        resumeAttempts.delete(sessionFile);
-        for (const pane of group()) pane.clearLiveIntent();
-      } else if (error) {
-        // Capacity (or another daemon refusal): the pane keeps its claim and the
-        // retry below runs again, but the user sees why nothing started here.
-        for (const pane of group()) pane.showStartFailure(error);
-      }
-    }
-  } finally {
-    restoring = false;
-  }
-}
-
-/**
- * Give live runtimes no pane claims a view, so a pool restored by the daemon
- * reappears as the grid it was instead of only as sidebar entries — including
- * sessions whose pane document was lost (an emptied binding has no transcript
- * left to resume, but the daemon's ledger still has the session). Runtimes
- * whose transcript is claimed by any pane are left for that pane, even while
- * its resume is still in flight; panes with a session (or a runtime), and
- * explicitly closed placeholders, are never overwritten.
+ * Give live runtimes no pane claims a view, so an already-running daemon pool
+ * reappears as the grid it was instead of only as sidebar entries. Runtimes
+ * whose transcript is claimed by any pane are left for that pane; panes with a
+ * session (or a runtime), and explicitly closed placeholders, are never overwritten.
  */
 function adoptUnclaimedRuntimes(): void {
+  // Detached live sessions belong in the sidebar, not in a restored empty slot.
+  // Pool adoption is only a fallback for a client without a saved workspace.
+  if (hasSavedWorkspace) return;
   const claimedRuntimes = new Set<string>();
   const claimedSessions = new Set<string>();
   for (const pane of panes.values()) {
@@ -2421,9 +2768,10 @@ function adoptUnclaimedRuntimes(): void {
     if (!attachable(runtime) || claimedRuntimes.has(runtime.id)) continue;
     if (runtime.sessionFile && claimedSessions.has(runtime.sessionFile)) continue;
     const empty = [...panes.values()].find((pane) =>
-      !pane.binding.runtimeId && !pane.binding.sessionFile && !pane.binding.keepEmpty);
+      !pane.binding.runtimeId && !pane.binding.sessionFile && !pane.binding.cwd &&
+      !pane.binding.orphanDraft && !pane.binding.keepEmpty);
     if (!empty) return;
-    empty.bind(bindingForRuntime(runtime, daemonId, displayTitle(runtime)));
+    empty.bind(bindingForRuntime(runtime, displayTitle(runtime)));
   }
 }
 
@@ -2730,6 +3078,7 @@ function applyStoredWorkspace(stored: StoredWorkspace): boolean {
       : leaves(rebuilt.tree)[0];
   }
   if (!spaces.size) return false;
+  hasSavedWorkspace = true;
   activeSpaceId = spaces.has(stored.activeSpaceId) ? stored.activeSpaceId : spaces.keys().next().value!;
   layout = spaces.get(activeSpaceId)!;
   renderLayout();
@@ -2897,30 +3246,12 @@ async function boot(): Promise<void> {
   ]);
   if (reachable) {
     await reconcileWorkspaceState();
-    const bound = [...panes.values()].some((pane) => pane.binding.runtimeId);
-    // First run only when nothing was ever stored, and only after the daemon's
-    // copy was read (or proven absent). A restored workspace whose runtimes are
-    // gone must keep its session files: replacing the focused pane with a fresh
-    // session is exactly how a reboot used to lose the workspace.
-    const stored = [...panes.values()].some(
-      (pane) => pane.binding.runtimeId || pane.binding.sessionFile || pane.binding.title,
-    );
-    if (!bound && runtimes.length === 0 && !stored && stateGate === "ready") {
-      const pane = focusedPane();
-      if (pane) await newSession(pane);
-    } else {
-      for (const pane of panes.values()) pane.syncFromRuntimes();
-      // Panes that were live when the workspace was saved and lost their runtime
-      // with a daemon restart reopen their transcripts here.
-      await restoreWantedSessions();
-      // Fresh profile or cleared storage next to a restored pool: bind every
-      // runtime no pane claims to an empty pane (a reserved runtime starts on
-      // the attach this adopts), and keep watching while the daemon restores
-      // the rest of its pool after this boot.
-      adoptPending = true;
-      adoptSeen = runtimes.length;
-      adoptUnclaimedRuntimes();
-    }
+    for (const pane of panes.values()) pane.syncFromRuntimes();
+    // Adopt only runtimes already present in the daemon ledger. Starting a
+    // session remains an explicit action from the pane or workspace controls.
+    adoptPending = true;
+    adoptSeen = runtimes.length;
+    adoptUnclaimedRuntimes();
   } else {
     // Nothing was read, so nothing may be published: this browser's fallback
     // must never replace a daemon copy it could not see.
@@ -2929,6 +3260,10 @@ async function boot(): Promise<void> {
     setStatus("daemon unreachable", "warn");
   }
   const pane = focusedPane();
+  if (pane && defaultCwd && !pane.binding.runtimeId && !pane.binding.sessionFile &&
+      !pane.binding.cwd && !pane.binding.keepEmpty) {
+    pane.bind({ ...pane.binding, cwd: defaultCwd });
+  }
   pane?.focus();
   pollingReady = true;
   startPolling();

@@ -8,7 +8,7 @@ than re-rendering conversations. The optional `omp-mobile` extension supplies st
 
 ## Requirements and browser setup
 
-- Bun 1.3+, Git and OMP 18.x on `PATH`; set `OMP_DESKTOP_OMP` to use a different binary. Complete OMP's provider
+- Bun 1.3+, Git and OMP 18.13.1+ on `PATH`; set `OMP_DESKTOP_OMP` to use a different binary. Complete OMP's provider
   setup by running `omp` once. Desktop uses OMP's own configuration and credentials and does not modify them.
 - The browser client needs a host that supports Bun and PTYs. Linux uses GTK4/WebKitGTK 6 for its native window;
   macOS and Windows retain the Tauri shell.
@@ -80,10 +80,17 @@ Create spaces with **+** in the top bar. Each space has its own layout (up to fo
 a sidebar session onto another space's tab to move/open it there. Right-click a pane to split the layout:
 1×1 becomes side-by-side, then 2×2. Panes meet at a single 1px separator with no gutter or duplicate borders;
 drag on or just beside the separator to resize. In a 2×2 grid, closing one pane leaves an empty
-slot; closing another occupied pane collapses the grid. A new pane starts a new session; clicking a sidebar
-session attaches it to the focused pane.
+slot; closing another occupied pane collapses the grid. New panes prepare local drafts; clicking a sidebar session
+opens it in the focused pane. Neither action starts a new agent.
 
-Closing a pane or space only detaches its view. The daemon keeps a terminal-state mirror and restores its screen,
+Saved conversations stream read-only history through `omp render`, with at most two renderers running at once.
+The renderer exits after reading; no resident agent or model request is started, and the transcript is not modified.
+Write in the composer and select **Send**, or press **Ctrl+Enter** / **⌘Enter**, to create or resume an agent.
+Plain Enter inserts a newline. Drafts and attachment references survive navigation; unconfirmed input is retained
+for review, never automatically resubmitted.
+
+Closing a pane or space only detaches its view; execution continues. For live runtimes, the daemon keeps a
+terminal-state mirror and restores its screen,
 scrolling margins (DECSTBM) and cursor visibility when a pane reconnects, along with up to 20,000 history rows and
 retained inline images. Replay follows the producer's resize history instead of parsing a truncated raw-output tail
 at the latest size. Encoded image sidecars are capped at 128 MiB per runtime and 512 MiB across the daemon; the oldest
@@ -95,13 +102,29 @@ when their remaining rows leave history or the cache limit requires eviction. Te
 whose last tile disappeared, including between image insertions in one parser write, so erased redraws do not
 evict still-visible charts. Fractional-height terminal rows use disjoint pixel-aligned clearing and drawing bounds
 to avoid leaving a strip of pixels after text overwrites an image.
-Use the sidebar stop action to terminate a session. Live sessions are recorded in a durable
+Use the sidebar stop action to terminate a session. Only live sessions are recorded in a durable
 ledger and resumed from their OMP transcripts after a daemon restart; the old processes are not preserved, and
 in-flight work or unsaved input cannot be restored. Each transcript has one live process at a time; attaching an
 existing session reuses its process. On first upgrading from a daemon that predates the ledger, checkpoint its
 live pool with `bun run scripts/checkpoint-sessions.ts` before restarting. The command does not stop processes;
 finish their current work before the restart.
-Stopping a session allows 500 ms for graceful termination before forcing a still-owned child to exit.
+
+**Idle unloading:** the default grace period is 60 minutes, checked once per minute by the daemon, including for
+sessions that have no attached view. Change **Settings → Sessions → Idle timeout (minutes)** to apply a new
+nonnegative whole-minute value immediately; **0** disables automatic unloading.
+
+Eligibility comes from OMP's authoritative session, tool, async-job and agent-registry state, not quiet terminal
+output. Running execution (including sleeps), admitted submissions, retry/compaction, background jobs, pending
+result delivery, active subagents, named Bash services, queued messages, dialogs/approvals and unsent terminal
+input all protect the session. Unavailable, incompatible or unknown activity state fails closed: keep it loaded.
+An unload rechecks activity immediately before calling the SDK's graceful shutdown; it never escalates to a signal.
+The idle clock starts only after protected work settles.
+
+Unloaded sessions leave the live ledger and remain cold after daemon restart. Their history stays readable;
+the next explicit submission resumes from disk. This releases the agent process and terminal resources, not
+memory owned by an independent local model server.
+
+Explicit stop allows 500 ms for graceful termination before forcing a still-owned child to exit.
 A successful stop response waits for process cleanup and resource release, so its slot can be reused immediately.
 Natural exits also release capacity, after final output has passed the parser/subscriber boundary.
 On Linux, initial process-group signals require a verified original PTY leader identity; if it cannot be verified,
@@ -116,7 +139,7 @@ Spaces, focus and pane layouts are stored in the browser profile and mirrored in
 Browser and native profiles do not share local settings, but the daemon workspace mirror can restore layout,
 pins and settings if webview storage is lost. The live-process limit is shared across spaces (default 16).
 The client bundle and stylesheet are built at daemon startup; restart the daemon to apply changes, which also
-ends its PTY children. Recorded sessions resume on its next start.
+ends its PTY children. Only ledgered live sessions resume on its next start; unloaded conversations remain cold.
 Production assets are minified, gzip-compressed and cache-validated; fingerprinted URLs are immutable, while HTML
 and canonical URLs revalidate. Fonts use WOFF2, and production JavaScript does not include inline source maps.
 Unchanged sidebar nodes are retained, periodic polling pauses while hidden, and workspace writes are coalesced.
@@ -166,20 +189,36 @@ For a systemd installation, check `systemctl --user cat omp-desktopd` before dep
 and `ExecStart` must point to the updated checkout, not an older branch or worktree.
 Run `bun install --frozen-lockfile` there before restarting. Updating a different worktree, or reloading the app alone, does
 not replace the JavaScript bundle held in the running daemon. Restart only after active work has finished:
-saved chats resume, but in-flight tools and unsent input do not.
+ledgered live chats resume, but in-flight tools and unsaved terminal input do not. Unloaded chats remain cold.
 
 Drop files onto a pane to insert quoted paths without submitting them. The native window uses original paths for
 all file types and does not upload file contents. In browsers, if security hides a file's path, only images can
 fall back to upload; other pathless files are ignored. Paths containing control characters are rejected.
+In a cold composer, paths remain draft references until **Send**. Supported PNG, JPEG, WebP and GIF files are read
+then and attached to the model request, within the existing 32 MiB image limit; other files remain path references.
 
 ### Sidebar, settings and shortcuts
 
-The session view groups compact, borderless two-line rows into **Loaded**, **Pinned**, then **Recent**.
-Each session appears only in its highest applicable section: a loaded, pinned session appears under Loaded,
-not Pinned or Recent. The Loaded heading includes its count; Recent is ordered by last conversation activity,
-newest first. Rows show the directory and title, with an unread-completion dot when attention is needed.
-Hover or focus within a row to reveal pin and stop controls. Start a session with **+** beside search.
-The sidebar stays open and remains resizable; settings retain the optional folder view.
+The default **Workspaces** view groups sessions by their directory, showing the directory basename once in the
+group heading and compact title-only rows beneath it. Hover a heading to see its full path. In the native app,
+click the folder-plus **Add workspace** icon to open the system directory chooser at your home directory.
+Cancel leaves the list unchanged; choosing the same directory again selects the existing workspace.
+Added workspaces remain visible even without sessions. Selection and collapsed groups persist across reloads
+and are included in the daemon's durable sidebar mirror.
+
+Hover a workspace heading (or focus it with the keyboard) to reveal **+** and start a session in that directory.
+The header **+** uses the selected workspace, falling back to the daemon's default directory when none is selected.
+Browser clients can use saved
+workspaces, but adding a directory requires the native desktop shell; the browser reports this rather than
+pretending an upload picker can return an absolute local directory.
+
+Running and saved sessions appear together, with pinned sessions first and then newest conversation activity.
+Opening a running session reattaches to its existing process; opening a saved session reads its transcript without
+loading an agent. Only explicit submission creates or resumes the agent.
+Working and unread-completion indicators remain authoritative extension state. Stopping a process does not
+delete its saved conversation. Settings offers a flat **Sessions** view with **Pinned** and **Sessions** sections,
+where rows retain directory subtitles. Hover or focus within a row to reveal pin and stop controls.
+The sidebar stays open and remains resizable.
 Pane title bars retain their compact single-line layout without a bottom border. Only the close and pin icons
 match the sidebar controls; they appear on hover or keyboard focus. Pinning updates both surfaces;
 closing a pane only detaches its view and does not stop the session.
@@ -208,11 +247,12 @@ Concurrent listings share indexing work, and responses are capped at 200 rows wi
 Set a custom **Session limit** in Settings. The limit is shared by all windows and spaces and is saved by the
 daemon, not just the browser profile. A saved change that differs from the running limit shows **Restart now**;
 restart when current work has finished. Restarting interrupts running work and loses unsaved input, then resumes
-recorded sessions from their transcripts. Reverting the setting to the running value removes the restart prompt.
+ledgered live sessions from their transcripts. Reverting the setting to the running value removes the restart prompt.
 While a lowered change awaits that restart, the daemon already refuses new sessions beyond the saved limit —
 session-less allocations included — so the restart cannot silently drop one. Reattaching a session that is
 already live is unaffected.
-When capacity is reached, the error explains the limit: stop an unused session or increase the limit in Settings.
+When capacity is reached, the error explains the limit: stop an unused session, let it unload safely, or increase
+the limit in Settings. Reading saved history does not occupy a live-session slot.
 
 Default shortcuts:
 
@@ -244,6 +284,7 @@ All variables are optional. Defaults below assume a single-user machine.
 | `OMP_DESKTOP_HOST` | `127.0.0.1` | Daemon listen address; keep it on loopback because the API has no authentication. |
 | `OMP_DESKTOP_PORT` | `4180` | Daemon and native-shell port. |
 | `OMP_DESKTOP_MAX_RUNTIMES` | `16` | Initial process limit across all spaces; a custom limit saved in Settings takes precedence. |
+| `OMP_DESKTOP_IDLE_TIMEOUT_MINUTES` | `60` | Idle-unload grace period; nonnegative whole minutes, `0` disables. A custom idle timeout saved in Settings takes precedence and applies without restart. |
 | `OMP_DESKTOP_REPLAY_ROWS_PER_RUNTIME` | `20000` | Per-runtime scrollback ceiling, subject to the shared cell budget. |
 | `OMP_DESKTOP_REPLAY_CELLS_TOTAL` | `33554432` | Aggregate terminal cells, including both visible buffers and granted scrollback. |
 | `OMP_DESKTOP_IMAGE_BYTES_PER_RUNTIME` | `134217728` | Encoded image-sidecar budget per runtime. |
@@ -261,7 +302,7 @@ All variables are optional. Defaults below assume a single-user machine.
 | `OMP_DESKTOP_STATE_DIR` | `$XDG_STATE_HOME/omp-desktop` or `~/.local/state/omp-desktop` | Directory for durable workspace state and session ledger. |
 | `OMP_DESKTOP_STATE_FILE` | `<state dir>/state.json` | Explicit workspace-state path; overrides the directory for this file. |
 | `OMP_DESKTOP_LEDGER_FILE` | `<state dir>/sessions.json` | Explicit durable live-session ledger path. |
-| `OMP_DESKTOP_SETTINGS_FILE` | `<state dir>/settings.json` | Daemon-owned custom session limit, shared by browser and native windows. |
+| `OMP_DESKTOP_SETTINGS_FILE` | `<state dir>/settings.json` | Daemon-owned custom session limit and idle timeout, shared by browser and native windows; each field overrides its environment default independently. |
 | `OMP_DESKTOP_EXTENSION` | `../omp-mobile/extension.ts` | Optional OMP extension path; empty or missing disables structured mobile state. |
 | `OMP_MOBILE_IPC_DIR` | `~/.local/state/omp-mobile` | Per-runtime extension socket directory. |
 | `OMP_MOBILE_IPC_TOKEN` / `OMP_MOBILE_TOKEN` | unset | Shared socket token; if unset, the token file is used. |
@@ -287,10 +328,14 @@ The API remains loopback-only and unauthenticated; do not expose it directly to 
 
 | Route | Contract |
 | --- | --- |
-| `GET /api/runtimes` | Runtime list and the current daemon `generation`; naturally exited runtimes leave the pool. |
+| `GET /api/runtimes` | Runtime list, default-directory metadata and current daemon `generation`; exited and unloaded runtimes leave the pool. |
 | `GET /api/runtimes/:id/screen` | Parser-fenced `{cols, rows, screen}` for the visible plain-text screen; no history serialization or resize. |
 | `POST /api/runtimes/:id/input` | `{data: string}`, at most 16,384 UTF-16 code units and a 128 KiB request body. |
 | `DELETE /api/runtimes/:id` | Stop and release the runtime before returning success. |
+| `GET /api/sessions/history` | Stream ANSI history for a validated saved-session path and viewport; read-only, without a resident agent. |
+| `POST /api/sessions/request` | `{path?, cwd?, text, files?}`; create/resume only for this explicit request. Respond after SDK admission, not model generation. File references preserve inline image attachments. Maximum HTTP body and serialized IPC envelope (including transcript path and attachment paths) 128 KiB each. Oversize requests return 413 without dispatch. Fresh transcript paths are known only after startup; a final oversize rejection attempts safe idle cleanup. |
+| `GET /api/settings` | Desired/effective process limits, idle timeout and whether a restart is required. |
+| `PUT /api/settings` | Partial `{maxRuntimes?, idleTimeoutMinutes?}`; idle changes apply immediately, process-limit changes retain restart semantics. |
 | `PUT /api/state` | Workspace document; requires `X-OMP-Generation` from the current runtime-list response. Missing or stale generations return `409`. |
 
 Polling JSON routes support conditional ETags and gzip. Input producers must split larger text at Unicode-safe
@@ -312,9 +357,9 @@ tests and real OMP extension/process smoke checks. It does not verify the native
   browser, and file links are disabled. Daemon-origin content receives only notification-plugin permissions.
 - Configured extension tokens are required on every socket request. Socket ownership checks prevent using a
   socket replaced by another process.
-- There is no idle-session unloading. Each live session is an OMP process; daemon restarts terminate those
-  processes and restore recorded transcripts, not running tasks or unsaved input. The phone client is session-
-  centric; the desktop's pane layout is not a mobile layout service.
+- Idle-session unloading is enabled by default after 60 minutes; set the timeout to `0` to disable it. Each live
+  session is an OMP process; daemon restarts terminate those processes and restore recorded transcripts, not running
+  tasks or unsaved input. The phone client is session-centric; the desktop's pane layout is not a mobile layout service.
 - Native clipboard-image paste, pane dragging and WebGL behavior depend on the desktop environment and are not
   verified on every compositor.
 

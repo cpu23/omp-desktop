@@ -254,10 +254,39 @@ select:focus-visible {
   padding: 0 0 8px;
 }
 
-/* Search, new-session and settings controls share one compact row. */
+/* The workspace title and controls sit above the search field. */
 .side-search {
   display: flex;
+  flex-direction: column;
   gap: 6px;
+}
+
+.sidebar-heading {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+#sidebar-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font: 700 12px/1.4 var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-picker-status {
+  margin: 0;
+  color: var(--warn);
+  font: 10px/1.45 var(--mono);
+  overflow-wrap: anywhere;
+}
+
+.workspace-picker-status[hidden] {
+  display: none;
 }
 
 .sidebar-toggle {
@@ -276,6 +305,11 @@ select:focus-visible {
   transition:
     border-color 0.15s ease,
     color 0.15s ease;
+}
+
+.sidebar-toggle:disabled {
+  color: var(--dim);
+  cursor: wait;
 }
 
 .sidebar-toggle:hover {
@@ -342,6 +376,56 @@ select:focus-visible {
   flex: 0 0 auto;
 }
 
+.workspace-heading {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.workspace-heading .folder-heading {
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 0;
+}
+
+.workspace-new-session {
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 26px;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.workspace-heading:hover .workspace-new-session,
+.workspace-heading:focus-within .workspace-new-session {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.workspace-new-session:hover {
+  background: var(--panel-soft);
+  color: var(--text);
+}
+
+.workspace-new-session:focus-visible {
+  outline: 1px solid var(--effort-accent);
+  outline-offset: 1px;
+}
+
+.workspace-new-session svg,
+.folder-marker svg {
+  display: block;
+  flex: 0 0 auto;
+}
+
 .folder-heading {
   display: flex;
   align-items: center;
@@ -362,6 +446,10 @@ select:focus-visible {
   background: var(--panel-soft);
 }
 
+.folder-heading.active {
+  color: var(--accent);
+}
+
 .folder-label {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -374,6 +462,7 @@ select:focus-visible {
   gap: 4px;
   padding-left: 10px;
 }
+
 
 .side-block input {
   width: 100%;
@@ -886,6 +975,31 @@ body.session-dragging * {
   user-select: none;
 }
 
+.folder-sessions .row {
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas: "name actions";
+  align-content: center;
+  gap: 6px;
+  flex: 0 0 34px;
+  height: 34px;
+  padding: 5px 4px;
+}
+
+.folder-sessions .row .sub {
+  display: none;
+}
+
+.folder-sessions .row .row-actions {
+  position: static;
+  grid-area: actions;
+  justify-self: end;
+  background: transparent;
+}
+
+.folder-sessions .row .row-actions button {
+  flex: 0 0 22px;
+}
+
 .row:hover,
 .row:focus-within {
   background: var(--panel-soft);
@@ -1350,6 +1464,8 @@ body.session-dragging * {
 
 .pane-body {
   position: relative;
+  display: flex;
+  flex-direction: column;
   flex: 1 1 auto;
   min-height: 0;
   overflow: hidden;
@@ -1403,7 +1519,9 @@ body.session-dragging * {
    content height, which pins rows to whatever the first fit produced and leaves
    the pane bottom empty. */
 .pane-body .term-host {
-  height: 100%;
+  height: auto;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow: hidden;
 }
 
@@ -1443,6 +1561,7 @@ body.session-dragging * {
 
 .pane-placeholder {
   display: flex;
+  flex: 1 1 auto;
   flex-direction: column;
   gap: 12px;
   align-items: center;
@@ -1453,28 +1572,141 @@ body.session-dragging * {
   text-align: center;
 }
 
-/* Why a start/resume was refused (a full pool, a transcript the daemon will not
-   reopen): the daemon's own sentence, warn-coloured, above the retry buttons. */
-.pane-notice {
-  max-width: 60ch;
-  color: var(--warn);
-  font: 12px/1.5 var(--mono);
+.pane-placeholder-cold {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  height: auto;
+  background: rgb(0 0 0 / 88%);
 }
 
 .pane-placeholder button {
   padding: 7px 12px;
-  background: var(--panel-raised);
-  color: var(--muted);
   border: 1px solid var(--line);
   border-radius: 8px;
+  background: var(--panel-raised);
+  color: var(--muted);
   font: 600 12px var(--mono);
   cursor: pointer;
-  transition:
-    border-color 0.15s ease,
-    color 0.15s ease;
 }
 
 .pane-placeholder button:hover {
   border-color: var(--effort-accent);
   color: var(--text);
+}
+
+
+.orphan-draft-review {
+  display: grid;
+  flex: 0 0 auto;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 5px 8px;
+  align-items: center;
+  max-height: 140px;
+  overflow: auto;
+  padding: 7px 9px;
+  border-bottom: 1px solid var(--line-muted);
+  background: var(--panel-raised);
+  color: var(--warn);
+  font: 10px/1.4 var(--mono);
+}
+
+.orphan-draft-review[hidden] {
+  display: none;
+}
+
+.orphan-draft-review pre {
+  grid-column: 1 / -1;
+  max-height: 70px;
+  margin: 0;
+  overflow: auto;
+  color: var(--text);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.orphan-draft-review button {
+  grid-column: 2;
+  padding: 3px 7px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+
+.orphan-draft-review button:hover,
+.orphan-draft-review button:focus-visible {
+  border-color: var(--effort-accent);
+  color: var(--effort-accent);
+}
+
+.cold-composer {
+  display: grid;
+  position: relative;
+  z-index: 3;
+  flex: 0 0 auto;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px;
+  align-items: end;
+  padding: 7px;
+  border-top: 1px solid var(--line-muted);
+  background: var(--panel);
+}
+
+.cold-composer[hidden] {
+  display: none;
+}
+
+.cold-composer textarea {
+  width: 100%;
+  min-width: 0;
+  min-height: 40px;
+  max-height: 30vh;
+  padding: 7px 9px;
+  resize: vertical;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font: 12px/1.45 var(--mono);
+}
+
+.cold-composer textarea:focus {
+  border-color: var(--effort-accent);
+  outline: 0;
+}
+
+.cold-composer button {
+  height: 34px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-raised);
+  color: var(--text);
+  font: 11px var(--mono);
+  cursor: pointer;
+}
+
+.cold-composer button:hover:enabled,
+.cold-composer button:focus-visible {
+  border-color: var(--effort-accent);
+  color: var(--effort-accent);
+}
+
+.cold-composer button:disabled {
+  color: var(--dim);
+  cursor: default;
+}
+
+.cold-composer-status {
+  grid-column: 1 / -1;
+  color: var(--warn);
+  font: 10px/1.4 var(--mono);
+}
+
+.cold-composer-status:empty {
+  display: none;
 }

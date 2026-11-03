@@ -56,11 +56,12 @@ export type RuntimeScreenSnapshot = { cols: number; rows: number; screen: string
 export const MAX_RUNTIME_INPUT_CODE_UNITS = 16_384;
 
 export type ClientMessage =
-  | { type: "input"; data: string }
+  | { type: "input"; data: string; id?: string }
   | { type: "resize"; cols: number; rows: number };
 
 export type ServerMessage =
   | { type: "hello"; runtime: RuntimeInfo; replayBytes: number }
+  | { type: "inputAck"; id: string }
   | {
       type: "exit";
       exitCode: number | null;
@@ -80,7 +81,7 @@ export type RuntimesResponse = {
 };
 
 /** The client-side view of `GET /api/runtimes`. */
-export type RuntimesPayload = { runtimes: RuntimeInfo[]; generation: string | null };
+export type RuntimesPayload = { runtimes: RuntimeInfo[]; generation: string | null; defaultCwd: string | null };
 
 // Everything below crosses a process boundary (HTTP, websocket, localStorage).
 // Validate once here instead of casting and trusting reads at the use site.
@@ -152,7 +153,10 @@ export function parseRuntimesResponse(payload: unknown): RuntimesPayload | null 
   const generation = typeof payload.generation === "string" && payload.generation.length > 0
     ? payload.generation
     : null;
-  return { runtimes, generation };
+  const defaultCwd = isRecord(payload.defaults) && typeof payload.defaults.cwd === "string"
+    ? payload.defaults.cwd
+    : null;
+  return { runtimes, generation, defaultCwd };
 }
 
 export function parseRuntimeOne(payload: unknown): RuntimeInfo | null {
@@ -199,6 +203,9 @@ export function parseServerMessage(raw: string): ServerMessage | null {
     const replayBytes = value.replayBytes;
     return { type: "hello", runtime, replayBytes: typeof replayBytes === "number" ? replayBytes : 0 };
   }
+  if (value.type === "inputAck" && typeof value.id === "string" && value.id.length > 0 && value.id.length <= 64) {
+    return { type: "inputAck", id: value.id };
+  }
   if (value.type === "exit" && (value.exitCode === null || typeof value.exitCode === "number")) {
     return { type: "exit", exitCode: value.exitCode, daemonShutdown: value.daemonShutdown === true };
   }
@@ -214,7 +221,9 @@ export function parseClientMessage(raw: string): ClientMessage | null {
   }
   if (!isRecord(value)) return null;
   if (value.type === "input" && typeof value.data === "string" && value.data.length <= MAX_RUNTIME_INPUT_CODE_UNITS) {
-    return { type: "input", data: value.data };
+    if (value.id !== undefined &&
+        (typeof value.id !== "string" || value.id.length === 0 || value.id.length > 64)) return null;
+    return { type: "input", data: value.data, ...(typeof value.id === "string" ? { id: value.id } : {}) };
   }
   if (value.type === "resize" && typeof value.cols === "number" && typeof value.rows === "number") {
     const cols = Math.max(2, Math.min(500, Math.floor(value.cols)));
