@@ -1324,7 +1324,7 @@ async function testFirstSessionAndPaneWorkload(
   const toStop = paneBindings[3]!;
   const stopped = (await runtimes(base)).find((runtime) => runtime.id === toStop.runtimeId);
   assert(stopped?.pid !== null && stopped?.pid !== undefined, "Chosen explicit-stop runtime has no PTY pid.");
-  const row = await driver.find(`#session-list .row[title*="${toStop.runtimeId}"] .kill`);
+  const row = await driver.find(`#session-list .row[data-runtime-id="${toStop.runtimeId}"] .kill`);
   await driver.click(row);
   await driver.waitFor(async () => !(await runtimes(base)).some((runtime) => runtime.id === toStop.runtimeId), "explicit session stop to remove the runtime");
   await waitFor("the explicitly stopped PTY to be reaped", async () => !(await isProcessAlive(stopped.pid!)));

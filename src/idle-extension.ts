@@ -452,12 +452,15 @@ export default function registerDesktopIdleExtension(host: HostApi): void {
       return registryCache.reasons;
     }
     const cwd = text(ctx.cwd) && isAbsolute(ctx.cwd) ? ctx.cwd : process.cwd();
-    const result = spawnSync(process.execPath, ["ps", "list", "--json", "--all"], {
+    const ompBin = process.env.OMP_DESKTOP_OMP ?? "omp";
+    const ompArgs = (process.env.OMP_DESKTOP_OMP_ARGS ?? "").split(" ").filter((part) => part.length > 0);
+    const result = spawnSync(ompBin, [...ompArgs, "ps", "list", "--json", "--all"], {
       cwd,
       encoding: "utf8",
       timeout: SERVICE_REGISTRY_TIMEOUT_MS,
       maxBuffer: MAX_SERVICE_REGISTRY_BYTES,
       windowsHide: true,
+      shell: false,
       env: process.env,
     });
     let reasons: string[];

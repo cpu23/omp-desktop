@@ -2013,17 +2013,52 @@ function closeSpace(id: string): void {
   if (!stored) return;
   const order = [...spaces.keys()];
   const index = order.indexOf(id);
+  const closingPanes = leaves(stored.tree).map((paneId) => panes.get(paneId)).filter((pane): pane is Pane => pane !== undefined);
   closePaneMenu();
-  for (const paneId of leaves(stored.tree)) {
-    panes.get(paneId)?.destroy();
-    panes.delete(paneId);
+
+  const closingLastSpace = spaces.size === 1;
+  let recoveryTarget: Pane | null = null;
+  for (const pane of closingPanes) pane.preservePendingForClose();
+  if (closingLastSpace) {
+    // Capture ACK-raced bytes before createSpace saves any workspace snapshot.
+    createSpace();
+    recoveryTarget = focusedPane();
+    if (recoveryTarget) {
+      recoveryTarget.binding.keepEmpty = true;
+      const coldDraftSource = closingPanes.find((pane) => {
+        const binding = pane.binding;
+        if (binding.runtimeId) return false;
+        const identity = binding.sessionFile ?? (binding.cwd ? `new:${binding.cwd}` : null);
+        if (!identity) return false;
+        return Boolean(binding.drafts?.[identity] || binding.draftFiles?.[identity]?.length);
+      });
+      if (coldDraftSource) {
+        recoveryTarget.binding.cwd = coldDraftSource.binding.cwd;
+        recoveryTarget.binding.sessionFile = coldDraftSource.binding.sessionFile;
+        recoveryTarget.binding.title = coldDraftSource.binding.title;
+      }
+    }
+  } else {
+    const destinationId = activeSpaceId === id
+      ? order.filter((spaceId) => spaceId !== id)[Math.min(index, spaces.size - 2)]
+      : activeSpaceId;
+    const destination = destinationId ? spaces.get(destinationId) : undefined;
+    const targetPaneId = destination?.focused && leaves(destination.tree).includes(destination.focused)
+      ? destination.focused
+      : destination ? leaves(destination.tree)[0] : undefined;
+    recoveryTarget = targetPaneId ? panes.get(targetPaneId) ?? null : null;
+  }
+
+  for (const closing of closingPanes) {
+    if (recoveryTarget && closing !== recoveryTarget) {
+      recoveryTarget.bind(rebindPaneBinding(closing.binding, recoveryTarget.binding));
+    }
+  }
+  for (const closing of closingPanes) {
+    closing.destroy();
+    panes.delete(closing.id);
   }
   spaces.delete(id);
-  if (spaces.size === 0) {
-    createSpace();
-    focusedPane()?.bind({ ...emptyBinding(), keepEmpty: true });
-    return;
-  }
   if (activeSpaceId === id) {
     const remaining = [...spaces.keys()];
     activeSpaceId = remaining[Math.min(index, remaining.length - 1)];
