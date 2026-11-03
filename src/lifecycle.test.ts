@@ -91,6 +91,40 @@ describe("pane rebind draft recovery", () => {
     });
     expect(rebound.drafts?.[rebound.sessionFile!]).not.toContain(rebound.orphanDraft);
   });
+
+  test("a displaced same-identity draft is labeled for review without replacing the destination draft", () => {
+    const identity = "new:/fixture/project";
+    const rebound = rebindPaneBinding(
+      { runtimeId: null, title: null, sessionFile: null, cwd: "/fixture/project", drafts: { [identity]: "source draft" } },
+      { runtimeId: null, title: null, sessionFile: null, cwd: "/fixture/project", drafts: { [identity]: "destination draft" } },
+    );
+
+    expect(rebound.drafts?.[identity]).toBe("destination draft");
+    expect(rebound.orphanDraft ?? "").toContain(`Displaced draft for ${identity} (review only; not automatically resent):`);
+    expect(rebound.orphanDraft ?? "").toContain("source draft");
+    expect(rebound.orphanDraft ?? "").not.toContain("destination draft");
+  });
+
+  test("displaced same-identity attachment references remain readable without attaching to the destination draft", () => {
+    const identity = "new:/fixture/project";
+    const sourceFile = { path: "/fixture/source image.png", text: "'/fixture/source image.png'" };
+    const destinationFile = { path: "/fixture/destination image.png", text: "'/fixture/destination image.png'" };
+    const rebound = rebindPaneBinding(
+      {
+        runtimeId: null, title: null, sessionFile: null, cwd: "/fixture/project",
+        drafts: { [identity]: "source draft" }, draftFiles: { [identity]: [sourceFile] },
+      },
+      {
+        runtimeId: null, title: null, sessionFile: null, cwd: "/fixture/project",
+        drafts: { [identity]: "destination draft" }, draftFiles: { [identity]: [destinationFile] },
+      },
+    );
+
+    expect(rebound.draftFiles?.[identity]).toEqual([destinationFile]);
+    expect(rebound.orphanDraft ?? "").toContain(`Displaced attachment references for ${identity} (review only; not submitted):`);
+    expect(rebound.orphanDraft ?? "").toContain(sourceFile.path);
+    expect(rebound.orphanDraft ?? "").toContain(sourceFile.text);
+  });
 });
 
 describe("runtime adoption by transcript", () => {

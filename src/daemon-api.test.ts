@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
-import { symlink } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { connect as connectTcp } from "node:net";
 import { IMAGE_FILE_LIMIT } from "./image-limits";
 import { isRecord } from "./guards";
@@ -84,6 +85,29 @@ async function rawHttpRequest(port: number, request: string): Promise<string> {
 }
 
 describe("real daemon API behavior", () => {
+  test("saved history rendering forwards configured OMP arguments as argv, not shell text", async () => {
+    const root = await mkdtemp(join(tmpdir(), "omp-history-configured-args-"));
+    const executable = join(root, "omp with spaces");
+    const invocationPath = join(root, "argv.txt");
+    await writeFile(executable,
+      `#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(invocationPath)}\nprintf 'configured history output\\n'\n`);
+    await chmod(executable, 0o700);
+    const configuredArgs = ["--fixture-option", "fixed;literal"];
+    const daemon = await startTestDaemon({ omp: executable, args: configuredArgs });
+    try {
+      const transcript = await writeTestTranscript(daemon.root, "configured-history-render-args");
+      const response = await fetch(`${daemon.base}/api/sessions/history?path=${encodeURIComponent(transcript)}&cols=80&rows=24`);
+      expect(response.status).toBe(200);
+      expect(await response.text()).toContain("configured history output");
+      expect((await readFile(invocationPath, "utf8")).trimEnd().split("\n")).toEqual([
+        ...configuredArgs, "render", transcript, "--width", "80", "--height", "24",
+      ]);
+    } finally {
+      await daemon.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   test("cross-origin simple prompt submissions are rejected before any runtime or transcript side effect", async () => {
     const daemon = await startTestDaemon();
     const marker = `blocked-cross-origin-${crypto.randomUUID()}`;

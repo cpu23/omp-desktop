@@ -38,20 +38,53 @@ export function bindingForRuntime(runtime: RuntimeInfo, title?: string): PaneBin
 
 }
 
+/** Keep displaced input and file references visible without binding them to a new composer. */
+function displacedAttachmentReview(identity: string, files: FileReference[]): string {
+  const entries = files.map((file) => `path: ${file.path}\ntext: ${file.text}`).join("\n");
+  return `Displaced attachment references for ${identity} (review only; not submitted):\n${entries}`;
+}
+
+function sameFileReferences(left: FileReference[] | undefined, right: FileReference[] | undefined): boolean {
+  return left !== undefined && right !== undefined && left.length === right.length &&
+    left.every((file, index) => file.path === right[index]?.path && file.text === right[index]?.text);
+}
+
 /** Preserve pending drafts when a pane changes transcript/runtime identity. */
 export function rebindPaneBinding(previous: PaneBinding, destination: PaneBinding): PaneBinding {
-  const drafts = { ...previous.drafts, ...destination.drafts };
+  const previousDrafts = previous.drafts ?? {};
+  const destinationDrafts = destination.drafts ?? {};
+  const displaced: string[] = [];
+  const displacedDrafts = new Set<string>();
+  for (const [identity, text] of Object.entries(previousDrafts)) {
+    if (!Object.prototype.hasOwnProperty.call(destinationDrafts, identity) || destinationDrafts[identity] === text) continue;
+    displacedDrafts.add(identity);
+    displaced.push(`Displaced draft for ${identity} (review only; not automatically resent):\n${text}`);
+  }
+
+  const drafts = { ...previousDrafts, ...destinationDrafts };
   if (Object.keys(drafts).length) destination.drafts = drafts;
   else delete destination.drafts;
 
-  const draftFiles = { ...previous.draftFiles, ...destination.draftFiles };
+  const previousFiles = previous.draftFiles ?? {};
+  const destinationFiles = destination.draftFiles ?? {};
+  const draftFiles: Record<string, FileReference[]> = { ...previousFiles };
+  for (const [identity, files] of Object.entries(previousFiles)) {
+    const currentFiles = destinationFiles[identity];
+    const textConflict = displacedDrafts.has(identity);
+    const referencesConflict = currentFiles !== undefined && !sameFileReferences(files, currentFiles);
+    if ((textConflict && !sameFileReferences(files, currentFiles)) || referencesConflict) {
+      displaced.push(displacedAttachmentReview(identity, files));
+      delete draftFiles[identity];
+    }
+  }
+  Object.assign(draftFiles, destinationFiles);
   if (Object.keys(draftFiles).length) destination.draftFiles = draftFiles;
   else delete destination.draftFiles;
 
-  const orphanDraft = previous.orphanDraft === destination.orphanDraft
-    ? previous.orphanDraft ?? ""
-    : `${previous.orphanDraft ?? ""}${destination.orphanDraft ?? ""}`;
-  if (orphanDraft) destination.orphanDraft = orphanDraft;
+  const orphanDrafts = [previous.orphanDraft, destination.orphanDraft]
+    .filter((text, index, all): text is string => Boolean(text) && all.indexOf(text) === index);
+  orphanDrafts.push(...displaced);
+  if (orphanDrafts.length) destination.orphanDraft = orphanDrafts.join("\n\n");
   else delete destination.orphanDraft;
   return destination;
 }

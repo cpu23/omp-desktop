@@ -21,6 +21,7 @@ type Binding = {
   drafts?: Record<string, string>;
   draftFiles?: Record<string, Array<{ path: string; text: string }>>;
   orphanDraft?: string;
+  keepEmpty?: true;
 };
 type Layout = { tree: unknown; panes: Record<string, Binding>; focused: string };
 type Workspace = { spaces: Array<{ id: string; layout: Layout }>; activeSpaceId: string };
@@ -86,6 +87,22 @@ async function savedWorkspace(daemon: TestDaemon): Promise<Workspace> {
   return snapshot.state.layout;
 }
 
+function workspaceSignature(workspace: Workspace): string {
+  return JSON.stringify({
+    activeSpaceId: workspace.activeSpaceId,
+    spaces: workspace.spaces.map((space) => ({
+      id: space.id,
+      tree: space.layout.tree,
+      focused: space.layout.focused,
+      panes: Object.fromEntries(Object.entries(space.layout.panes).map(([id, binding]) => [id, {
+        runtimeId: binding.runtimeId ?? null,
+        sessionFile: binding.sessionFile ?? null,
+        keepEmpty: binding.keepEmpty ?? null,
+      }])),
+    })),
+  });
+}
+
 async function freshBrowserPage(browser: Browser, daemon: TestDaemon, ackGate?: AckGate): Promise<{ context: BrowserContext; page: Page }> {
   const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
   const page = await context.newPage();
@@ -139,6 +156,261 @@ async function stopAndReap(page: Page, daemon: TestDaemon, runtime: Runtime): Pr
   }, (runtimes) => !runtimes.some((entry) => entry.id === runtime.id), `stop control to remove runtime ${runtime.id}`);
   await waitFor(() => processAlive(runtime.pid), (alive) => !alive, `owned PTY ${runtime.pid} to be reaped`);
   console.log(`ok - Chromium found no title-based stop row, selected runtime ${runtime.id} by data-runtime-id; stop removed it and reaped pid ${runtime.pid}`);
+}
+
+async function testSameIdentityCloseCollision(browser: Browser): Promise<void> {
+  const daemon = await startTestDaemon();
+  let context: BrowserContext | undefined;
+  const sourceDraft = "DISPLACED-SOURCE-DRAFT-REVIEW-ONLY";
+  const destinationDraft = "DESTINATION-CURRENT-DRAFT-MUST-STAY";
+  const sourceFile = { path: "/fixture/source recovery.png", text: "'/fixture/source recovery.png'" };
+  const destinationFile = { path: "/fixture/current attachment.png", text: "'/fixture/current attachment.png'" };
+  try {
+    const runtime = await createRuntime(daemon);
+    const identity = `new:${runtime.cwd}`;
+    await writeWorkspace(daemon, {
+      spaces: [
+        {
+          id: "source",
+          layout: {
+            tree: { kind: "leaf", pane: "source-pane" },
+            panes: {
+              "source-pane": {
+                runtimeId: null, title: null, sessionFile: null, cwd: runtime.cwd,
+                drafts: { [identity]: sourceDraft }, draftFiles: { [identity]: [sourceFile] },
+              },
+            },
+            focused: "source-pane",
+          },
+        },
+        {
+          id: "destination",
+          layout: {
+            tree: { kind: "split", dir: "row", ratio: 0.5,
+              a: { kind: "leaf", pane: "runtime-pane" }, b: { kind: "leaf", pane: "destination-pane" } },
+            panes: {
+              "runtime-pane": { runtimeId: runtime.id, title: "collision fixture", sessionFile: runtime.sessionFile, cwd: runtime.cwd },
+              "destination-pane": {
+                runtimeId: null, title: null, sessionFile: null, cwd: runtime.cwd,
+                drafts: { [identity]: destinationDraft }, draftFiles: { [identity]: [destinationFile] },
+              },
+            },
+            focused: "destination-pane",
+          },
+        },
+      ],
+      activeSpaceId: "source",
+    });
+
+    ({ context } = await freshBrowserPage(browser, daemon));
+    const page = context.pages()[0]!;
+    await page.locator('#panes .pane[data-pane="source-pane"] textarea[aria-label="Message this session"]')
+      .waitFor({ state: "visible", timeout: waitTimeoutMs });
+    const beforeClose = await readFile(fakeOmpRecordPath(daemon.root, runtime.id)).catch(() => Buffer.alloc(0));
+    await clickSpaceClose(page);
+    await page.waitForFunction(() => document.querySelectorAll("#space-tabs [role='tab']").length === 1,
+      undefined, { timeout: waitTimeoutMs });
+
+    const durable = await waitFor(() => savedWorkspace(daemon), (value) => {
+      const destination = value.spaces.find((space) => space.id === "destination");
+      const binding = destination?.layout.panes["destination-pane"];
+      return value.spaces.length === 1 && binding?.drafts?.[identity] === destinationDraft &&
+        binding.draftFiles?.[identity]?.length === 1 &&
+        binding.draftFiles[identity]?.[0]?.path === destinationFile.path &&
+        binding.orphanDraft?.includes(sourceDraft) === true;
+    }, "same-identity source conflict to be stored separately from the destination composer");
+    const binding = durable.spaces[0]!.layout.panes["destination-pane"]!;
+    assert.equal(binding.drafts?.[identity], destinationDraft, "close collision overwrote the destination's current draft");
+    assert.deepEqual(binding.draftFiles?.[identity], [destinationFile], "close collision replaced destination attachment references");
+    assert.match(binding.orphanDraft ?? "", new RegExp(`Displaced draft for ${identity} \\(review only; not automatically resent\\):`));
+    assert.ok(binding.orphanDraft?.includes(sourceFile.path), "displaced file path was omitted from review recovery");
+    assert.ok(binding.orphanDraft?.includes(sourceFile.text), "displaced file text was omitted from review recovery");
+    assert.equal(binding.runtimeId, null, "cold destination recovery became bound to the unrelated live runtime");
+
+    const review = page.locator('#panes .pane[data-pane="destination-pane"] .orphan-draft-review');
+    await review.waitFor({ state: "visible", timeout: waitTimeoutMs });
+    const visibleReview = await review.innerText();
+    assert.match(visibleReview, /review before reuse; not automatically resent/i);
+    assert.ok(visibleReview.includes(sourceDraft) && visibleReview.includes(sourceFile.path) && visibleReview.includes(sourceFile.text),
+      "Chromium did not visibly render displaced text and attachment references as review-only recovery");
+    const destinationComposer = page.locator('#panes .pane[data-pane="destination-pane"] textarea[aria-label="Message this session"]');
+    assert.equal(await destinationComposer.inputValue(), destinationDraft, "visible destination composer changed during collision recovery");
+
+    await page.evaluate(() => localStorage.clear());
+    await page.reload({ waitUntil: "domcontentloaded" });
+    const restoredReview = page.locator('#panes .pane[data-pane="destination-pane"] .orphan-draft-review');
+    await restoredReview.waitFor({ state: "visible", timeout: waitTimeoutMs });
+    const restoredReviewText = await restoredReview.innerText();
+    assert.ok(restoredReviewText.includes(sourceDraft) && restoredReviewText.includes(sourceFile.path) && restoredReviewText.includes(sourceFile.text),
+      "fresh Chromium profile lost the displaced review-only recovery");
+    const restoredComposer = page.locator('#panes .pane[data-pane="destination-pane"] textarea[aria-label="Message this session"]');
+    await restoredComposer.waitFor({ state: "visible", timeout: waitTimeoutMs });
+    assert.equal(await restoredComposer.inputValue(), destinationDraft, "fresh restore changed the destination's current draft");
+    assert.deepEqual(await readFile(fakeOmpRecordPath(daemon.root, runtime.id)).catch(() => Buffer.alloc(0)), beforeClose,
+      "close/reload automatically resent one of the drafts to a live runtime");
+    const restored = await savedWorkspace(daemon);
+    const restoredBinding = restored.spaces[0]!.layout.panes["destination-pane"]!;
+    assert.deepEqual(restoredBinding.draftFiles?.[identity], [destinationFile], "fresh restore changed destination attachment references");
+    console.log("ok - Chromium closed a same-identity draft/file collision, retained the destination composer, showed displaced recovery as review-only, restored it from daemon state, and sent nothing");
+    await stopAndReap(page, daemon, runtime);
+  } finally {
+    await context?.close();
+    await daemon.stop();
+  }
+}
+
+async function testSavedWorkspaceRestoreSignature(browser: Browser): Promise<void> {
+  const daemon = await startTestDaemon();
+  let context: BrowserContext | undefined;
+  try {
+    const runtimes = await Promise.all([createRuntime(daemon), createRuntime(daemon), createRuntime(daemon)]);
+    const [first, second, third] = runtimes;
+    await writeWorkspace(daemon, {
+      spaces: [
+        {
+          id: "four-pane-space",
+          layout: {
+            tree: { kind: "split", dir: "row", ratio: 0.5,
+              a: { kind: "split", dir: "col", ratio: 0.5, a: { kind: "leaf", pane: "p1" }, b: { kind: "leaf", pane: "p2" } },
+              b: { kind: "split", dir: "col", ratio: 0.5, a: { kind: "leaf", pane: "p3" }, b: { kind: "leaf", pane: "p4" } } },
+            panes: {
+              p1: { runtimeId: first.id, title: "first", sessionFile: first.sessionFile, cwd: first.cwd },
+              p2: { runtimeId: second.id, title: "second", sessionFile: second.sessionFile, cwd: second.cwd },
+              p3: { runtimeId: third.id, title: "third", sessionFile: third.sessionFile, cwd: third.cwd },
+              p4: { runtimeId: null, title: null, sessionFile: null, keepEmpty: true },
+            },
+            focused: "p2",
+          },
+        },
+        {
+          id: "empty-space",
+          layout: { tree: { kind: "leaf", pane: "p5" }, panes: { p5: { runtimeId: null, title: null, sessionFile: null } }, focused: "p5" },
+        },
+      ],
+      activeSpaceId: "four-pane-space",
+    });
+    const expected = await savedWorkspace(daemon);
+    const expectedSignature = workspaceSignature(expected);
+
+    ({ context } = await freshBrowserPage(browser, daemon));
+    const page = context.pages()[0]!;
+    await page.waitForFunction(() => document.querySelectorAll("#panes .pane").length === 4 &&
+      document.querySelectorAll("#space-tabs [role='tab']").length === 2,
+    undefined, { timeout: waitTimeoutMs });
+    await waitFor(() => savedWorkspace(daemon), (workspace) => workspaceSignature(workspace) === expectedSignature,
+      "fresh Chromium to restore exact saved four-pane tree, pane IDs, active space, focus, runtime and transcript bindings");
+
+    const runtimeSnapshot = await fetch(`${daemon.base}/api/runtimes`).then((response) => response.json()) as {
+      runtimes: Array<{ id: string; pid: number | null }>;
+    };
+    const expectedRuntimes = runtimes.map(({ id, pid }) => [id, pid]);
+    assert.deepEqual(runtimeSnapshot.runtimes.map(({ id, pid }) => [id, pid]), expectedRuntimes,
+      "Chromium workspace restore changed runtime IDs or PTY PIDs");
+    await page.evaluate(() => localStorage.clear());
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForFunction(() => document.querySelectorAll("#panes .pane").length === 4 &&
+      document.querySelectorAll("#space-tabs [role='tab']").length === 2,
+    undefined, { timeout: waitTimeoutMs });
+    const reopened = await waitFor(() => savedWorkspace(daemon), (workspace) =>
+      workspaceSignature(workspace) === expectedSignature, "Chromium's cleared-profile reload to restore the exact durable workspace signature");
+    assert.equal(workspaceSignature(reopened), expectedSignature,
+      "Chromium reload changed durable pane/layout identity fields checked by native smoke");
+    assert.deepEqual(await fetch(`${daemon.base}/api/runtimes`).then((response) => response.json()).then((body: { runtimes: Array<{ id: string; pid: number | null }> }) =>
+      body.runtimes.map(({ id, pid }) => [id, pid])), expectedRuntimes,
+    "Chromium reload changed runtime IDs or PTY PIDs");
+    console.log("ok - exact-source Chromium fresh and cleared-profile restores preserved the four-pane/two-space tree, focus, keepEmpty, runtime/transcript bindings, and live PTY IDs");
+  } finally {
+    await context?.close();
+    await daemon.stop();
+  }
+}
+
+async function testSameIdentityPaneCloseCollision(browser: Browser): Promise<void> {
+  const daemon = await startTestDaemon();
+  let context: BrowserContext | undefined;
+  const sourceDraft = "PANE-CLOSE-DISPLACED-DRAFT";
+  const destinationDraft = "PANE-CLOSE-DESTINATION-DRAFT";
+  const sourceFile = { path: "/fixture/pane source.png", text: "'/fixture/pane source.png'" };
+  const destinationFile = { path: "/fixture/pane destination.png", text: "'/fixture/pane destination.png'" };
+  try {
+    const runtime = await createRuntime(daemon);
+    const identity = `new:${runtime.cwd}`;
+    await writeWorkspace(daemon, {
+      spaces: [
+        {
+          id: "pane-close",
+          layout: {
+            tree: { kind: "split", dir: "row", ratio: 0.5, a: { kind: "leaf", pane: "destination-pane" }, b: { kind: "leaf", pane: "source-pane" } },
+            panes: {
+              "destination-pane": {
+                runtimeId: null, title: null, sessionFile: null, cwd: runtime.cwd,
+                drafts: { [identity]: destinationDraft }, draftFiles: { [identity]: [destinationFile] },
+              },
+              "source-pane": {
+                runtimeId: null, title: null, sessionFile: null, cwd: runtime.cwd,
+                drafts: { [identity]: sourceDraft }, draftFiles: { [identity]: [sourceFile] },
+              },
+            },
+            focused: "source-pane",
+          },
+        },
+        {
+          id: "live-runtime",
+          layout: {
+            tree: { kind: "leaf", pane: "runtime-pane" },
+            panes: { "runtime-pane": { runtimeId: runtime.id, title: "unrelated live runtime", sessionFile: runtime.sessionFile, cwd: runtime.cwd } },
+            focused: "runtime-pane",
+          },
+        },
+      ],
+      activeSpaceId: "pane-close",
+    });
+
+    ({ context } = await freshBrowserPage(browser, daemon));
+    const page = context.pages()[0]!;
+    await page.locator('#panes .pane[data-pane="source-pane"] textarea[aria-label="Message this session"]')
+      .waitFor({ state: "visible", timeout: waitTimeoutMs });
+    const beforeClose = await readFile(fakeOmpRecordPath(daemon.root, runtime.id)).catch(() => Buffer.alloc(0));
+    await page.locator('#panes .pane[data-pane="source-pane"] .pane-close')
+      .evaluate((button) => (button as HTMLButtonElement).click());
+    await page.waitForFunction(() => document.querySelectorAll("#panes .pane").length === 1 &&
+      document.querySelector('#panes .pane[data-pane="destination-pane"]') !== null,
+    undefined, { timeout: waitTimeoutMs });
+    const durable = await waitFor(() => savedWorkspace(daemon), (workspace) => {
+      const paneClose = workspace.spaces.find((space) => space.id === "pane-close");
+      const binding = paneClose?.layout.panes["destination-pane"];
+      return binding?.drafts?.[identity] === destinationDraft &&
+        binding.draftFiles?.[identity]?.[0]?.path === destinationFile.path &&
+        binding.orphanDraft?.includes(sourceDraft) === true;
+    }, "pane close to preserve conflicting source input separately from destination content");
+    const binding = durable.spaces.find((space) => space.id === "pane-close")!.layout.panes["destination-pane"]!;
+    assert.equal(binding.drafts?.[identity], destinationDraft);
+    assert.deepEqual(binding.draftFiles?.[identity], [destinationFile]);
+    assert.ok(binding.orphanDraft?.includes(identity) && binding.orphanDraft.includes(sourceFile.path) && binding.orphanDraft.includes(sourceFile.text),
+      "pane-close review recovery omitted displaced attachment identity/path/text");
+    const review = page.locator('#panes .pane[data-pane="destination-pane"] .orphan-draft-review');
+    await review.waitFor({ state: "visible", timeout: waitTimeoutMs });
+    const reviewText = await review.innerText();
+    assert.ok(reviewText.includes(sourceDraft) && reviewText.includes(sourceFile.path) && reviewText.includes(sourceFile.text),
+      "pane-close displaced recovery was not visibly reviewable");
+    assert.equal(await page.locator('#panes .pane[data-pane="destination-pane"] textarea[aria-label="Message this session"]').inputValue(), destinationDraft);
+
+    await page.evaluate(() => localStorage.clear());
+    await page.reload({ waitUntil: "domcontentloaded" });
+    const restoredReview = page.locator('#panes .pane[data-pane="destination-pane"] .orphan-draft-review');
+    await restoredReview.waitFor({ state: "visible", timeout: waitTimeoutMs });
+    assert.ok((await restoredReview.innerText()).includes(sourceFile.path), "pane-close review recovery did not survive fresh-profile restore");
+    assert.equal(await page.locator('#panes .pane[data-pane="destination-pane"] textarea[aria-label="Message this session"]').inputValue(), destinationDraft);
+    assert.deepEqual(await readFile(fakeOmpRecordPath(daemon.root, runtime.id)).catch(() => Buffer.alloc(0)), beforeClose,
+      "pane close or reload automatically sent recovered draft bytes");
+    assert.ok((await savedWorkspace(daemon)).spaces.some((space) => space.layout.panes["runtime-pane"]?.runtimeId === runtime.id),
+      "pane close changed the unrelated runtime binding");
+    console.log("ok - Chromium closed a conflicting pane binding, preserved the destination draft/file refs and visibly restored displaced review-only content without sending bytes");
+    await stopAndReap(page, daemon, runtime);
+  } finally {
+    await context?.close();
+    await daemon.stop();
+  }
 }
 
 async function testNonLastSpaceColdDraft(browser: Browser): Promise<void> {
@@ -343,6 +615,9 @@ try {
   } else {
     await testNonLastSpaceColdDraft(launchedBrowser);
     await testLastSpaceBeforeAck(launchedBrowser);
+    await testSameIdentityCloseCollision(launchedBrowser);
+    await testSameIdentityPaneCloseCollision(launchedBrowser);
+    await testSavedWorkspaceRestoreSignature(launchedBrowser);
   }
 } finally {
   await browser?.close();

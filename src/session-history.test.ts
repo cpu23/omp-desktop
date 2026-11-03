@@ -1,4 +1,4 @@
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
@@ -27,6 +27,26 @@ describe("offline session history renderer", () => {
   test("rejects unsafe terminal dimensions without starting a renderer", async () => {
     const response = await renderSessionHistory({ file: "/sessions/a.jsonl", cols: 0, rows: 27, omp: "/not-used" });
     expect(response.status).toBe(400);
+  });
+
+  test("passes configured OMP arguments as literal argv entries before render", async () => {
+    const root = await mkdtemp(join(tmpdir(), "omp-desktop-history-argv-"));
+    roots.push(root);
+    const executable = join(root, "omp");
+    const invocationPath = join(root, "invocation.txt");
+    await writeFile(executable,
+      `#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(invocationPath)}\nprintf 'fixture history\\n'\n`);
+    await chmod(executable, 0o700);
+    const configuredArgs = ["--fixture-option", "fixed;literal"];
+    const file = "/sessions/argv-safe.jsonl";
+
+    const response = await renderSessionHistory({ file, cols: 80, rows: 24, omp: executable, args: configuredArgs });
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain("fixture history");
+    expect((await readFile(invocationPath, "utf8")).trimEnd().split("\n")).toEqual([
+      ...configuredArgs, "render", file, "--width", "80", "--height", "24",
+    ]);
   });
 
   test("cancellation reaps a renderer and permits another while the second remains active", async () => {

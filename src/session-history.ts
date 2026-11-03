@@ -68,9 +68,10 @@ export async function renderSessionHistory(options: {
   cols: number;
   rows: number;
   omp: string;
+  args?: string[];
   signal?: AbortSignal;
 }): Promise<Response> {
-  const { file, omp, signal } = options;
+  const { file, omp, args = [], signal } = options;
   const { cols, rows } = options;
   if (
     !file || !omp || !Number.isSafeInteger(cols) || !Number.isSafeInteger(rows) ||
@@ -103,7 +104,7 @@ export async function renderSessionHistory(options: {
       finish();
       return new Response(null, { status: 499 });
     }
-    const subprocess = Bun.spawn([omp, "render", file, "--width", String(cols), "--height", String(rows)], {
+    const subprocess = Bun.spawn([omp, ...args, "render", file, "--width", String(cols), "--height", String(rows)], {
       stdin: "ignore",
       stdout: "pipe",
       stderr: "ignore",

@@ -876,7 +876,7 @@ const server = Bun.serve<WsData>({
         if (!file) return new Response("history requires an existing transcript under the session store", { status: 400 });
         const cols = Number(url.searchParams.get("cols") ?? 120);
         const rows = Number(url.searchParams.get("rows") ?? 32);
-        return renderSessionHistory({ file, cols, rows, omp: OMP_BIN, signal: req.signal });
+        return renderSessionHistory({ file, cols, rows, omp: OMP_BIN, args: OMP_ARGS, signal: req.signal });
       }
       default:
         break;
