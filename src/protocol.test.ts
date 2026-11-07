@@ -106,6 +106,20 @@ describe("runtime presentation parsing", () => {
     expect(parseRuntimeInfo(runtime({ cols: "80" }))).toBeNull();
   });
 
+  test("runtime parsing rejects missing or malformed core lifecycle fields", () => {
+    for (const invalid of [
+      { alive: undefined }, { alive: "yes" },
+      { pid: undefined }, { pid: "100" },
+      { sessionFile: undefined }, { sessionFile: {} },
+    ]) {
+      const payload = runtime(invalid);
+      expect(parseRuntimeInfo(payload)).toBeNull();
+      expect(parseRuntimesResponse({ runtimes: [payload] })).toBeNull();
+      expect(parseServerMessage(JSON.stringify({ type: "ready", runtime: payload }))).toBeNull();
+    }
+    expect(parseRuntimeInfo(runtime({ alive: false, pid: null, sessionFile: null, status: "starting" }))).not.toBeNull();
+  });
+
   test("one-shot runtime parsing drops junk presentation too", () => {
     const one = parseRuntimeOne({ runtime: runtime({ presentation: { agentActive: 1 } }) });
     expect(one?.presentation).toBeUndefined();

@@ -125,6 +125,9 @@ function isRuntimeInfoBase(value: unknown): value is RuntimeInfoBase {
   // `alive`/`status` drive attach decisions (a reserved runtime is alive:false,
   // status idle, and still attachable; exited is final), so they are required
   // here rather than trusted to be present.
+  if (typeof value.alive !== "boolean") return false;
+  if (value.pid !== null && typeof value.pid !== "number") return false;
+  if (value.sessionFile !== null && typeof value.sessionFile !== "string") return false;
   if (
     value.status !== "starting" &&
     value.status !== "streaming" &&
