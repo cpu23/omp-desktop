@@ -6,10 +6,8 @@ import { renderSessionHistory } from "./session-history";
 
 const roots: string[] = [];
 const controllers: AbortController[] = [];
-const readers: ReadableStreamDefaultReader<Uint8Array>[] = [];
 afterEach(async () => {
   for (const controller of controllers.splice(0)) controller.abort();
-  await Promise.all(readers.splice(0).map((reader) => reader.cancel().catch(() => {})));
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
@@ -49,32 +47,49 @@ describe("offline session history renderer", () => {
     ]);
   });
 
+  test("keeps the final answer after output larger than a pipe buffer", async () => {
+    const payload = `${"history line\n".repeat(200_000)}FINAL ANSWER\n`;
+    const omp = await fakeOmp(
+      `exec ${JSON.stringify(process.execPath)} -e 'process.stdout.write("history line\\n".repeat(200000) + "FINAL ANSWER\\n"); process.exit(0)'`,
+    );
+    const response = await renderSessionHistory({ file: "/sessions/large.jsonl", cols: 80, rows: 24, omp });
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe(payload);
+  });
+
   test("cancellation reaps a renderer and permits another while the second remains active", async () => {
-    const omp = await fakeOmp("printf '%s\\n' \"$$\"; exec sleep 30");
-    const start = async (file: string) => {
+    const root = await mkdtemp(join(tmpdir(), "omp-history-cancellation-"));
+    roots.push(root);
+    const omp = await fakeOmp('printf "%s\\n" "$$" > "$2.tmp"; mv "$2.tmp" "$2"; exec sleep 30');
+    const start = async (name: string) => {
+      const file = join(root, name);
       const controller = new AbortController();
       controllers.push(controller);
-      const response = await renderSessionHistory({ file, cols: 80, rows: 24, omp, signal: controller.signal });
-      if (!response.body) throw new Error("Renderer did not expose a body");
-      const reader = response.body.getReader();
-      readers.push(reader);
-      const first = await reader.read();
-      const pid = Number(new TextDecoder().decode(first.value).trim());
-      if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("Renderer did not expose its owned PID");
-      return { reader, pid };
+      // A separate OS process publishes its PID; fake timers cannot advance it.
+      const deadline = Date.now() + 3000;
+      const response = renderSessionHistory({ file, cols: 80, rows: 24, omp, signal: controller.signal });
+      while (!(await Bun.file(file).exists())) {
+        if (Date.now() > deadline) throw new Error("Renderer did not publish its PID");
+        await Bun.sleep(10);
+      }
+      const pid = Number((await Bun.file(file).text()).trim());
+      return { controller, response, pid };
     };
     const alive = (pid: number) => {
       try { process.kill(pid, 0); return true; } catch { return false; }
     };
-    const first = await start("/sessions/a.jsonl");
-    const second = await start("/sessions/b.jsonl");
-    await first.reader.cancel();
+    const first = await start("a");
+    const second = await start("b");
+    first.controller.abort();
+    expect((await first.response).status).toBe(499);
     expect(alive(first.pid)).toBe(false);
-    const third = await start("/sessions/c.jsonl");
+    const third = await start("c");
     expect(alive(second.pid)).toBe(true);
     expect(alive(third.pid)).toBe(true);
-    await second.reader.cancel();
-    await third.reader.cancel();
+    second.controller.abort();
+    third.controller.abort();
+    expect((await second.response).status).toBe(499);
+    expect((await third.response).status).toBe(499);
     expect(alive(second.pid)).toBe(false);
     expect(alive(third.pid)).toBe(false);
   });
