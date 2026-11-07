@@ -83,8 +83,10 @@ drag on or just beside the separator to resize. In a 2×2 grid, closing one pane
 slot; closing another occupied pane collapses the grid. New panes prepare local drafts; clicking a sidebar session
 opens it in the focused pane. Neither action starts a new agent.
 
-Saved conversations stream read-only history through `omp render`, with at most two renderers running at once.
-The renderer exits after reading; no resident agent or model request is started, and the transcript is not modified.
+Saved conversations render read-only history through `omp render`, with at most two history requests active at once.
+Output is spooled to a private temporary file before streaming to the pane, so large transcripts and inline images
+do not lose their final messages when the renderer exits. The temporary output is removed after delivery or cancellation.
+No resident agent or model request is started, and the transcript is not modified.
 Write in the composer and select **Send**, or press **Ctrl+Enter** / **⌘Enter**, to create or resume an agent.
 Plain Enter inserts a newline. Drafts and attachment references survive navigation; unconfirmed input is retained
 for review, never automatically resubmitted.

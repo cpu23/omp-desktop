@@ -1,3 +1,7 @@
+import { mkdtemp, open, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 const MAX_RENDERERS = 2;
 const MAX_DIMENSION = 1_000;
 
@@ -61,7 +65,8 @@ function invalidRequest(): Response {
 
 /**
  * Render a saved transcript through OMP's production, offline transcript renderer.
- * The returned body streams stdout without retaining the full transcript in memory.
+ * Spool stdout to a private file: OMP can exit before a pipe drains its final writes.
+ * Stream the completed file without retaining the full transcript in memory.
  */
 export async function renderSessionHistory(options: {
   file: string;
@@ -82,58 +87,66 @@ export async function renderSessionHistory(options: {
   let release: (() => void) | null = null;
   let child: Bun.Subprocess | null = null;
   let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
-  let finished = false;
-  const finish = () => {
-    if (finished) return;
-    finished = true;
+  let directory: string | null = null;
+  let cleanup: Promise<void> | null = null;
+  const finish = (): Promise<void> => {
+    if (cleanup) return cleanup;
     signal?.removeEventListener("abort", abortChild);
     release?.();
     release = null;
+    cleanup = directory ? rm(directory, { recursive: true, force: true }) : Promise.resolve();
+    return cleanup;
   };
   const abortChild = () => {
     child?.kill("SIGKILL");
-    void reader?.cancel().catch(() => undefined).finally(async () => {
+    void (async () => {
       await child?.exited.catch(() => undefined);
-      finish();
-    });
+      await reader?.cancel().catch(() => undefined);
+      await finish();
+    })();
   };
 
   try {
     release = await acquireRenderer(signal);
     if (signal?.aborted) {
-      finish();
+      await finish();
       return new Response(null, { status: 499 });
     }
-    const subprocess = Bun.spawn([omp, ...args, "render", file, "--width", String(cols), "--height", String(rows)], {
-      stdin: "ignore",
-      stdout: "pipe",
-      stderr: "ignore",
-      env: {
-        ...process.env,
-        TERM: "xterm-256color",
-        COLORTERM: "truecolor",
-        PI_FORCE_IMAGE_PROTOCOL: process.env.PI_FORCE_IMAGE_PROTOCOL ?? "iterm2",
-      },
-    });
+    directory = await mkdtemp(join(tmpdir(), "omp-desktop-history-"));
+    const outputPath = join(directory, "transcript.ansi");
+    const outputFile = await open(outputPath, "wx", 0o600);
+    let subprocess: Bun.Subprocess;
+    try {
+      subprocess = Bun.spawn([omp, ...args, "render", file, "--width", String(cols), "--height", String(rows)], {
+        stdin: "ignore",
+        stdout: outputFile.fd,
+        stderr: "ignore",
+        env: {
+          ...process.env,
+          TERM: "xterm-256color",
+          COLORTERM: "truecolor",
+          PI_FORCE_IMAGE_PROTOCOL: process.env.PI_FORCE_IMAGE_PROTOCOL ?? "iterm2",
+        },
+      });
+    } finally {
+      await outputFile.close();
+    }
     child = subprocess;
-    const output = subprocess.stdout.getReader();
-    reader = output;
     signal?.addEventListener("abort", abortChild, { once: true });
     if (signal?.aborted) abortChild();
 
-    const first = await output.read();
-    if (first.done) {
-      const exitCode = await child.exited;
-      finish();
-      if (signal?.aborted) return new Response(null, { status: 499 });
-      if (exitCode !== 0) return new Response("OMP could not render this session history", { status: 502 });
-      return new Response(null, { headers: { "content-type": "text/plain; charset=utf-8" } });
+    const exitCode = await subprocess.exited;
+    if (signal?.aborted || exitCode !== 0) {
+      await finish();
+      return new Response(signal?.aborted ? null : "OMP could not render this session history", {
+        status: signal?.aborted ? 499 : 502,
+      });
     }
+    const output = Bun.file(outputPath).stream().getReader();
+    reader = output;
 
     const body = new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(first.value);
-      },
+      // Pull only as the client consumes the completed transcript.
       async pull(controller) {
         try {
           const next = await output.read();
@@ -141,22 +154,17 @@ export async function renderSessionHistory(options: {
             controller.enqueue(next.value);
             return;
           }
-          const exitCode = await subprocess.exited;
-          finish();
-          if (exitCode !== 0) controller.error(new Error(`OMP history renderer exited with status ${exitCode}`));
-          else controller.close();
+          await finish();
+          controller.close();
         } catch (error) {
-          subprocess.kill("SIGKILL");
-          await subprocess.exited.catch(() => undefined);
-          finish();
+          await output.cancel().catch(() => undefined);
+          await finish();
           controller.error(error);
         }
       },
       async cancel() {
-        subprocess.kill("SIGKILL");
         await output.cancel().catch(() => undefined);
-        await subprocess.exited.catch(() => undefined);
-        finish();
+        await finish();
       },
     });
     return new Response(body, {
@@ -169,7 +177,7 @@ export async function renderSessionHistory(options: {
     child?.kill("SIGKILL");
     await child?.exited.catch(() => undefined);
     await reader?.cancel().catch(() => undefined);
-    finish();
+    await finish();
     if (signal?.aborted) return new Response(null, { status: 499 });
     return new Response("OMP could not render this session history", { status: 502 });
   }
