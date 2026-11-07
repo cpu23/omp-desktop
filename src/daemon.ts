@@ -213,7 +213,13 @@ function sameOriginRequest(req: Request, requestUrl: URL, port: number): boolean
 }
 
 
-type WsData = { runtime?: Runtime; output?: TerminalOutput; unsubData?: () => void; unsubExit?: () => void };
+type WsData = {
+  runtime?: Runtime;
+  output?: TerminalOutput;
+  unsubData?: () => void;
+  unsubExit?: () => void;
+  unsubReady?: () => void;
+};
 
 
 /** Resume is restricted to real session files under the store: the daemon runs
@@ -296,16 +302,21 @@ async function waitForActivity(runtime: Runtime, expectedFile?: string): Promise
     if (result.kind === "available") {
       if (result.status.unloading) throw new RuntimeUnavailableError("session is unloading; send again after it closes");
       const file = result.status.sessionFile;
-      if (file !== null) {
+      if (file !== null && file.length > 0) {
         if (expectedFile && file !== expectedFile) {
           throw new SessionIdentityError("the runtime opened a different transcript; the request was not sent");
         }
-        return result.status;
+        if (runtime.ready) return result.status;
       }
     }
     await Bun.sleep(100);
   }
-  throw new RuntimeUnavailableError("session did not become ready; the request was not sent");
+  if (!runtime.ready) {
+    throw new RuntimeUnavailableError("terminal did not initialize before the startup timeout; the request was not sent");
+  }
+  throw new RuntimeUnavailableError(
+    "session did not become ready (terminal frame, idle socket, and session file are required); the request was not sent",
+  );
 }
 
 
@@ -919,6 +930,9 @@ const server = Bun.serve<WsData>({
       }
       if (terminalMatch[2] === "input" && req.method === "POST") {
         if (!runtime.alive) return new Response("runtime is not running", { status: 409 });
+        if (!runtime.ready) {
+          return new Response("terminal is still starting; input was not accepted", { status: 503 });
+        }
         let body: unknown;
         try {
           body = JSON.parse(new TextDecoder().decode(await readLimitedBytes(req, 128 * 1024)));
@@ -962,6 +976,16 @@ const server = Bun.serve<WsData>({
         return;
       }
       const output = ws.data.output = new TerminalOutput(ws);
+      let helloSent = false;
+      let readyBeforeHello = false;
+      ws.data.unsubReady = runtime.subscribeReady(() => {
+        if (!helloSent) {
+          readyBeforeHello = true;
+          return;
+        }
+        const message: ServerMessage = { type: "ready", runtime: runtime.info() };
+        output.send(JSON.stringify(message));
+      });
       ws.data.unsubData = runtime.subscribeOutput((replay, info) => {
         const hello: ServerMessage = {
           type: "hello",
@@ -970,6 +994,12 @@ const server = Bun.serve<WsData>({
         };
         output.send(JSON.stringify(hello));
         if (replay.length > 0) output.replay(replay, hello.replayBytes);
+        helloSent = true;
+        if (readyBeforeHello && info.status === "starting") {
+          const message: ServerMessage = { type: "ready", runtime: runtime.info() };
+          output.send(JSON.stringify(message));
+        }
+        readyBeforeHello = false;
       }, (data) => output.send(data));
       ws.data.unsubExit = runtime.subscribeExit((exit) => {
         const message: ServerMessage = { type: "exit", exitCode: exit.exitCode, daemonShutdown: shuttingDown };
@@ -982,6 +1012,10 @@ const server = Bun.serve<WsData>({
       const msg = parseClientMessage(raw);
       if (!msg) return;
       if (msg.type === "input") {
+        if (!runtime.ready) {
+          ws.close(1013, "Runtime is still starting; input was not accepted");
+          return;
+        }
         const unloading = runtime.sessionFile ? unloadingBySession.get(runtime.sessionFile) : undefined;
         if (unloading?.runtime === runtime) await unloading.done;
         if (!runtime.alive || unloadingRuntimes.has(runtime) || manager.get(runtime.id) !== runtime) {
@@ -993,6 +1027,12 @@ const server = Bun.serve<WsData>({
           const ack: ServerMessage = { type: "inputAck", id: msg.id };
           ws.data.output?.send(JSON.stringify(ack));
         }
+      } else if (msg.type === "terminalReply") {
+        if (!runtime.alive || unloadingRuntimes.has(runtime) || manager.get(runtime.id) !== runtime) {
+          ws.close(1012, "Session unavailable");
+          return;
+        }
+        runtime.writeTerminalReply(msg.data);
       } else runtime.resize(msg.cols, msg.rows);
     },
     drain(ws) {
@@ -1002,6 +1042,7 @@ const server = Bun.serve<WsData>({
       ws.data.output?.dispose();
       ws.data.unsubData?.();
       ws.data.unsubExit?.();
+      ws.data.unsubReady?.();
     },
   },
 });

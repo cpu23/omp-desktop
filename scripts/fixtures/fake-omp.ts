@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { appendFileSync, chmodSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { isRecord } from "../../src/guards";
 
@@ -80,7 +80,9 @@ function announceSessionFile(): void {
   process.stdout.write(`\x1b]1337;SetUserVar=omp_session_file=${encodedPath}\x07`);
 }
 if (process.env.OMP_DESKTOP_TEST_DEFER_SESSION_FILE !== "1") announceSessionFile();
-process.stdout.write("FAKE-OMP READY\r\n");
+const startupGate = process.env.OMP_DESKTOP_TEST_STARTUP_GATE;
+// OMP reads terminal negotiation replies in raw mode during startup.
+if (startupGate) process.stdin.setRawMode?.(true);
 
 let idleSince = Date.now();
 let unloading = false;
@@ -151,6 +153,7 @@ if (idleDir && idleToken) {
     },
   });
   chmodSync(socket, 0o600);
+  if (startupGate) writeFileSync(`${startupGate}.online`, "idle IPC listening");
   process.on("exit", () => {
     idleServer.stop(true);
     try { unlinkSync(socket); } catch {}
@@ -185,3 +188,12 @@ process.stdin.on("data", (chunk: Buffer) => {
 });
 
 process.stdin.resume();
+
+const startupMode = process.env.OMP_DESKTOP_TEST_STARTUP_MODE;
+if (startupMode === "no-frame") {
+  await new Promise<void>(() => {});
+} else {
+  while (startupGate && existsSync(startupGate)) await Bun.sleep(10);
+  if (startupGate) process.stdin.setRawMode?.(false);
+  process.stdout.write("\x1b[2JFAKE-OMP READY\r\n");
+}

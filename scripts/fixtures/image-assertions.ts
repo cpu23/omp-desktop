@@ -92,7 +92,9 @@ export async function runImageAssertions(page: ImageEvaluationPage): Promise<voi
   for (const scenario of cases) {
     const replay = new TerminalReplay(80, 24);
     try {
-      await new Promise<void>(resolve => replay.append(scenario.source, resolve));
+      const parsed = Promise.withResolvers<void>();
+      replay.append(scenario.source, () => parsed.resolve());
+      await parsed.promise;
       const snapshot = await new Promise<{ data: string; cols: number; rows: number }>(resolve => replay.snapshot(resolve));
       await page.evaluate(async ({ data, rows }: { data: string; rows: string }) => {
         const h = window.imageHarness;

@@ -5,10 +5,17 @@ import { tmpdir } from "node:os";
 import { connect as connectTcp } from "node:net";
 import { IMAGE_FILE_LIMIT } from "./image-limits";
 import { isRecord } from "./guards";
-import { parseServerMessage } from "./protocol";
+import { parseServerMessage, type ServerMessage } from "./protocol";
 import { fakeOmpRecordPath, startTestDaemon, testSessionsRoot, writeTestTranscript } from "../scripts/fixtures/daemon";
 
-type RuntimeInfo = { id: string; alive: boolean; pid: number | null; sessionFile: string | null; cwd: string };
+type RuntimeInfo = {
+  id: string;
+  alive: boolean;
+  pid: number | null;
+  sessionFile: string | null;
+  cwd: string;
+  status?: string;
+};
 
 async function createRuntime(base: string, request: Record<string, unknown> = {}): Promise<RuntimeInfo> {
   const response = await fetch(`${base}/api/runtimes`, {
@@ -42,6 +49,7 @@ async function runtimeList(base: string): Promise<RuntimeInfo[]> {
       pid: typeof record.pid === "number" ? record.pid : null,
       sessionFile: typeof record.sessionFile === "string" ? record.sessionFile : null,
       cwd: typeof record.cwd === "string" ? record.cwd : "",
+      status: typeof record.status === "string" ? record.status : undefined,
     };
   });
 }
@@ -447,8 +455,12 @@ describe("real daemon API behavior", () => {
       await opened.promise;
       await waitFor(
         () => messages.some((entry) => entry.parsed?.type === "hello") &&
-          messages.some((entry) => entry.raw instanceof ArrayBuffer),
-        "WebSocket hello and replay",
+          messages.some((entry) =>
+            entry.raw instanceof ArrayBuffer && new TextDecoder().decode(entry.raw).includes("FAKE-OMP READY"),
+          ) &&
+          (messages.some((entry) => entry.parsed?.type === "ready") ||
+            messages.some((entry) => entry.parsed?.type === "hello" && entry.parsed.runtime.status !== "starting")),
+        "WebSocket hello, initial frame and readiness",
       );
       const helloIndex = messages.findIndex((entry) => entry.parsed?.type === "hello");
       const replayIndex = messages.findIndex((entry) => entry.raw instanceof ArrayBuffer);
@@ -494,6 +506,143 @@ describe("real daemon API behavior", () => {
       await daemon.stop();
     }
   }, 60_000);
+  test("cold prompts and raw input wait for the parsed startup frame", async () => {
+    const gateDir = await mkdtemp(join(tmpdir(), "omp-startup-gate-"));
+    const gatePath = join(gateDir, "hold-first-frame");
+    await writeFile(gatePath, "held");
+    const daemon = await startTestDaemon({ env: { OMP_DESKTOP_TEST_STARTUP_GATE: gatePath } });
+    let earlySocket: WebSocket | null = null;
+    let observerSocket: WebSocket | null = null;
+    let coldRequest: Promise<Response> | null = null;
+    try {
+      const marker = `cold-start-prompt-${crypto.randomUUID()}`;
+      coldRequest = fetch(`${daemon.base}/api/sessions/request`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: marker }),
+      }).catch(error => new Response(String(error), { status: 599 }));
+
+      let runtime: RuntimeInfo | undefined;
+      await waitFor(async () => {
+        runtime = (await runtimeList(daemon.base)).find(entry => entry.id.length > 0);
+        return runtime?.alive === true &&
+          runtime.status === "starting" &&
+          typeof runtime.sessionFile === "string" &&
+          await Bun.file(`${gatePath}.online`).exists();
+      }, "the idle IPC socket while the PTY is still starting");
+      if (!runtime?.sessionFile) throw new Error("cold startup did not announce its transcript");
+      const sessionFile = runtime.sessionFile;
+      const recordPath = fakeOmpRecordPath(daemon.root, runtime.id);
+      expect(await Bun.file(sessionFile).text()).not.toContain(marker);
+
+      const earlyHttpText = `early-http-input-${crypto.randomUUID()}\n`;
+      const earlyHttp = await inputRequest(daemon.base, runtime.id, JSON.stringify({ data: earlyHttpText }));
+      expect(earlyHttp.status).toBe(503);
+      expect(await earlyHttp.text()).toContain("still starting");
+
+      const earlyFrames: Array<{ raw: string; parsed: ServerMessage | null }> = [];
+      earlySocket = new WebSocket(`ws://127.0.0.1:${daemon.port}/ws/term?runtime=${encodeURIComponent(runtime.id)}`);
+      earlySocket.onmessage = event => {
+        if (typeof event.data === "string") earlyFrames.push({ raw: event.data, parsed: parseServerMessage(event.data) });
+      };
+      const earlyOpened = Promise.withResolvers<void>();
+      const earlyClosed = Promise.withResolvers<CloseEvent>();
+      earlySocket.onopen = () => earlyOpened.resolve();
+      earlySocket.onerror = () => earlyOpened.reject(new Error("early runtime WebSocket failed"));
+      earlySocket.onclose = event => earlyClosed.resolve(event);
+      await earlyOpened.promise;
+      await waitFor(() => earlyFrames.some(frame => frame.parsed?.type === "hello"), "the starting hello");
+      const earlyHello = earlyFrames.find(frame => frame.parsed?.type === "hello")?.parsed;
+      expect(earlyHello?.type === "hello" ? earlyHello.runtime.status : null).toBe("starting");
+
+      const terminalReply = "\x1b[0n";
+      earlySocket.send(JSON.stringify({ type: "terminalReply", data: terminalReply }));
+      await waitFor(async () => {
+        if (!await Bun.file(recordPath).exists()) return false;
+        const recorded = Buffer.from(await Bun.file(recordPath).arrayBuffer());
+        return recorded.equals(Buffer.from(terminalReply));
+      }, "a valid terminal reply reaching the starting PTY");
+
+      const earlyWsText = `early-ws-input-${crypto.randomUUID()}\n`;
+      earlySocket.send(JSON.stringify({ type: "input", id: "rejected-starting-input", data: earlyWsText }));
+      const close = await earlyClosed.promise;
+      expect(close.code).toBe(1013);
+      expect(earlyFrames.some(frame =>
+        frame.parsed?.type === "inputAck" && frame.parsed.id === "rejected-starting-input",
+      )).toBe(false);
+      expect(Buffer.from(await Bun.file(recordPath).arrayBuffer())).toEqual(Buffer.from(terminalReply));
+
+      const observed: Array<{ raw: string; parsed: ServerMessage | null; binary: boolean }> = [];
+      observerSocket = new WebSocket(`ws://127.0.0.1:${daemon.port}/ws/term?runtime=${encodeURIComponent(runtime.id)}`);
+      observerSocket.binaryType = "arraybuffer";
+      observerSocket.onmessage = event => {
+        const binary = typeof event.data !== "string";
+        const raw = binary ? new TextDecoder().decode(event.data as ArrayBuffer) : event.data as string;
+        observed.push({ raw, parsed: binary ? null : parseServerMessage(raw), binary });
+      };
+      const observerOpened = Promise.withResolvers<void>();
+      observerSocket.onopen = () => observerOpened.resolve();
+      observerSocket.onerror = () => observerOpened.reject(new Error("readiness observer WebSocket failed"));
+      await observerOpened.promise;
+      await waitFor(() => observed.some(frame => frame.parsed?.type === "hello"), "the observer hello");
+      const observerHello = observed.find(frame => frame.parsed?.type === "hello")?.parsed;
+      expect(observerHello?.type === "hello" ? observerHello.runtime.status : null).toBe("starting");
+
+      await rm(gatePath, { force: true });
+      const response = await coldRequest;
+      expect(response.status).toBe(200);
+      await waitFor(
+        () => observed.some(frame => frame.parsed?.type === "ready"),
+        "the parsed-frame ready event",
+      );
+      const helloIndex = observed.findIndex(frame => frame.parsed?.type === "hello");
+      const clearFrameIndex = observed.findIndex(frame => frame.binary && frame.raw.includes("\x1b[2J"));
+      const readyIndex = observed.findIndex(frame => frame.parsed?.type === "ready");
+      expect(helloIndex).toBeGreaterThanOrEqual(0);
+      expect(clearFrameIndex).toBeGreaterThan(helloIndex);
+      expect(readyIndex).toBeGreaterThan(clearFrameIndex);
+      const readyMessage = observed[readyIndex]?.parsed;
+      expect(readyMessage?.type === "ready" ? readyMessage.runtime.status : "starting").not.toBe("starting");
+      const transcript = await Bun.file(sessionFile).text();
+      const submittedMessages = transcript.split("\n").filter(line => {
+        try {
+          const entry: unknown = JSON.parse(line);
+          return isRecord(entry) &&
+            isRecord(entry.message) &&
+            entry.message.role === "user" &&
+            entry.message.content === marker;
+        } catch {
+          return false;
+        }
+      });
+      expect(submittedMessages).toHaveLength(1);
+    } finally {
+      earlySocket?.close();
+      observerSocket?.close();
+      await daemon.stop();
+      await rm(gateDir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("a no-frame startup times out without submitting its prompt", async () => {
+    const daemon = await startTestDaemon({ env: { OMP_DESKTOP_TEST_STARTUP_MODE: "no-frame" } });
+    const marker = `unsubmitted-startup-prompt-${crypto.randomUUID()}`;
+    try {
+      const response = await fetch(`${daemon.base}/api/sessions/request`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: marker }),
+      });
+      expect(response.status).toBe(503);
+      expect(await response.text()).toContain("terminal did not initialize");
+      const runtime = (await runtimeList(daemon.base))[0];
+      if (!runtime?.sessionFile) throw new Error("no-frame runtime did not announce its transcript");
+      expect(runtime.status).toBe("starting");
+      expect(await Bun.file(runtime.sessionFile).text()).not.toContain(marker);
+    } finally {
+      await daemon.stop();
+    }
+  }, 30_000);
   test("the deterministic fake OMP exits with its requested status through a real PTY", async () => {
     const daemon = await startTestDaemon();
     let ws: WebSocket | null = null;
@@ -510,7 +659,13 @@ describe("real daemon API behavior", () => {
       ws.onopen = () => opened.resolve();
       ws.onerror = () => opened.reject(new Error("fake OMP exit-status WebSocket failed"));
       await opened.promise;
-      await waitFor(() => messages.some((message) => message?.type === "hello"), "the PTY attachment hello");
+      await waitFor(
+        () => messages.some(message =>
+          message?.type === "ready" ||
+          message?.type === "hello" && message.runtime.status !== "starting",
+        ),
+        "the initial parsed frame",
+      );
       expect((await inputRequest(daemon.base, runtime.id, JSON.stringify({ data: "exit 7\n" }))).status).toBe(200);
       await waitFor(
         () => messages.some((message) => message?.type === "exit" && message.exitCode === 7),

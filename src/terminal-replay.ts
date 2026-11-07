@@ -9,7 +9,7 @@ const DEFAULT_SCROLLBACK_ROWS = 20_000;
 
 type Snapshot = { data: string; cols: number; rows: number };
 type ReplayTask =
-  | { type: "write"; data: string; onParsed: () => void }
+  | { type: "write"; data: string; onParsed: (initialClearScreenSeen: boolean) => void }
   | { type: "resize"; cols: number; rows: number }
   | { type: "snapshot"; callback: (snapshot: Snapshot) => void }
   | { type: "screen"; callback: (snapshot: RuntimeScreenSnapshot) => void };
@@ -81,6 +81,7 @@ export class TerminalReplay {
   #taskIndex = 0;
   #running = false;
   #disposed = false;
+  #initialClearScreenSeen = false;
   #screenRejectors = new Set<(error: Error) => void>();
 
   constructor(cols: number, rows: number, resources?: RuntimeResourceLease) {
@@ -103,10 +104,14 @@ export class TerminalReplay {
 
     this.#serializer = new SerializeAddon();
     this.#terminal.loadAddon(this.#serializer as unknown as Parameters<Terminal["loadAddon"]>[0]);
+    this.#terminal.parser.registerCsiHandler({ final: "J" }, params => {
+      if (params[0] === 2) this.#initialClearScreenSeen = true;
+      return false;
+    });
   }
 
   /** Parse bytes before notifying subscribers that those bytes are visible. */
-  append(data: string, onParsed: () => void): void {
+  append(data: string, onParsed: (initialClearScreenSeen: boolean) => void): void {
     if (this.#disposed) return;
     this.#enqueue({ type: "write", data, onParsed });
   }
@@ -205,7 +210,7 @@ export class TerminalReplay {
         if (this.#disposed) return;
         try {
           this.#images.prune();
-          task.onParsed();
+          task.onParsed(this.#initialClearScreenSeen);
         } finally {
           this.#finishTask();
         }

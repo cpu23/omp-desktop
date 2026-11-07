@@ -89,6 +89,15 @@ Write in the composer and select **Send**, or press **Ctrl+Enter** / **⌘Enter*
 Plain Enter inserts a newline. Drafts and attachment references survive navigation; unconfirmed input is retained
 for review, never automatically resubmitted.
 
+Cold submission transitions the conversation from unloaded to **Starting**, not immediately to a usable loaded session.
+The daemon waits for the parsed initial clear-screen frame, an available idle IPC endpoint and the matching transcript
+before submitting the prompt. The pending composer is disabled; a startup timeout or failure preserves its draft for
+explicit retry, including if the process finishes initializing later. No prompt is automatically retried.
+Live panes remain input-disabled until server readiness, replay completion and the local terminal parser's write fence.
+The 10-second diagnostic changes the status text only; it never unlocks an uninitialized terminal.
+Desktop sets `PI_TUI_NATIVE=0` because xterm does not implement Tern Surface Protocol. This avoids the unsupported
+native-rendering fallback race without disabling native-shell GPU acceleration.
+
 Closing a pane or space only detaches its view; execution continues. For live runtimes, the daemon keeps a
 terminal-state mirror and restores its screen,
 scrolling margins (DECSTBM) and cursor visibility when a pane reconnects, along with up to 20,000 history rows and
@@ -330,10 +339,10 @@ The API remains loopback-only and unauthenticated; do not expose it directly to 
 | --- | --- |
 | `GET /api/runtimes` | Runtime list, default-directory metadata and current daemon `generation`; exited and unloaded runtimes leave the pool. |
 | `GET /api/runtimes/:id/screen` | Parser-fenced `{cols, rows, screen}` for the visible plain-text screen; no history serialization or resize. |
-| `POST /api/runtimes/:id/input` | `{data: string}`, at most 16,384 UTF-16 code units and a 128 KiB request body. |
+| `POST /api/runtimes/:id/input` | `{data: string}`, at most 16,384 UTF-16 code units and a 128 KiB request body. Returns 503 without writing while the runtime is starting. |
 | `DELETE /api/runtimes/:id` | Stop and release the runtime before returning success. |
 | `GET /api/sessions/history` | Stream ANSI history for a validated saved-session path and viewport; read-only, without a resident agent. |
-| `POST /api/sessions/request` | `{path?, cwd?, text, files?}`; create/resume only for this explicit request. Respond after SDK admission, not model generation. File references preserve inline image attachments. Maximum HTTP body and serialized IPC envelope (including transcript path and attachment paths) 128 KiB each. Oversize requests return 413 without dispatch. Fresh transcript paths are known only after startup; a final oversize rejection attempts safe idle cleanup. |
+| `POST /api/sessions/request` | `{path?, cwd?, text, files?}`; create/resume only for this explicit request. Wait for terminal and idle IPC readiness, then respond after SDK admission, not model generation. Startup timeout does not dispatch the prompt. File references preserve inline image attachments. Maximum HTTP body and serialized IPC envelope (including transcript path and attachment paths) 128 KiB each. Oversize requests return 413 without dispatch. Fresh transcript paths are known only after startup; a final oversize rejection attempts safe idle cleanup. |
 | `GET /api/settings` | Desired/effective process limits, idle timeout and whether a restart is required. |
 | `PUT /api/settings` | Partial `{maxRuntimes?, idleTimeoutMinutes?}`; idle changes apply immediately, process-limit changes retain restart semantics. |
 | `PUT /api/state` | Workspace document; requires `X-OMP-Generation` from the current runtime-list response. Missing or stale generations return `409`. |
@@ -341,6 +350,13 @@ The API remains loopback-only and unauthenticated; do not expose it directly to 
 Polling JSON routes support conditional ETags and gzip. Input producers must split larger text at Unicode-safe
 boundaries; the browser client does so before sending. WebSocket application queues are bounded to 4 MiB of pending
 live data and 4096 frames, with lazy replay encoding and native backpressure/drain handling.
+
+Runtime status is `starting` until its first parsed terminal frame; thereafter it is `idle` or `streaming`.
+WebSocket clients process `hello` and replay, then a `ready` control event if initialization was still pending.
+An already-ready `hello` needs no separate `ready` event. Ordinary `input` is rejected without acknowledgement during
+startup. A separate validated `terminalReply` message carries only terminal-negotiation replies so startup cannot
+deadlock while user input is locked; it does not count as user activity. Browser clients additionally wait for
+`replayDone` and a local terminal write callback before accepting user input.
 
 Run `OMP_MOBILE_CHECKOUT=/path/to/omp-mobile bun run release:check` from the Desktop checkout for paired verification.
 It checks the invoking worktree and the chosen companion in a disposable home, including frozen installs, typechecks,
