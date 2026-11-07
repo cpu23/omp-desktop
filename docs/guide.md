@@ -87,9 +87,10 @@ Saved conversations render read-only history through `omp render`, with at most 
 Output is spooled to a private temporary file before streaming to the pane, so large transcripts and inline images
 do not lose their final messages when the renderer exits. The temporary output is removed after delivery or cancellation.
 No resident agent or model request is started, and the transcript is not modified.
-Write in the composer and select **Send**, or press **Ctrl+Enter** / **⌘Enter**, to create or resume an agent.
-Plain Enter inserts a newline. Drafts and attachment references survive navigation; unconfirmed input is retained
-for review, never automatically resubmitted.
+Opening an unloaded session or clicking its pane focuses the draft; there is no Send button.
+Type and press **Enter** to create or resume an agent; **Shift+Enter** inserts a newline.
+Typing alone never starts an agent. History selection, scrolling and links remain usable.
+Drafts and attachment references survive navigation; unconfirmed input is retained for review, never automatically resubmitted.
 
 Closing a pane or space only detaches its view; execution continues. For live runtimes, the daemon keeps a
 terminal-state mirror and restores its screen,
@@ -196,8 +197,8 @@ ledgered live chats resume, but in-flight tools and unsaved terminal input do no
 Drop files onto a pane to insert quoted paths without submitting them. The native window uses original paths for
 all file types and does not upload file contents. In browsers, if security hides a file's path, only images can
 fall back to upload; other pathless files are ignored. Paths containing control characters are rejected.
-In a cold composer, paths remain draft references until **Send**. Supported PNG, JPEG, WebP and GIF files are read
-then and attached to the model request, within the existing 32 MiB image limit; other files remain path references.
+In a cold composer, paths remain draft references until you submit with **Enter**. Supported PNG, JPEG, WebP and GIF files
+are read then and attached to the model request, within the existing 32 MiB image limit; other files remain path references.
 
 ### Sidebar, settings and shortcuts
 
