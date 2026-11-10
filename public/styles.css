@@ -504,6 +504,27 @@ select:focus-visible {
   padding-left: 26px;
 }
 
+.workspace-show-more {
+  align-self: flex-start;
+  padding: 6px 4px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font: 11px var(--mono);
+  cursor: pointer;
+}
+
+.workspace-show-more:hover {
+  color: var(--text);
+  background: var(--panel-soft);
+}
+
+.workspace-show-more:focus-visible {
+  outline: 1px solid var(--effort-accent);
+  outline-offset: 1px;
+}
+
 
 .side-block input {
   width: 100%;

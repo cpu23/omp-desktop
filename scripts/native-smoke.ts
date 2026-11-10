@@ -352,7 +352,6 @@ async function selectWorkspaceFromNativePicker(
 ): Promise<void> {
   const input = profile.input;
   if (!input) throw new Error("Workspace picker smoke requires the real X11 input backend.");
-  await driver.clickCss("#sidebar-settings-open");
   await driver.clickCss("#add-workspace");
   const findDialog = (): string | false => {
     const result = Bun.spawnSync({
@@ -390,7 +389,6 @@ async function selectWorkspaceFromNativePicker(
     return Array.isArray(state.workspaces) && state.workspaces.includes(arguments[0]) &&
       (!Array.isArray(state.archivedWorkspaces) || !state.archivedWorkspaces.includes(arguments[0]));
   `, [workspacePath]), "the native picker to add and unarchive the workspace");
-  await driver.clickCss("#sidebar-settings-back");
 }
 
 async function testWorkspaceFolderActions(
@@ -413,9 +411,10 @@ async function testWorkspaceFolderActions(
   await driver.keyPress("\uE014");
   await driver.keyPress("\uE007");
   const expectedUri = pathToFileURL(workspacePath).href;
-  await waitFor("the native GIO file browser to receive the workspace URI", async () => {
+  await waitFor("the native GIO file browser to receive the workspace directory", async () => {
     const log = await readFile(fileBrowserLog, "utf8").catch(() => "");
-    return log.split(/\r?\n/).includes(expectedUri) ? true : false;
+    // GIO may convert a local file URI to a filename before launching the handler.
+    return log.split(/\r?\n/).some((argument) => argument === expectedUri || argument === workspacePath) ? true : false;
   });
   assert(await driver.attribute(trigger, "aria-expanded") === "false", "Workspace menu remained expanded after Show folder.");
 
@@ -481,6 +480,64 @@ async function testWorkspaceFolderActions(
   assert(JSON.stringify(afterReadd) === JSON.stringify(beforeArchive),
     "Re-adding a workspace changed daemon-owned runtime ids or pids.");
   console.log("ok - workspace menu opens the native file browser, archives durably without deleting sessions or stopping PTYs, and re-add restores it");
+}
+
+async function testWorkspaceSessionLimit(driver: WebDriver, daemon: TestDaemon): Promise<void> {
+  const cwd = join(daemon.root, "session limit fixture");
+  await mkdir(cwd, { recursive: true });
+  const paths: string[] = [];
+  for (let index = 1; index <= 7; index++) {
+    paths.push(await writeTestTranscript(daemon.root, `native-cap-${index}`, {
+      cwd, title: `native cap session ${index}`,
+    }));
+  }
+  // Closing search refreshes the index without waiting for its 30-second poll.
+  await driver.clickCss("#search-open");
+  await driver.clickCss("#search-close");
+  const selector = `.sidebar-folder:has(.folder-heading[data-cwd=${JSON.stringify(cwd)}])`;
+  const snapshot = () => driver.execute<{ paths: string[]; more: string | null }>(`
+    const folder = document.querySelector(arguments[0]);
+    return {
+      paths: Array.from(folder?.querySelectorAll(".row") ?? [], row => row.dataset.sessionFile),
+      more: folder?.querySelector(".workspace-show-more")?.textContent ?? null,
+    };
+  `, [selector]);
+  await driver.waitFor(async () => {
+    const value = await snapshot();
+    return value.paths.length === 6 && value.more === "Show more (1)";
+  }, "seven sessions to show six rows and one Show more button");
+  const capped = await snapshot();
+  assert(new Set(capped.paths).size === 6 && capped.paths.every((path) => paths.includes(path)),
+    "The capped workspace must show six distinct fixture sessions.");
+  if (process.env.OMP_DESKTOP_NATIVE_SCREENSHOT) {
+    await captureShellScreenshot(driver, process.env.OMP_DESKTOP_NATIVE_SCREENSHOT.replace(/\.png$/i, "-session-cap.png"));
+  }
+  const hidden = paths.find((path) => !capped.paths.includes(path))!;
+  await driver.clickCss("#search-open");
+  await driver.sendKeysCss("#search", "native cap session");
+  await driver.waitFor(async () => {
+    const value = await snapshot();
+    return JSON.stringify([...value.paths].sort()) === JSON.stringify([...paths].sort()) && value.more === null;
+  }, "search to expose all seven matching sessions without Show more");
+  await driver.clickCss("#search-close");
+  await driver.waitFor(async () => {
+    const value = await snapshot();
+    return value.paths.length === 6 && !value.paths.includes(hidden) && value.more === "Show more (1)";
+  }, "closing search to restore the six-session cap");
+  await driver.clickCss(`${selector} .workspace-show-more`);
+  await driver.waitFor(async () => {
+    const value = await snapshot();
+    return JSON.stringify([...value.paths].sort()) === JSON.stringify([...paths].sort()) && value.more === null;
+  }, "Show more to reveal the seventh session");
+  assert(await driver.execute<boolean>(`
+    return document.activeElement === document.querySelector(arguments[0])?.querySelectorAll(".row")[6];
+  `, [selector]), "Show more must focus the first newly revealed session.");
+  await driver.clickCss(`${selector} .folder-heading`);
+  await driver.clickCss(`${selector} .folder-heading`);
+  const expanded = await snapshot();
+  assert(JSON.stringify([...expanded.paths].sort()) === JSON.stringify([...paths].sort()) && expanded.more === null,
+    "Collapsing and reopening the folder must retain the revealed sessions.");
+  console.log("ok - workspace caps seven sessions at six, search exposes all matches, and Show more reveals the seventh with keyboard focus");
 }
 
 async function startPrivateBus(runtimeDir: string, home: string): Promise<{ address: string; child: ManagedChild; binary: string }> {
@@ -1331,18 +1388,20 @@ async function testFirstSessionAndPaneWorkload(
 
   await driver.rightClick(await driver.find("#panes .pane"));
   const firstSplitItem = await driver.waitFor(async () => {
-    const item = await driver.find(".pane-menu [role='menuitem']").catch(() => null);
+    const item = await driver.find(".pane-menu:not([hidden]) [role='menuitem']").catch(() => null);
     return item && await driver.displayed(item) ? item : false;
   }, "the first actual pane context menu");
+  assert(await driver.elementText(firstSplitItem) === "Split", "Pane context-menu action must be named Split.");
+  assert(await driver.attribute(await driver.find("#split-layout"), "aria-label") === "Split into 2×1",
+    "The toolbar must preview the side-by-side split for one pane.");
   await driver.click(firstSplitItem);
   await driver.waitFor(async () => await driver.findAll("#panes .pane").then((items) => items.length === 2), "the first pane split");
-  await driver.rightClick(await driver.find("#panes .pane"));
-  const secondSplitItem = await driver.waitFor(async () => {
-    const item = await driver.find(".pane-menu [role='menuitem']").catch(() => null);
-    return item && await driver.displayed(item) ? item : false;
-  }, "the second actual pane context menu");
-  await driver.click(secondSplitItem);
+  assert(await driver.attribute(await driver.find("#split-layout"), "aria-label") === "Split into 2×2",
+    "The toolbar must preview the grid split for two panes.");
+  await driver.clickCss("#split-layout");
   await driver.waitFor(async () => (await driver.findAll("#panes .pane")).length === 4, "the four-pane layout");
+  assert(await driver.execute<boolean>(`return document.querySelector("#split-layout").disabled;`),
+    "The toolbar split button must be disabled at four panes.");
   // Splitting creates cold panes, not agents. Start each new pane through its
   // real composer before testing native multi-runtime keyboard routing.
   const coldPaneIds = await driver.execute<string[]>(`return Array.from(document.querySelectorAll('#panes .pane'))
@@ -1469,6 +1528,7 @@ async function testFirstSessionAndPaneWorkload(
     archiveTranscriptPath,
     folderBrowserLog,
   );
+  await testWorkspaceSessionLimit(driver, daemon);
 
   await driver.clickCss("#new-space");
   await driver.waitFor(async () => await driver.findAll("#space-tabs [role='tab']").then((items) => items.length === 2), "the second workspace space");

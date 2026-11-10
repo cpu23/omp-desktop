@@ -211,6 +211,9 @@ click the folder-plus **Add workspace** icon to open the system directory choose
 Cancel leaves the list unchanged; choosing the same directory again selects the existing workspace.
 Added workspaces remain visible even without sessions. Selection and collapsed groups persist across reloads
 and are included in the daemon's durable sidebar mirror.
+Workspaces show six sessions initially; when a seventh exists, **Show more (N)** reveals the remaining sessions
+in that workspace and focuses the first newly revealed row. Reloading returns to the six-row default.
+Search shows every matching session without applying this six-row cutoff.
 
 Hover a workspace heading (or focus it with the keyboard) to reveal **+** and start a session in that directory.
 The header **+** uses the selected workspace, falling back to the daemon's default directory when none is selected.
@@ -400,7 +403,8 @@ bun run smoke:native -- --images
 
 The full runner uses isolated fixture daemons, profiles and a private D-Bus notification service. It needs
 `WebKitWebDriver`, `dbus-daemon`, Python 3 with PyGObject, AT-SPI (`at-spi2-core` and `gir1.2-atspi-2.0`), Xvfb,
-`xdotool`, `xprop` (`x11-utils`), `wmctrl`, `xclip`, `scrot`, and Openbox; Ubuntu CI installs the driver from `webkit2gtk-driver`.
+`xdotool`, `xprop` (`x11-utils`), `wmctrl`, `xclip`, `scrot`, and Openbox. The driver package is `webkitgtk-webdriver`
+on Ubuntu 26.04; older Ubuntu releases use `webkit2gtk-driver`.
 
 On Ubuntu 24.04, `bwrap: setting up uid map: Permission denied` can indicate AppArmor is blocking the user namespace
 required by WebKit's sandbox. See [Ubuntu bug 2144531](https://bugs.launchpad.net/ubuntu/+source/bubblewrap/+bug/2144531)

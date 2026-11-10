@@ -189,6 +189,8 @@ type SidebarFolderRecord = {
   marker: HTMLElement;
   label: HTMLElement;
   contents: HTMLElement;
+  more: HTMLButtonElement;
+  showAllSessions: boolean;
 };
 
 const sidebarRows = new Map<string, SidebarRowRecord>();
@@ -2594,6 +2596,8 @@ function reconcileChildren(container: HTMLElement, desired: HTMLElement[]): void
   }
 }
 
+const WORKSPACE_SESSION_LIMIT = 6;
+
 function folderRecord(cwd: string): SidebarFolderRecord {
   const existing = sidebarFolders.get(cwd);
   if (existing) return existing;
@@ -2643,6 +2647,14 @@ function folderRecord(cwd: string): SidebarFolderRecord {
   const contents = document.createElement("div");
   contents.className = "folder-sessions";
   contents.id = `sidebar-folder-${++sidebarFolderSeq}`;
+  const more = document.createElement("button");
+  more.type = "button";
+  more.className = "workspace-show-more";
+  more.addEventListener("click", () => {
+    record.showAllSessions = true;
+    renderSidebar();
+    (contents.children[WORKSPACE_SESSION_LIMIT] as HTMLElement | undefined)?.focus();
+  });
   heading.setAttribute("aria-controls", contents.id);
   heading.addEventListener("click", () => {
     selectSidebarWorkspace(cwd);
@@ -2650,7 +2662,7 @@ function folderRecord(cwd: string): SidebarFolderRecord {
     heading.focus();
   });
   element.append(header, contents);
-  const record = { element, heading, marker, label, contents };
+  const record = { element, heading, marker, label, contents, more, showAllSessions: false };
   sidebarFolders.set(cwd, record);
   return record;
 }
@@ -2794,7 +2806,16 @@ function renderSidebar(): void {
       if (query && folderRows.length === 0 && !cwd.toLowerCase().includes(query)) continue;
       const folder = folderRecord(cwd);
       updateFolder(folder, cwd);
-      reconcileChildren(folder.contents, folderRows.map((row) => row.element));
+      const limited = !query && !folder.showAllSessions && folderRows.length > WORKSPACE_SESSION_LIMIT;
+      const visibleRows = limited ? folderRows.slice(0, WORKSPACE_SESSION_LIMIT) : folderRows;
+      const children = visibleRows.map((row) => row.element);
+      if (limited) {
+        const remaining = folderRows.length - WORKSPACE_SESSION_LIMIT;
+        folder.more.textContent = `Show more (${remaining})`;
+        folder.more.setAttribute("aria-label", `Show ${remaining} more sessions in ${cwd}`);
+        children.push(folder.more);
+      }
+      reconcileChildren(folder.contents, children);
       desiredTopLevel.push(folder.element);
     }
   } else {
