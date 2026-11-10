@@ -33,6 +33,7 @@ const WINDOW_TITLE: &str = "OMP Desktop";
 const SHELL_MARKER: &str = "Object.defineProperty(window,'__OMP_DESKTOP_SHELL__',{value:'gtk'});";
 const CONNECT_HANDLER: &str = "ompDesktopConnect";
 const WORKSPACE_PICKER_HANDLER: &str = "ompDesktopSelectWorkspaceDirectory";
+const SHOW_FOLDER_HANDLER: &str = "ompDesktopShowWorkspaceFolder";
 const BOOTSTRAP_RECOVERY_MARKER: &str = "__OMP_DESKTOP_RECOVERY_ERROR__";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,9 +214,11 @@ fn build_window(
     // Only the trusted top frame receives this capability. WebKit's message
     // value context cannot evaluate DOM globals to identify its calling frame.
     let workspace_picker_token = glib::uuid_string_random().to_string();
-    let token_json = serde_json::to_string(&workspace_picker_token).expect("UUID is valid JSON");
+    let picker_token_json = serde_json::to_string(&workspace_picker_token).expect("UUID is valid JSON");
+    let show_folder_token = glib::uuid_string_random().to_string();
+    let show_folder_token_json = serde_json::to_string(&show_folder_token).expect("UUID is valid JSON");
     let user_script_source = format!(
-        "if(location.origin==={daemon_script_origin}){{{SHELL_MARKER}Object.defineProperty(window,'__OMP_SELECT_WORKSPACE_DIRECTORY__',{{value:(()=>{{const token={token_json};const handler=window.webkit.messageHandlers.{WORKSPACE_PICKER_HANDLER};const post=handler.postMessage.bind(handler);return ()=>post(token);}})()}});}}"
+        "if(location.origin==={daemon_script_origin}){{{SHELL_MARKER}Object.defineProperty(window,'__OMP_SELECT_WORKSPACE_DIRECTORY__',{{value:(()=>{{const token={picker_token_json};const handler=window.webkit.messageHandlers.{WORKSPACE_PICKER_HANDLER};const post=handler.postMessage.bind(handler);return ()=>post(token);}})()}});Object.defineProperty(window,'__OMP_SHOW_WORKSPACE_FOLDER__',{{value:(()=>{{const token={show_folder_token_json};const handler=window.webkit.messageHandlers.{SHOW_FOLDER_HANDLER};const post=handler.postMessage.bind(handler);return path=>post(token+'\\n'+path);}})()}});}}"
     );
     let user_script = UserScript::new(
         &user_script_source,
@@ -297,6 +300,7 @@ fn build_window(
     let single_flight = Rc::new(Cell::new(false));
     install_connect_bridge(&view, &user_content, port, &single_flight, &bootstrap_generation);
     install_workspace_picker_bridge(&view, &user_content, port, &window, workspace_picker_token);
+    install_show_folder_bridge(&view, &user_content, port, show_folder_token);
 
     let recovery_script: Rc<RefCell<Option<UserScript>>> = Rc::new(RefCell::new(None));
     let recovery_in_progress = Rc::new(Cell::new(false));
@@ -497,9 +501,11 @@ fn install_navigation_policy(
                             generation.set(generation.get().wrapping_add(1));
                             ensure_connect_handler(&manager);
                             manager.unregister_script_message_handler(WORKSPACE_PICKER_HANDLER, None);
+                            manager.unregister_script_message_handler(SHOW_FOLDER_HANDLER, None);
                         } else {
                             manager.unregister_script_message_handler(CONNECT_HANDLER, None);
                             ensure_workspace_picker_handler(&manager);
+                            ensure_show_folder_handler(&manager);
                         }
                         if let Some(view) = weak_view.upgrade() {
                             view.load_uri(&uri);
@@ -535,9 +541,11 @@ fn install_navigation_policy(
                     generation.set(generation.get().wrapping_add(1));
                     ensure_connect_handler(&manager);
                     manager.unregister_script_message_handler(WORKSPACE_PICKER_HANDLER, None);
+                    manager.unregister_script_message_handler(SHOW_FOLDER_HANDLER, None);
                 } else {
                     manager.unregister_script_message_handler(CONNECT_HANDLER, None);
                     ensure_workspace_picker_handler(&manager);
+                    ensure_show_folder_handler(&manager);
                 }
                 decision.use_();
             }
@@ -737,6 +745,71 @@ fn install_workspace_picker_bridge(
             true
         },
     );
+}
+
+fn install_show_folder_bridge(
+    view: &WebView,
+    user_content: &UserContentManager,
+    port: u16,
+    token: String,
+) {
+    let weak_view = view.downgrade();
+    let signal_manager = user_content.clone();
+    let prefix = format!("{token}\n");
+    signal_manager.connect_script_message_with_reply_received(
+        Some(SHOW_FOLDER_HANDLER),
+        move |_manager, value, reply| {
+            if !value.is_string() {
+                reply.return_error_message("Unsupported workspace folder request.");
+                return true;
+            }
+            let request = value.to_str();
+            let Some(path) = request.strip_prefix(&prefix) else {
+                reply.return_error_message("Unsupported workspace folder request.");
+                return true;
+            };
+            let Some(js_context) = value.context() else {
+                reply.return_error_message("The workspace folder reply context is unavailable.");
+                return true;
+            };
+            let Some(view) = weak_view.upgrade() else {
+                reply.return_error_message("The desktop window has closed.");
+                return true;
+            };
+            if !view
+                .uri()
+                .is_some_and(|uri| policy::is_daemon_origin(uri.as_str(), port))
+            {
+                reply.return_error_message("Workspace folders can only be opened from the desktop daemon page.");
+                return true;
+            }
+            if path.is_empty() || path.contains('\0') {
+                reply.return_error_message("The workspace folder path is invalid.");
+                return true;
+            }
+            let path = PathBuf::from(path);
+            if !path.is_absolute() {
+                reply.return_error_message("The workspace folder path is not absolute.");
+                return true;
+            }
+            if !path.is_dir() {
+                reply.return_error_message(&format!("The workspace folder is not available: {}", path.display()));
+                return true;
+            }
+            let uri = gio::File::for_path(&path).uri();
+            match gio::AppInfo::launch_default_for_uri(uri.as_str(), None::<&gio::AppLaunchContext>) {
+                Ok(()) => reply.return_value(&JsValue::new_null(&js_context)),
+                Err(error) => reply.return_error_message(&format!(
+                    "Could not open the workspace folder in the file browser: {error}"
+                )),
+            }
+            true
+        },
+    );
+}
+
+fn ensure_show_folder_handler(user_content: &UserContentManager) {
+    let _ = user_content.register_script_message_handler_with_reply(SHOW_FOLDER_HANDLER, None);
 }
 
 fn ensure_workspace_picker_handler(user_content: &UserContentManager) {

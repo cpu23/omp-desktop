@@ -2,8 +2,9 @@ import { trimSelectionHighlight } from "./selection";
 import {
   applySidebarState, onSidebarStateChange, sidebarFolderView, sidebarFolderExpanded,
   toggleSidebarFolder, sidebarWorkspaces, sidebarActiveWorkspace, selectSidebarWorkspace,
-  normalizeDirectoryPath, STORE_KEY as SIDEBAR_KEY,
+  archiveSidebarWorkspace, sidebarWorkspaceArchived, normalizeDirectoryPath, STORE_KEY as SIDEBAR_KEY,
 } from "./sidebar";
+import { showWorkspaceFolder } from "./workspace-picker";
 import { doneIndicator, workingIndicator } from "./working-indicator";
 import { CompletionTracker } from "./completion-tracker";
 import { CompletionNotifications } from "./notifications";
@@ -41,6 +42,7 @@ const statusEl = document.getElementById("status") as HTMLElement;
 const buildEl = document.getElementById("build") as HTMLElement;
 const spaceTabsEl = document.getElementById("space-tabs") as HTMLElement;
 const newSpaceEl = document.getElementById("new-space") as HTMLButtonElement;
+const splitLayoutEl = document.getElementById("split-layout") as HTMLButtonElement;
 const panesEl = document.getElementById("panes") as HTMLElement;
 const sessionListEl = document.getElementById("session-list") as HTMLElement;
 const searchEl = document.getElementById("search") as HTMLInputElement;
@@ -247,7 +249,7 @@ function closeSessionMenu(): void {
 }
 function showSessionMenu(record: SidebarRowRecord, x: number, y: number): void {
   closePaneMenu();
-  closeSessionMenu();
+  closeWorkspaceMenu();
   const session = record.snapshot;
   const runtime = record.runtime;
   const item = (label: string, icon: keyof typeof SESSION_ICONS, action: () => void, disabled = false): void => {
@@ -319,6 +321,92 @@ sessionMenu.addEventListener("focusout", () => {
 });
 window.addEventListener("blur", closeSessionMenu);
 window.addEventListener("resize", closeSessionMenu);
+
+const workspaceMenu = document.createElement("div");
+workspaceMenu.id = "workspace-actions-menu";
+workspaceMenu.className = "pane-menu";
+workspaceMenu.setAttribute("role", "menu");
+workspaceMenu.hidden = true;
+document.body.append(workspaceMenu);
+let workspaceMenuAnchor: HTMLButtonElement | null = null;
+
+function closeWorkspaceMenu(restoreFocus = false): void {
+  workspaceMenu.hidden = true;
+  workspaceMenu.replaceChildren();
+  workspaceMenuAnchor?.setAttribute("aria-expanded", "false");
+  const anchor = workspaceMenuAnchor;
+  workspaceMenuAnchor = null;
+  if (restoreFocus) anchor?.focus();
+}
+
+function showWorkspaceMenu(cwd: string, anchor: HTMLButtonElement): void {
+  if (!workspaceMenu.hidden && workspaceMenuAnchor === anchor) {
+    closeWorkspaceMenu();
+    return;
+  }
+  closePaneMenu();
+  closeSessionMenu();
+  closeWorkspaceMenu();
+  workspaceMenuAnchor = anchor;
+  anchor.setAttribute("aria-expanded", "true");
+  workspaceMenu.setAttribute("aria-label", `Workspace actions for ${cwd}`);
+  const item = (label: string, action: () => void): void => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.setAttribute("role", "menuitem");
+    button.textContent = label;
+    button.addEventListener("click", action);
+    workspaceMenu.append(button);
+  };
+  item("Archive workspace", () => {
+    closeWorkspaceMenu();
+    archiveSidebarWorkspace(cwd);
+    document.querySelector<HTMLButtonElement>("#add-workspace")?.focus();
+  });
+  item("Show folder", () => {
+    closeWorkspaceMenu(true);
+    void showWorkspaceFolder(cwd).catch((error: unknown) => {
+      const detail = error instanceof Error ? error.message : String(error);
+      setStatus(`Could not open folder: ${detail}`, "warn");
+    });
+  });
+  workspaceMenu.hidden = false;
+  const rect = workspaceMenu.getBoundingClientRect();
+  const anchorRect = anchor.getBoundingClientRect();
+  const x = Math.max(0, Math.min(anchorRect.right - rect.width, innerWidth - rect.width));
+  const y = Math.max(0, Math.min(anchorRect.bottom, innerHeight - rect.height));
+  workspaceMenu.style.left = `${x}px`;
+  workspaceMenu.style.top = `${y}px`;
+  workspaceMenu.querySelector<HTMLButtonElement>('[role="menuitem"]')?.focus();
+}
+
+workspaceMenu.addEventListener("keydown", (event) => {
+  const items = [...workspaceMenu.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not(:disabled)')];
+  const index = items.indexOf(document.activeElement as HTMLButtonElement);
+  if (event.key === "Escape") {
+    event.preventDefault();
+    event.stopPropagation();
+    closeWorkspaceMenu(true);
+  } else if (event.key === "ArrowDown" || event.key === "ArrowUp" || event.key === "Home" || event.key === "End") {
+    event.preventDefault();
+    const next = event.key === "Home" ? 0
+      : event.key === "End" ? items.length - 1
+      : (index + (event.key === "ArrowDown" ? 1 : items.length - 1)) % items.length;
+    items[next]?.focus();
+  }
+});
+document.addEventListener("pointerdown", (event) => {
+  if (!(event.target instanceof Node) || workspaceMenu.contains(event.target)) return;
+  if (event.target instanceof Element && event.target.closest("button.workspace-menu") === workspaceMenuAnchor) return;
+  closeWorkspaceMenu();
+}, true);
+workspaceMenu.addEventListener("focusout", () => {
+  queueMicrotask(() => {
+    if (!workspaceMenu.contains(document.activeElement)) closeWorkspaceMenu();
+  });
+});
+window.addEventListener("blur", () => closeWorkspaceMenu());
+window.addEventListener("resize", () => closeWorkspaceMenu());
 
 function pinButton(currentSession: () => SessionSummaryLike | null): HTMLButtonElement {
   const button = document.createElement("button");
@@ -1756,6 +1844,10 @@ splitMenuItem.addEventListener("click", () => {
   splitLayout();
   focusedPane()?.focus();
 });
+splitLayoutEl.addEventListener("click", () => {
+  splitLayout();
+  focusedPane()?.focus();
+});
 panesEl.addEventListener("contextmenu", (event) => {
   const target = event.target instanceof Element ? event.target.closest<HTMLElement>(".pane") : null;
   const pane = target?.dataset.pane ? panes.get(target.dataset.pane) : null;
@@ -1763,9 +1855,7 @@ panesEl.addEventListener("contextmenu", (event) => {
   event.preventDefault();
   pane.focus();
   const count = leaves().length;
-  splitMenuItem.textContent = count >= MAX_PANES
-    ? "Split — maximum 4 panes"
-    : count === 1 ? "Split side by side" : "Split into 2×2";
+  splitMenuItem.textContent = "Split";
   splitMenuItem.disabled = count >= MAX_PANES;
   paneMenu.hidden = false;
   const rect = paneMenu.getBoundingClientRect();
@@ -2202,6 +2292,11 @@ function togglePaneFocus(): void {
 
 function renderLayout(preservePaneFocus = false): void {
   closePaneMenu();
+  const count = leaves().length;
+  splitLayoutEl.disabled = count >= MAX_PANES;
+  splitLayoutEl.title = count >= MAX_PANES ? "Maximum 4 panes" : count === 1 ? "Split into 2×1" : "Split into 2×2";
+  splitLayoutEl.setAttribute("aria-label", splitLayoutEl.title);
+  splitLayoutEl.innerHTML = `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M12 3v18${count === 1 ? "" : "M3 12h18"}"/></svg>`;
   if (!preservePaneFocus) expandedPaneId = null;
   const tree: LayoutNode = expandedPaneId ? { kind: "leaf", pane: expandedPaneId } : layout.tree;
   const ids = leaves(tree);
@@ -2527,9 +2622,24 @@ function folderRecord(cwd: string): SidebarFolderRecord {
     const pane = focusedPane();
     if (pane) void newSession(pane, true, cwd);
   });
+  const menuButton = document.createElement("button");
+  menuButton.type = "button";
+  menuButton.className = "workspace-menu";
+  menuButton.title = `Workspace actions for ${name}`;
+  menuButton.setAttribute("aria-label", menuButton.title);
+  menuButton.setAttribute("aria-haspopup", "menu");
+  menuButton.setAttribute("aria-controls", workspaceMenu.id);
+  menuButton.setAttribute("aria-expanded", "false");
+  menuButton.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg>';
+  menuButton.addEventListener("click", () => showWorkspaceMenu(cwd, menuButton));
+  menuButton.addEventListener("keydown", (event) => {
+    if (event.key !== "ArrowDown") return;
+    event.preventDefault();
+    showWorkspaceMenu(cwd, menuButton);
+  });
   const header = document.createElement("div");
   header.className = "workspace-heading";
-  header.append(heading, add);
+  header.append(heading, add, menuButton);
   const contents = document.createElement("div");
   contents.className = "folder-sessions";
   contents.id = `sidebar-folder-${++sidebarFolderSeq}`;
@@ -2598,15 +2708,19 @@ function renderSidebar(): void {
     })
     : runtimes;
   // Exited transcripts belong to the same saved-session list, not a stale runtime row.
-  const visibleRuntimes = liveRuntimes.filter((runtime) =>
-    (attachable(runtime) || !runtime.sessionFile) &&
-    (!runtime.sessionFile || !archivedPaths.has(runtime.sessionFile))
-  );
+  const visibleRuntimes = liveRuntimes.filter((runtime) => {
+    const summary = runtime.sessionFile ? sessionSummary(runtime.sessionFile) : undefined;
+    const cwd = summary?.cwd ?? runtime.cwd;
+    return (attachable(runtime) || !runtime.sessionFile) &&
+      (!runtime.sessionFile || !archivedPaths.has(runtime.sessionFile)) &&
+      !sidebarWorkspaceArchived(cwd);
+  });
   const candidates = new Map(pinnedSessions.map((session) => [session.path, session]));
   for (const session of sessions) candidates.set(session.path, session);
   const recent = [...candidates.values()].filter((session) =>
     !liveFiles.has(session.path) &&
     !archivedPaths.has(session.path) &&
+    !sidebarWorkspaceArchived(session.cwd) &&
     (!query || sessionByPath.has(session.path) || `${session.title} ${session.cwd}`.toLowerCase().includes(query)),
   ).sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt) || a.path.localeCompare(b.path));
 
@@ -2655,8 +2769,9 @@ function renderSidebar(): void {
     const bActivity = Date.parse(b.snapshot?.updatedAt ?? b.runtime?.startedAt ?? "") || 0;
     return bActivity - aActivity || aPath.localeCompare(bPath);
   });
+  const visibleWorkspaces = sidebarWorkspaces().filter((cwd) => !sidebarWorkspaceArchived(cwd));
   const desiredTopLevel: HTMLElement[] = [];
-  if (rows.length === 0 && (!folderView || sidebarWorkspaces().length === 0 || query !== "")) {
+  if (rows.length === 0 && (!folderView || visibleWorkspaces.length === 0 || query !== "")) {
     if (!sidebarEmpty) {
       sidebarEmpty = document.createElement("div");
       sidebarEmpty.className = "side-empty";
@@ -2667,7 +2782,7 @@ function renderSidebar(): void {
   }
 
   const rowsByFolder = new Map<string, SidebarRowRecord[]>();
-  for (const cwd of sidebarWorkspaces()) rowsByFolder.set(cwd, []);
+  for (const cwd of visibleWorkspaces) rowsByFolder.set(cwd, []);
   for (const row of rows) {
     const cwd = row.element.dataset.cwd ?? "";
     const folderRows = rowsByFolder.get(cwd) ?? [];
@@ -2716,6 +2831,7 @@ function renderSidebar(): void {
     sidebarFolders.delete(cwd);
   }
   reconcileChildren(sessionListEl, desiredTopLevel);
+  if (workspaceMenuAnchor && !workspaceMenuAnchor.isConnected) closeWorkspaceMenu();
 }
 
 function focusedPane(): Pane | null {

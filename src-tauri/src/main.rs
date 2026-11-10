@@ -23,7 +23,8 @@ fn main() {
         .plugin(tauri_plugin_notification::init())
         .invoke_handler(tauri::generate_handler![
             shell::connect,
-            shell::select_workspace_directory
+            shell::select_workspace_directory,
+            shell::show_workspace_folder
         ])
         .setup(|app| {
             shell::build_main_window(app.handle())?;

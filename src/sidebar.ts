@@ -29,12 +29,14 @@ type SidebarState = {
   workspaces: string[];
   activeWorkspace: string | null;
   collapsedWorkspaces: string[];
+  archivedWorkspaces: string[];
 };
 
 let view: SidebarState["view"] = "workspaces";
 let workspaces: string[] = [];
 let activeWorkspace: string | null = null;
 let collapsedWorkspaces = new Set<string>();
+let archivedWorkspaces = new Map<string, string>();
 let savePreferences: (() => void) | null = null;
 let refreshViewControls: (() => void) | null = null;
 
@@ -60,12 +62,32 @@ export function sidebarWorkspaces(): readonly string[] {
   return workspaces;
 }
 
+export function sidebarWorkspaceArchived(cwd: string): boolean {
+  const path = normalizeDirectoryPath(cwd);
+  return path !== null && archivedWorkspaces.has(workspacePathKey(path));
+}
+
+export function archiveSidebarWorkspace(cwd: string): void {
+  const path = normalizeDirectoryPath(cwd);
+  if (path === null) return;
+  const key = workspacePathKey(path);
+  if (archivedWorkspaces.has(key)) return;
+  archivedWorkspaces.set(key, path);
+  if (activeWorkspace !== null && workspacePathKey(activeWorkspace) === key) {
+    activeWorkspace = workspaces.find((workspace) =>
+      !archivedWorkspaces.has(workspacePathKey(workspace)),
+    ) ?? null;
+  }
+  savePreferences?.();
+}
+
 export function addSidebarWorkspace(cwd: string): void {
   const path = normalizeDirectoryPath(cwd);
   if (path === null) return;
   const key = workspacePathKey(path);
   const existing = workspaces.find((workspace) => workspacePathKey(workspace) === key);
   if (existing === undefined) workspaces = [...workspaces, path];
+  archivedWorkspaces.delete(key);
   activeWorkspace = existing ?? path;
   collapsedWorkspaces.delete(key);
   view = "workspaces";
@@ -202,6 +224,7 @@ function parseSidebarState(value: unknown): SidebarState {
       workspaces,
       activeWorkspace: active,
       collapsedWorkspaces: normalizedDirectoryPaths(record.collapsedWorkspaces),
+      archivedWorkspaces: normalizedDirectoryPaths(record.archivedWorkspaces),
     };
   }
   return {
@@ -210,6 +233,7 @@ function parseSidebarState(value: unknown): SidebarState {
     workspaces: [],
     activeWorkspace: null,
     collapsedWorkspaces: [],
+    archivedWorkspaces: [],
   };
 }
 
@@ -237,11 +261,33 @@ function init(): void {
   workspaces = stored.workspaces;
   activeWorkspace = stored.activeWorkspace;
   collapsedWorkspaces = new Set(stored.collapsedWorkspaces.map(workspacePathKey));
-
+  archivedWorkspaces = new Map(stored.archivedWorkspaces.map((path) => [workspacePathKey(path), path]));
   const settings = document.getElementById("sidebar-settings")!;
   const settingsOpen = document.getElementById("sidebar-settings-open")!;
   const settingsBack = document.getElementById("sidebar-settings-back")!;
-  const search = document.getElementById("search")!;
+  const search = document.getElementById("search") as HTMLInputElement;
+  const searchRow = document.getElementById("search-row")!;
+  const searchOpen = document.getElementById("search-open")!;
+  const searchClose = document.getElementById("search-close")!;
+  function closeSearch(): void {
+    searchRow.hidden = true;
+    searchOpen.setAttribute("aria-expanded", "false");
+    search.value = "";
+    search.dispatchEvent(new Event("input", { bubbles: true }));
+    searchOpen.focus();
+  }
+  searchOpen.addEventListener("click", () => {
+    searchRow.hidden = false;
+    searchOpen.setAttribute("aria-expanded", "true");
+    search.focus();
+  });
+  searchClose.addEventListener("click", closeSearch);
+  search.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    event.preventDefault();
+    event.stopPropagation();
+    closeSearch();
+  });
   const newSession = document.getElementById("new-session")!;
   const sidebarTitle = document.getElementById("sidebar-title")!;
   const addWorkspace = document.getElementById("add-workspace") as HTMLButtonElement;
@@ -262,7 +308,8 @@ function init(): void {
   function showSettings(show: boolean): void {
     settingsVisible = show;
     settings.hidden = !show;
-    search.hidden = show;
+    if (show && !searchRow.hidden) closeSearch();
+    searchOpen.hidden = show;
     sidebarTitle.hidden = show;
     addWorkspace.hidden = show;
     pickerStatus.hidden = show || !pickerStatus.textContent;
@@ -320,6 +367,7 @@ function init(): void {
         workspaces,
         activeWorkspace,
         collapsedWorkspaces: [...collapsedWorkspaces],
+        archivedWorkspaces: [...archivedWorkspaces.values()],
       } satisfies SidebarState));
     } catch {
       // Storage denied: the sidebar still works for this page life.
@@ -413,6 +461,7 @@ function init(): void {
     workspaces = state.workspaces;
     activeWorkspace = state.activeWorkspace;
     collapsedWorkspaces = new Set(state.collapsedWorkspaces.map(workspacePathKey));
+    archivedWorkspaces = new Map(state.archivedWorkspaces.map((path) => [workspacePathKey(path), path]));
     renderView();
     saveState();
     render();

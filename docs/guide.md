@@ -77,11 +77,17 @@ for diagnosis. The shell does not automatically relaunch with another backend or
 ## Sessions, spaces and panes
 
 Create spaces with **+** in the top bar. Each space has its own layout (up to four panes); drag a pane header or
-a sidebar session onto another space's tab to move/open it there. Right-click a pane to split the layout:
-1×1 becomes side-by-side, then 2×2. Panes meet at a single 1px separator with no gutter or duplicate borders;
+a sidebar session onto another space's tab to move/open it there. Right-click a pane and choose **Split**, or use
+the top-right split button: 1×1 becomes side-by-side, then 2×2. The button previews the next layout and disables at
+four panes. Panes meet at a single 1px separator with no gutter or duplicate borders;
 drag on or just beside the separator to resize. In a 2×2 grid, closing one pane leaves an empty
 slot; closing another occupied pane collapses the grid. New panes prepare local drafts; clicking a sidebar session
 opens it in the focused pane. Neither action starts a new agent.
+
+The sidebar's magnifying-glass button opens search over its heading row, with the search icon on the left and
+a close button on the right. Close it with **×** or **Escape** to clear the filter and restore the full list.
+Workspace sessions are indented beneath their folder. The sidebar edge has no permanent border; hover or focus
+its resize handle to reveal it.
 
 Saved conversations stream read-only history through `omp render`, with at most two renderers running at once.
 The renderer exits after reading; no resident agent or model request is started, and the transcript is not modified.
@@ -208,6 +214,11 @@ and are included in the daemon's durable sidebar mirror.
 
 Hover a workspace heading (or focus it with the keyboard) to reveal **+** and start a session in that directory.
 The header **+** uses the selected workspace, falling back to the daemon's default directory when none is selected.
+Each workspace heading also has a **⋯** menu. **Archive workspace** hides that workspace and its sessions from
+both sidebar views, without deleting transcripts or stopping running sessions. The archive preference survives
+reloads and is included in the durable sidebar mirror. Add the same directory again to restore it.
+**Show folder** opens the directory in the operating system's file browser and requires the native desktop shell.
+
 Browser clients can use saved
 workspaces, but adding a directory requires the native desktop shell; the browser reports this rather than
 pretending an upload picker can return an absolute local directory.
