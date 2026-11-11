@@ -337,6 +337,7 @@ async function retireUnadmittedFreshRuntime(runtime: Runtime): Promise<void> {
   let unloadAttempted = false;
   let cleanupFinished = false;
   let readyDuringCleanup = false;
+  let unloadCancelled = false;
   const unloadAttemptId = crypto.randomUUID();
   let unsubscribeExit: (() => void) | undefined;
   let unsubscribeReady: (() => void) | undefined;
@@ -352,6 +353,7 @@ async function retireUnadmittedFreshRuntime(runtime: Runtime): Promise<void> {
     const result = await idleClient.cancelUnload(runtime.id, { sessionFile, attemptId: unloadAttemptId });
     // A status read cannot prove cancellation of an in-flight unload. In
     // particular, waiting for one here can consume the host's shutdown grace.
+    if (result.kind === "accepted") unloadCancelled = true;
     return result.kind === "accepted";
   };
   const onReady = (): void => {
@@ -443,6 +445,11 @@ async function retireUnadmittedFreshRuntime(runtime: Runtime): Promise<void> {
     console.warn(`omp-desktopd: unadmitted startup cleanup unavailable: ${String(error)}`);
   } finally {
     cleanupFinished = true;
+    // Cancellation can finish before the final status read crosses its deadline.
+    // Its callback cannot release the fence until cleanup has finished.
+    if (unloadCancelled && runtime.alive && manager.get(runtime.id) === runtime) {
+      retainFenceUntilExit = false;
+    }
     // The manager can remove an alive runtime during the precheck or a rejected
     // unload. Keep queued resumes fenced until that runtime exits.
     if (!retainFenceUntilExit && runtime.alive && manager.get(runtime.id) !== runtime) {

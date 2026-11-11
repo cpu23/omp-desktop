@@ -333,7 +333,7 @@ export default function registerDesktopIdleExtension(host: HostApi): void {
   let socketIdentity: SocketIdentity | undefined;
   let pollHandle: unknown;
   let pendingUnloadTimer: { sessionFile: string; attemptId: string | undefined; context: HostContext; handle: unknown } | undefined;
-  const cancelledUnloadAttempts = new Set<string>();
+  const unloadAttempts = new Map<string, "pending" | "cancelled">();
   let branchSessionKey: string | null = null;
   let branchBlockers: string[] = ["session_branch_unavailable"];
   let registryCache: RegistryCache | undefined;
@@ -693,7 +693,7 @@ export default function registerDesktopIdleExtension(host: HostApi): void {
             }
             // Never forget an acknowledged cancellation: a delayed request must
             // not become eligible again. Refuse new entries at the bound.
-            if (!cancelledUnloadAttempts.has(attemptId) && cancelledUnloadAttempts.size >= 128) {
+            if (!unloadAttempts.has(attemptId) && unloadAttempts.size >= 128) {
               return response({ kind: "unavailable", reason: "cancellation_capacity" }, 503);
             }
             const pending = pendingUnloadTimer;
@@ -714,7 +714,7 @@ export default function registerDesktopIdleExtension(host: HostApi): void {
                 return response({ kind: "unavailable", reason: "unload_state_unavailable" }, 503);
               }
             }
-            cancelledUnloadAttempts.add(attemptId);
+            unloadAttempts.set(attemptId, "cancelled");
             return response({ kind: "accepted" }, 202);
           }
 
@@ -770,8 +770,14 @@ export default function registerDesktopIdleExtension(host: HostApi): void {
           }
 
           const attemptId = input.attemptId;
-          if (nonEmptyText(attemptId) && cancelledUnloadAttempts.has(attemptId)) {
+          if (attemptId !== undefined && (!nonEmptyText(attemptId) || attemptId.length > 128)) {
+            return response({ kind: "conflict", reason: "invalid_attempt_id" }, 400);
+          }
+          if (nonEmptyText(attemptId) && unloadAttempts.get(attemptId) === "cancelled") {
             return response({ kind: "conflict", reason: "unload_cancelled" }, 409);
+          }
+          if (nonEmptyText(attemptId) && !unloadAttempts.has(attemptId) && unloadAttempts.size >= 128) {
+            return response({ kind: "unavailable", reason: "cancellation_capacity" }, 503);
           }
 
           const idleTimeoutMs = input.idleTimeoutMs;
@@ -781,6 +787,9 @@ export default function registerDesktopIdleExtension(host: HostApi): void {
           const observation = observeHost(activeContext, true);
           const transition = state.beginUnload(sessionFile, idleTimeoutMs, observation, Date.now());
           if (transition.kind === "conflict") return response(transition, 409);
+          // Reserve the cancellation entry before admitting shutdown. Later
+          // cancellations cannot consume the space this attempt requires.
+          if (nonEmptyText(attemptId)) unloadAttempts.set(attemptId, "pending");
           if (typeof activeContext.setTimeout !== "function") {
             state.cancelPendingUnload(sessionFile);
             return response({ kind: "unavailable", reason: "shutdown_schedule_unavailable" }, 503);

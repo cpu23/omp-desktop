@@ -143,6 +143,45 @@ describe("desktop idle service registry executable selection", () => {
       shutdownCallbacks[1]!();
       expect(shutdowns).toBe(1);
       expect((await client.cancelUnload(runtimeId, { sessionFile, attemptId: "next" })).kind).toBe("conflict");
+
+      handlers.get("session_shutdown")?.({}, context);
+      registerDesktopIdleExtension(host);
+      handlers.get("session_start")?.({}, context);
+      await client.status(runtimeId);
+      expect(await client.unload(runtimeId, { sessionFile, idleTimeoutMs: 1, attemptId: "x".repeat(129) }))
+        .toEqual({ kind: "conflict", reason: "invalid_attempt_id" });
+      for (let index = 0; index < 127; index++) {
+        expect((await client.cancelUnload(runtimeId, { sessionFile, attemptId: `reserved-${index}` })).kind)
+          .toBe("accepted");
+      }
+      await Bun.sleep(5);
+      const callbackCount = shutdownCallbacks.length;
+      expect((await client.unload(runtimeId, { sessionFile, idleTimeoutMs: 1, attemptId: "last-slot" })).kind)
+        .toBe("accepted");
+      expect((await client.cancelUnload(runtimeId, { sessionFile, attemptId: "unrelated" })).kind)
+        .not.toBe("accepted");
+      expect((await client.cancelUnload(runtimeId, { sessionFile, attemptId: "last-slot" })).kind)
+        .toBe("accepted");
+      shutdownCallbacks[callbackCount]!();
+      expect(shutdowns).toBe(1);
+      await client.status(runtimeId);
+      await Bun.sleep(5);
+      expect((await client.unload(runtimeId, { sessionFile, idleTimeoutMs: 1, attemptId: "over-capacity" })).kind)
+        .toBe("unavailable");
+      const full = await fetch("http://localhost/unload", {
+        unix: join(socketDir, `${runtimeId}.sock`), method: "POST",
+        headers: { authorization: `Bearer ${environment.OMP_DESKTOP_IDLE_IPC_TOKEN}`, "content-type": "application/json" },
+        body: JSON.stringify({ sessionFile, idleTimeoutMs: 1, attemptId: "still-over-capacity" }),
+      });
+      expect(full.status).toBe(503);
+      expect(await full.json()).toEqual({ kind: "unavailable", reason: "cancellation_capacity" });
+      expect(shutdownCallbacks.length).toBe(callbackCount + 1);
+      // Idempotent cancellation and ordinary idle unload still work at capacity.
+      expect((await client.cancelUnload(runtimeId, { sessionFile, attemptId: "last-slot" })).kind)
+        .toBe("accepted");
+      expect((await client.unload(runtimeId, { sessionFile, idleTimeoutMs: 1 })).kind).toBe("accepted");
+      shutdownCallbacks.at(-1)!();
+      expect(shutdowns).toBe(2);
     } finally {
       handlers.get("session_shutdown")?.({}, context);
       for (const [key, value] of previous) {

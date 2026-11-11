@@ -931,11 +931,33 @@ class Pane {
 
     wireSessionDrag(header, { kind: "pane", paneId: this.id });
     this.#wireDrop();
+    const dropStatus = document.createElement("span");
+    dropStatus.className = "cold-composer-status";
+    dropStatus.setAttribute("role", "status");
+    dropStatus.hidden = true;
+    // Keep feedback outside the body's startup cover and the pinned save banner.
+    this.el.append(dropStatus);
+    const warnRejectedDrop = () => {
+      dropStatus.textContent = "Files were not inserted. Drop them again after the terminal is ready.";
+      dropStatus.hidden = false;
+      setStatus(dropStatus.textContent, "warn");
+    };
     this.#disposeFileDrop = wireFileDrop(this.el, {
-      onPaths: (paths) => insertFilePaths((data, files) => this.#sendOrStageInput(data, files), paths, !this.binding.runtimeId),
-      upload: (file) => this.binding.runtimeId && !this.#inputReady
-        ? Promise.resolve(null)
-        : uploadPaste(file),
+      onPaths: (paths) => {
+        if (!insertFilePaths((data, files) => this.#sendOrStageInput(data, files), paths, !this.binding.runtimeId)) {
+          warnRejectedDrop();
+        } else {
+          dropStatus.textContent = "";
+          dropStatus.hidden = true;
+        }
+      },
+      upload: (file) => {
+        if (this.binding.runtimeId && !this.#inputReady) {
+          warnRejectedDrop();
+          return Promise.resolve(null);
+        }
+        return uploadPaste(file);
+      },
     });
     // xterm stops paste propagation at its textarea. Capture image files before
     // that text-only handler can consume the event or emit an empty paste.
