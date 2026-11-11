@@ -37,6 +37,9 @@ let workspaces: string[] = [];
 let activeWorkspace: string | null = null;
 let collapsedWorkspaces = new Set<string>();
 let archivedWorkspaces = new Map<string, string>();
+// Retain explicit archive/re-add actions (or daemon restoration) if storage is
+// denied or full, until a write succeeds. Unrelated saves carry no archive edits.
+const pendingArchives = new Map<string, string | null>();
 let savePreferences: (() => void) | null = null;
 let refreshViewControls: (() => void) | null = null;
 
@@ -71,13 +74,8 @@ export function archiveSidebarWorkspace(cwd: string): void {
   const path = normalizeDirectoryPath(cwd);
   if (path === null) return;
   const key = workspacePathKey(path);
-  if (archivedWorkspaces.has(key)) return;
   archivedWorkspaces.set(key, path);
-  if (activeWorkspace !== null && workspacePathKey(activeWorkspace) === key) {
-    activeWorkspace = workspaces.find((workspace) =>
-      !archivedWorkspaces.has(workspacePathKey(workspace)),
-    ) ?? null;
-  }
+  pendingArchives.set(key, path);
   savePreferences?.();
 }
 
@@ -88,6 +86,7 @@ export function addSidebarWorkspace(cwd: string): void {
   const existing = workspaces.find((workspace) => workspacePathKey(workspace) === key);
   if (existing === undefined) workspaces = [...workspaces, path];
   archivedWorkspaces.delete(key);
+  pendingArchives.set(key, null);
   activeWorkspace = existing ?? path;
   collapsedWorkspaces.delete(key);
   view = "workspaces";
@@ -165,15 +164,15 @@ function normalizedDirectoryPaths(value: unknown): string[] {
 /** Set by init(); null only in the instant before the controls are wired. */
 let applyExternalState: ((state: SidebarState) => void) | null = null;
 
-/** Set by the client so user-driven sidebar changes reach the durable mirror. */
-let notifyStateChange: (() => void) | null = null;
+/** Storage-event adoption refreshes the view without republishing the mirror. */
+let notifyStateChange: ((persist: boolean) => void) | null = null;
 
 /**
  * Registers the client's hook for user-driven sidebar changes (resize,
  * keyboard/double-click width). Adoption via applySidebarState notifies too, so
- * one save path covers both.
+ * one save path covers both. Cross-tab storage events pass persist=false.
  */
-export function onSidebarStateChange(listener: () => void): void {
+export function onSidebarStateChange(listener: (persist: boolean) => void): void {
   notifyStateChange = listener;
 }
 
@@ -237,12 +236,29 @@ function parseSidebarState(value: unknown): SidebarState {
   };
 }
 
-function readState(): SidebarState {
+function readState(): SidebarState | null {
   try {
-    return parseSidebarState(JSON.parse(localStorage.getItem(STORE_KEY) ?? "null"));
+    const value = localStorage.getItem(STORE_KEY);
+    return value === null ? null : parseSidebarState(JSON.parse(value));
   } catch {
-    // Corrupt JSON or storage denied (private mode): defaults are fine.
-    return parseSidebarState(null);
+    // An unavailable cache must not erase this page's in-memory preferences.
+    return null;
+  }
+}
+
+function reconcileArchives(): void {
+  const stored = readState();
+  if (stored !== null) {
+    archivedWorkspaces = new Map(stored.archivedWorkspaces.map((path) => [workspacePathKey(path), path]));
+  }
+  for (const [key, path] of pendingArchives) {
+    if (path === null) archivedWorkspaces.delete(key);
+    else archivedWorkspaces.set(key, path);
+  }
+  if (activeWorkspace !== null && archivedWorkspaces.has(workspacePathKey(activeWorkspace))) {
+    activeWorkspace = workspaces.find((workspace) =>
+      !archivedWorkspaces.has(workspacePathKey(workspace)),
+    ) ?? null;
   }
 }
 
@@ -254,7 +270,7 @@ function init(): void {
     return;
   }
 
-  const stored = readState();
+  const stored = readState() ?? parseSidebarState(null);
   let width = stored.width;
 
   view = stored.view;
@@ -360,6 +376,13 @@ function init(): void {
   });
 
   function saveState(): void {
+    // Storage events can still be queued in a stale tab. Read the current list
+    // before writing and apply only this tab's explicit archive/re-add actions.
+    reconcileArchives();
+    writeState();
+  }
+
+  function writeState(): void {
     try {
       localStorage.setItem(STORE_KEY, JSON.stringify({
         width,
@@ -369,11 +392,12 @@ function init(): void {
         collapsedWorkspaces: [...collapsedWorkspaces],
         archivedWorkspaces: [...archivedWorkspaces.values()],
       } satisfies SidebarState));
+      pendingArchives.clear();
     } catch {
       // Storage denied: the sidebar still works for this page life.
     }
     // User-driven sidebar changes are workspace state: let the client mirror them.
-    notifyStateChange?.();
+    notifyStateChange?.(true);
   }
   savePreferences = saveState;
 
@@ -455,15 +479,31 @@ function init(): void {
   // A window resize can move the clamp ceiling; re-render, do not persist.
   window.addEventListener("resize", render);
 
+  window.addEventListener("storage", (event) => {
+    if (event.key !== STORE_KEY && event.key !== null) return;
+    try {
+      if (event.storageArea !== localStorage) return;
+    } catch {
+      return;
+    }
+    // Read current storage rather than an event snapshot that may predate a
+    // local action. Adoption never writes back or queues a daemon save.
+    reconcileArchives();
+    notifyStateChange?.(false);
+  });
+
   applyExternalState = (state) => {
     width = clampWidth(state.width);
     view = state.view;
     workspaces = state.workspaces;
     activeWorkspace = state.activeWorkspace;
     collapsedWorkspaces = new Set(state.collapsedWorkspaces.map(workspacePathKey));
+    pendingArchives.clear();
+    for (const key of archivedWorkspaces.keys()) pendingArchives.set(key, null);
     archivedWorkspaces = new Map(state.archivedWorkspaces.map((path) => [workspacePathKey(path), path]));
+    for (const [key, path] of archivedWorkspaces) pendingArchives.set(key, path);
     renderView();
-    saveState();
+    writeState();
     render();
   };
 

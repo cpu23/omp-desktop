@@ -33,9 +33,9 @@ import {
 import { parsePasteResponse, parseRuntimesResponse, parseRuntimeOne, parseServerMessage, parseSessionList, parseStateResponse, type RuntimeInfo, type ServerMessage, type SessionSummaryLike } from "./protocol";
 
 // Sidebar preferences share the durable-save path with panes, pins and font size.
-onSidebarStateChange(() => {
+onSidebarStateChange((persist) => {
   renderSidebar();
-  queueStateSave();
+  if (persist) queueStateSave();
 });
 
 const statusEl = document.getElementById("status") as HTMLElement;

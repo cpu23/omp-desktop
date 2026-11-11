@@ -133,6 +133,13 @@ bun test
 bun run scripts/daemon-smoke.ts
 ```
 
+The focused sidebar archive regression uses two Chromium tabs and a real daemon in disposable
+homes, with private state and an OS-selected loopback port. Install the browser with
+`bunx playwright install --with-deps chromium`, then run `bun run smoke:sidebar`.
+It covers stale-tab saves, independent archives, explicit re-add, delayed storage events,
+reload, and denied/full browser storage. It needs no OMP installation or credentials;
+the directory picker is stubbed, so native-shell behavior is not exercised.
+
 The broader `bun run smoke` exercises the OMP PTY integration and requires OMP 18.13.1+ on `PATH`. For a native Linux
 build, install Rust 1.92+ and the [system packages listed in the guide](docs/guide.md#native-linux-app), then run:
 
