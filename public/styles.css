@@ -1710,7 +1710,7 @@ body.session-dragging * {
   position: relative;
   z-index: 3;
   flex: 0 0 auto;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr);
   gap: 6px;
   align-items: end;
   padding: 7px;
@@ -1739,28 +1739,6 @@ body.session-dragging * {
 .cold-composer textarea:focus {
   border-color: var(--effort-accent);
   outline: 0;
-}
-
-.cold-composer button {
-  height: 34px;
-  padding: 0 12px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: var(--panel-raised);
-  color: var(--text);
-  font: 11px var(--mono);
-  cursor: pointer;
-}
-
-.cold-composer button:hover:enabled,
-.cold-composer button:focus-visible {
-  border-color: var(--effort-accent);
-  color: var(--effort-accent);
-}
-
-.cold-composer button:disabled {
-  color: var(--dim);
-  cursor: default;
 }
 
 .cold-composer-status {
