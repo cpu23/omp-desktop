@@ -447,8 +447,9 @@ describe("real daemon API behavior", () => {
       await opened.promise;
       await waitFor(
         () => messages.some((entry) => entry.parsed?.type === "hello") &&
-          messages.some((entry) => entry.raw instanceof ArrayBuffer),
-        "WebSocket hello and replay",
+          messages.some((entry) => entry.raw instanceof ArrayBuffer &&
+            new TextDecoder().decode(entry.raw as ArrayBuffer).includes("FAKE-OMP READY")),
+        "WebSocket hello and ready marker replay",
       );
       const helloIndex = messages.findIndex((entry) => entry.parsed?.type === "hello");
       const replayIndex = messages.findIndex((entry) => entry.raw instanceof ArrayBuffer);
