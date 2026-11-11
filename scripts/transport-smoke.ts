@@ -1,6 +1,9 @@
 #!/usr/bin/env bun
 /** Real-browser transport regressions. Only fixture-owned daemons/PTYs are used. */
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { chromium, type Browser } from "playwright";
 import { startTestDaemon } from "./fixtures/daemon";
 
@@ -102,9 +105,14 @@ async function successfulReconnects(browser:Browser) {
   } finally { attachment?.close();await context.close();await daemon.stop(); }
 }
 
-const browser=await chromium.launch({headless:true,executablePath:chromium.executablePath()});
+const browserHome=await mkdtemp(join(tmpdir(),"omp-transport-browser-"));
+const browser=await chromium.launch({
+  headless:true,executablePath:chromium.executablePath(),
+  env:{HOME:browserHome,TMPDIR:tmpdir(),PATH:process.env.PATH??"/usr/bin:/bin",LANG:"C.UTF-8",
+    XDG_CONFIG_HOME:browserHome,XDG_CACHE_HOME:browserHome,XDG_DATA_HOME:browserHome},
+}).catch(async error=>{await rm(browserHome,{recursive:true,force:true});throw error;});
 try {
   if(!process.argv.includes("--reconnect-only")) for(const mode of ["503","invalid","network"] as const) await uncertainRequest(browser,mode);
   if(!process.argv.includes("--ack-only")) await successfulReconnects(browser);
   console.log("TRANSPORT SMOKE PASSED");
-} finally {await browser.close();}
+} finally {await browser.close();await rm(browserHome,{recursive:true,force:true});}
