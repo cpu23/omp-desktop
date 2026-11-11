@@ -89,8 +89,10 @@ a close button on the right. Close it with **×** or **Escape** to clear the fil
 Workspace sessions are indented beneath their folder. The sidebar edge has no permanent border; hover or focus
 its resize handle to reveal it.
 
-Saved conversations stream read-only history through `omp render`, with at most two renderers running at once.
-The renderer exits after reading; no resident agent or model request is started, and the transcript is not modified.
+Saved conversations render read-only history through `omp render`, with at most two history requests active at once.
+Output is spooled to a private temporary file before streaming to the pane, so large transcripts and inline images
+do not lose their final messages when the renderer exits. The temporary output is removed after delivery or cancellation.
+No resident agent or model request is started, and the transcript is not modified.
 Write in the composer and select **Send**, or press **Ctrl+Enter** / **⌘Enter**, to create or resume an agent.
 Plain Enter inserts a newline. Drafts and attachment references survive navigation; unconfirmed input is retained
 for review, never automatically resubmitted.
@@ -168,6 +170,10 @@ Slow WebSocket readers receive ordered replay, live bytes and exit metadata. A r
 pending-live queue is disconnected for resynchronization rather than silently losing bytes.
 
 ### Clipboard and file drops
+
+In a terminal, **Ctrl+C** with no selection sends Escape rather than the Ctrl+C byte, so repeated presses cannot
+trigger OMP's session-exit shortcut. Existing selection-copy behavior is unchanged; unselected **Ctrl+Shift+C**
+does nothing. Use the sidebar's **Unload session** action to stop a session deliberately.
 
 Ctrl/Cmd+V and Ctrl+Shift+V are handled by the webview. Text paste retains xterm's bracketed-paste behavior;
 image paste uploads to the daemon, which stores the image and types its path into the terminal for OMP to attach.

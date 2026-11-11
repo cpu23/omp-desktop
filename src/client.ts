@@ -931,9 +931,18 @@ class Pane {
     });
     // Let the WebView deliver clipboard data instead of sending Ctrl+V (0x16)
     // to omp, which would make the child read the OS clipboard itself.
-    this.term.attachCustomKeyEventHandler((event) =>
-      !((event.key === "v" || event.key === "V") && (event.ctrlKey || event.metaKey) && !event.altKey),
-    );
+    this.term.attachCustomKeyEventHandler((event) => {
+      if (event.ctrlKey && !event.metaKey && !event.altKey &&
+          (event.key === "c" || event.key === "C") && !this.term.hasSelection()) {
+        if (event.type === "keydown") {
+          event.preventDefault();
+          // Escape cancels work without OMP's repeated-Ctrl+C session exit.
+          if (!event.shiftKey) this.#sendInput("\x1b");
+        }
+        return false;
+      }
+      return !((event.key === "v" || event.key === "V") && (event.ctrlKey || event.metaKey) && !event.altKey);
+    });
     // xterm paints OSC 8 file targets with a dashed underline even though its
     // default link handler cannot open them. Consume those links only; preserve
     // HTTP links and explicit SGR underlining in the transcript.
