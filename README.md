@@ -136,9 +136,19 @@ bun run scripts/daemon-smoke.ts
 The focused sidebar archive regression uses two Chromium tabs and a real daemon in disposable
 homes, with private state and an OS-selected loopback port. Install the browser with
 `bunx playwright install --with-deps chromium`, then run `bun run smoke:sidebar`.
-It covers stale-tab saves, independent archives, explicit re-add, delayed storage events,
-reload, and denied/full browser storage. It needs no OMP installation or credentials;
-the directory picker is stubbed, so native-shell behavior is not exercised.
+It covers controlled overlapping read/merge/write operations, stale-tab saves, independent archives,
+queued archive/re-add ordering, delayed storage events and daemon PUTs, reload, corrupt cold-start
+cache restoration, valid local preferences, denied/full browser storage, and unavailable/rejected
+browser locking. It needs no OMP installation or credentials; the directory picker is stubbed,
+so native-shell behavior is not exercised.
+
+Sidebar persistence and daemon workspace saves require Web Locks (a supported browser on localhost
+or HTTPS). If locking or storage fails, edits stay in memory with a visible warning; a later
+preference change retries them. If initial daemon restoration cannot be cached, reload after
+recovery to reopen daemon saving. The app does not fall back to an unsafe concurrent write.
+Same-origin daemon saves are also serialized so an older in-flight request cannot replace a newer
+archive snapshot. Reload all open tabs after updating so every writer uses the same lock.
+Independent browser profiles/devices still use the daemon's whole-document last-writer policy.
 
 The broader `bun run smoke` exercises the OMP PTY integration and requires OMP 18.13.1+ on `PATH`. For a native Linux
 build, install Rust 1.92+ and the [system packages listed in the guide](docs/guide.md#native-linux-app), then run:

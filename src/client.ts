@@ -1,6 +1,6 @@
 import { trimSelectionHighlight } from "./selection";
 import {
-  applySidebarState, onSidebarStateChange, sidebarFolderView, sidebarFolderExpanded,
+  applySidebarState, readSidebarState, onSidebarStateChange, sidebarFolderView, sidebarFolderExpanded,
   toggleSidebarFolder, sidebarWorkspaces, sidebarActiveWorkspace, selectSidebarWorkspace,
   archiveSidebarWorkspace, sidebarWorkspaceArchived, normalizeDirectoryPath, STORE_KEY as SIDEBAR_KEY,
 } from "./sidebar";
@@ -158,8 +158,6 @@ let stateGate: "pending" | "ready" | "blocked" = "pending";
 /** Why publishing is blocked; surfaced when a save is attempted while gated. */
 let stateGateReason = "";
 let stateGateGeneration: string | null = null;
-/** Fingerprint of the last document the daemon accepted, to skip no-op PUTs. */
-let deliveredState = "";
 
 function savePins(): void {
   try {
@@ -594,7 +592,6 @@ async function refreshRuntimes(options: { restore?: boolean } = {}): Promise<boo
     stateGate = "pending";
     stateGateGeneration = null;
     stateGateReason = "";
-    deliveredState = "";
     stateQueued = false;
   }
   // A new (or never-seen) generation means the pool this client knew is gone
@@ -2959,6 +2956,22 @@ function queueStateSave(): void {
 }
 
 async function deliverState(): Promise<void> {
+  try {
+    if (!navigator.locks?.request) throw new Error("browser locking is unavailable; use localhost or HTTPS in a supported browser");
+    // A tab can commit another sidebar edit while a previous mirror is in
+    // flight. Serialize snapshot + PUT across this origin so an older request
+    // cannot arrive last and erase the newly merged archives. Use a separate
+    // lock so network latency never blocks local sidebar persistence.
+    await navigator.locks.request("omp-desktop.workspace-state", deliverStateLocked);
+  } catch (error) {
+    const message = `workspace state not saved: ${error instanceof Error ? error.message : String(error)}`;
+    stateSaveError = message;
+    console.warn("omp-desktop:", message);
+    setStatus(message, "warn");
+  }
+}
+
+async function deliverStateLocked(): Promise<void> {
   if (stateGate !== "ready") {
     // The local cache already holds the change; publishing waits for a compatible
     // read so a partial or fallback document cannot replace the daemon's copy.
@@ -2991,13 +3004,9 @@ async function deliverState(): Promise<void> {
       deliveryGeneration = generation;
       const layoutDocument = workspaceLayoutDocument();
       const sidebar = localStorage.getItem(SIDEBAR_KEY);
-      const fingerprint = JSON.stringify({
-        layout: layoutDocument,
-        pins: pinnedSessions,
-        cellSize,
-        sidebar,
-      });
-      if (fingerprint === deliveredState && !stateSaveError) break;
+      // Do not deduplicate against this tab's last PUT: another tab may have
+      // since published a different snapshot, even when this edit returns to
+      // a value we previously saved. Storage adoption itself never queues PUTs.
       const body = JSON.stringify({
         version: STATE_VERSION,
         savedAt: new Date().toISOString(),
@@ -3032,7 +3041,6 @@ async function deliverState(): Promise<void> {
         if (daemonId !== generation || stateGateGeneration !== generation) break;
         throw new Error(detail || `HTTP ${res.status}`);
       }
-      deliveredState = fingerprint;
       if (stateSaveError) {
         stateSaveError = null;
         setStatus("workspace state saved", "ok");
@@ -3123,9 +3131,16 @@ async function reconcileWorkspaceState(): Promise<void> {
     const remoteCellSize = typeof state.cellSize === "number" && Number.isFinite(state.cellSize) ? state.cellSize : null;
     if (remoteCellSize !== null && localStorage.getItem(CELL_KEY) === null) setCellSize(remoteCellSize);
     const remoteSidebar = typeof state.sidebar === "string" && state.sidebar.length <= STATE_LIMIT_BYTES ? state.sidebar : null;
-    if (remoteSidebar && localStorage.getItem(SIDEBAR_KEY) === null) {
+    if (remoteSidebar && readSidebarState() === null) {
       try {
-        applySidebarState(JSON.parse(remoteSidebar));
+        const cached = await applySidebarState(JSON.parse(remoteSidebar));
+        if (daemonId !== generation) return;
+        if (!cached) {
+          stateGate = "blocked";
+          stateGateGeneration = null;
+          stateGateReason = "restored sidebar preferences could not be safely cached";
+          return;
+        }
       } catch {
         // Malformed sidebar preferences are ignored.
       }
