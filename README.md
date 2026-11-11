@@ -53,6 +53,8 @@ from your application menu; the daemon above must remain running.
 - Opening a running session reattaches; opening a saved one reads its history without loading an agent.
   Opening a saved session or clicking its pane focuses the draft. **Enter** creates or resumes the agent;
   **Shift+Enter** inserts a newline. There is no Send button; typing alone stays local.
+- In a terminal, **Ctrl+C** without selected text sends Escape to cancel work, never OMP's session-exit signal.
+  Selected text retains normal copy behavior; **Ctrl+Shift+C** without a selection does nothing.
 - Truly idle agents unload gracefully after **60 minutes**. Change **Settings → Sessions → Idle timeout (minutes)**
   without restarting; **0** disables unloading. Execution, sleeps, background jobs, subagents, queued delivery,
   pending dialogs and unsent terminal input prevent unloading. Unknown activity also prevents unloading.
@@ -76,6 +78,8 @@ from your application menu; the daemon above must remain running.
 </details>
 
 ## Unreleased
+
+- Keep terminal Ctrl+C from exiting OMP: map an unselected Ctrl+C to Escape and preserve selection copying.
 
 - Default the sidebar to Workspaces, add a home-rooted native directory chooser on Linux/macOS/Windows, persist
   empty workspaces and selection, and prepare new-session drafts in the selected directory.
