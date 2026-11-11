@@ -1345,20 +1345,13 @@ async function testFirstSessionAndPaneWorkload(
   await selectWorkspaceFromNativePicker(driver, profile, archiveWorkspacePath);
   const beforeSessionIds = new Set(initialRuntimes.map((runtime) => runtime.id));
   await driver.clickCss("#new-session");
-  const coldComposer = await driver.waitFor(async () => {
-    const input = await driver.find("#panes .pane .cold-composer textarea").catch(() => null);
-    return input && await driver.displayed(input) ? input : false;
-  }, "#new-session to show a cold composer");
-  assert((await runtimes(base)).length === 0, "#new-session created a runtime before submission.");
-  await driver.sendKeys(coldComposer, "start-native-session");
-  await driver.sendKeys(coldComposer, PRIVATE_USE_ENTER);
   const created = await driver.waitFor(async () => {
     const current = await runtimes(base);
     const added = current.filter((runtime) => !beforeSessionIds.has(runtime.id));
     return current.length === 1 && added.length === 1 && added[0]!.pid !== null ? added[0] : false;
-  }, "submitting the cold composer to create and attach one real daemon runtime");
+  }, "new-session to create and attach one real daemon runtime without a prompt");
   await waitForRuntimePaneReady(driver, base, created.id);
-  console.log("ok - blank boot and #new-session stay cold until explicit submission, then the fake-OMP PTY attaches");
+  console.log("ok - blank boot stays cold; new-session immediately attaches the fake-OMP PTY");
   const createdRecord = fakeOmpRecordPath(daemon.root, created.id);
   const { binding: createdBinding, textarea: terminal } = await focusRuntimePane(driver, base, created.id);
   const echo = "native-echo-✓";
@@ -1402,32 +1395,18 @@ async function testFirstSessionAndPaneWorkload(
   await driver.waitFor(async () => (await driver.findAll("#panes .pane")).length === 4, "the four-pane layout");
   assert(await driver.execute<boolean>(`return document.querySelector("#split-layout").disabled;`),
     "The toolbar split button must be disabled at four panes.");
-  // Splitting creates cold panes, not agents. Start each new pane through its
-  // real composer before testing native multi-runtime keyboard routing.
-  const coldPaneIds = await driver.execute<string[]>(`return Array.from(document.querySelectorAll('#panes .pane'))
-    .filter(pane => { const composer = pane.querySelector('.cold-composer'); return composer && !composer.hidden; })
-    .map(pane => pane.dataset.pane);`);
-  assert(coldPaneIds.length === 3, "Splitting one live pane must leave exactly three cold composers.");
-  assert((await runtimes(base)).length === 1, "Splitting started an agent without explicit submission.");
-  for (const [index, paneId] of coldPaneIds.entries()) {
-    const selector = `#panes .pane[data-pane=${JSON.stringify(paneId)}] .cold-composer`;
-    const before = (await runtimes(base)).length;
-    await driver.sendKeys(await driver.find(`${selector} textarea`), `native-split-${index + 1}`);
-    assert((await runtimes(base)).length === before, "Typing a split-pane draft started an agent.");
-    await driver.sendKeys(await driver.find(`${selector} textarea`), PRIVATE_USE_ENTER);
-    const binding = await driver.waitFor(async () =>
-      (await activePaneBindings(driver, base)).find((entry) => entry.paneId === paneId) ?? false,
-    `explicit submission to bind split pane ${paneId}`);
-    await waitForRuntimePaneReady(driver, base, binding.runtimeId);
-    assert((await runtimes(base)).length === before + 1, "Split-pane submission did not create exactly one runtime.");
-  }
+  // Splitting starts each new pane as a live terminal. Wait for all four panes
+  // to bind distinct runtimes and for each PTY to be created.
   const paneBindings = await driver.waitFor(async () => {
     const bindings = await activePaneBindings(driver, base);
     return bindings.length === 4 && new Set(bindings.map((entry) => entry.runtimeId)).size === 4 ? bindings : false;
-  }, "four distinct pane/runtime bindings");
+  }, "four distinct pane/runtime bindings after split startup");
   const allRuntimes = await waitFor("all four attached pane runtimes", async () => {
     const current = await runtimes(base);
-    return paneBindings.every(({ runtimeId }) => current.some((runtime) => runtime.id === runtimeId && runtime.pid !== null)) ? current : false;
+    return current.length === 4 &&
+      paneBindings.every(({ runtimeId }) => current.some((runtime) => runtime.id === runtimeId && runtime.pid !== null))
+      ? current
+      : false;
   });
   const beforeMarkers = new Map<string, Buffer>();
   for (const runtime of allRuntimes) beforeMarkers.set(runtime.id, await readRecord(daemon.root, runtime.id));
@@ -2277,14 +2256,7 @@ async function testConnectionRetry(parent: string, binary: string, busAddress: s
     assert(buildResponse.ok, "Retry did not connect the app to the real daemon build endpoint.");
     assert((await runtimes(daemon.base)).length === 0, "Retry recovery created a runtime during blank boot.");
     await shell.driver.clickCss("#new-session");
-    const composer = await shell.driver.waitFor(async () => {
-      const input = await shell!.driver.find("#panes .pane .cold-composer textarea").catch(() => null);
-      return input && await shell!.driver.displayed(input) ? input : false;
-    }, "Retry recovery to show a cold new-session composer");
-    assert((await runtimes(daemon.base)).length === 0, "Retry's new-session control created a runtime before submission.");
-    await shell.driver.sendKeys(composer, "retry-session");
-    await shell.driver.sendKeys(composer, PRIVATE_USE_ENTER);
-    await waitFor("Retry's submitted cold draft to create a usable real daemon runtime", async () => {
+    await waitFor("Retry's new-session control to create a usable real daemon runtime", async () => {
       const current = await runtimes(daemon!.base);
       return current.some((runtime) => runtime.pid !== null && runtime.alive) ? true : false;
     });
@@ -2991,14 +2963,7 @@ async function testInitialNativeInput(parent: string, binary: string, busAddress
     await waitConnected(shell.driver, daemon.port);
     assert((await runtimes(daemon.base)).length === 0, "First boot created a runtime before user input.");
     await shell.driver.clickCss("#new-session");
-    const composer = await shell.driver.waitFor(async () => {
-      const input = await shell!.driver.find("#panes .pane .cold-composer textarea").catch(() => null);
-      return input && await shell!.driver.displayed(input) ? input : false;
-    }, "the fresh app's cold new-session composer");
-    assert((await runtimes(daemon.base)).length === 0, "New session created a runtime before explicit submission.");
-    await shell.driver.sendKeys(composer, "start-native-input");
-    await shell.driver.sendKeys(composer, PRIVATE_USE_ENTER);
-    const runtime = await waitFor("the submitted cold composer to create one real runtime", async () => {
+    const runtime = await waitFor("new-session to create one real runtime without a prompt", async () => {
       const current = await runtimes(daemon!.base);
       return current.length === 1 && current[0]!.pid !== null ? current[0] : false;
     });

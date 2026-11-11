@@ -52,7 +52,7 @@ from your application menu; the daemon above must remain running.
   through the system chooser, starting at your home folder. Empty workspaces remain available after a reload.
 - Running and saved sessions share one list, pinned first then newest conversation activity. Workspace rows
   show titles without repeating their directory; working and unread-completion indicators remain visible.
-- Use **+** beside a workspace to prepare a new-session draft there, or select a workspace and use the header **+**.
+- Use **+** beside a workspace to start a live OMP session there, or select a workspace and use the header **+**.
   The workspace button appears only on heading hover or keyboard focus.
   Each submitted request accepts at most 16 unique image attachments and 32 MiB of image data in total; repeated paths are encoded once.
 - Opening a running session reattaches; opening a saved one reads its history without loading an agent.
@@ -88,14 +88,14 @@ from your application menu; the daemon above must remain running.
 - Gate session input on real terminal readiness rather than process creation or a timeout. Preserve failed cold
   drafts even if initialization finishes later, and disable unsupported Tern native rendering to avoid its fallback animation race.
 - Default the sidebar to Workspaces, add a home-rooted native directory chooser on Linux/macOS/Windows, persist
-  empty workspaces and selection, and prepare new-session drafts in the selected directory.
+  empty workspaces and selection, and start new sessions in the selected directory.
 - Unify running and saved conversations instead of separating Loaded/Recent sections; omit redundant directory
   subtitles inside workspace groups.
 - Reveal each workspace's add-session button only on heading hover or keyboard focus, without shifting layout.
 - Unload confidently idle agents after a configurable 60-minute grace period, with live settings and graceful
   SDK shutdown rather than forced termination. Protect running work, background jobs, subagents and pending input.
-- Read saved transcripts without a resident agent; start or resume only on explicit submission. Preserve local
-  drafts across navigation and send dropped/pasted image attachments with cold requests.
+- Read saved transcripts without a resident agent; resume them only on explicit submission. New-session controls
+  start a live terminal immediately, without requiring a first message. Preserve saved-session drafts across navigation.
 
 - Edit session titles with explicit Save/Cancel icons, Enter to save, and click-away to discard.
 - Add an icon-based sidebar context menu for editing, pinning, unloading, and non-destructive archiving.
