@@ -4,7 +4,7 @@ Use [OMP](https://omp.sh) coding sessions in a browser or native desktop window.
 shell; macOS and Windows retain Tauri. Organize chats into spaces with up to four terminal panes; switch between
 live and saved sessions. Closing a pane or window does not stop its session.
 
-![OMP Desktop with compact session groups and a two-pane workspace](docs/images/workspace-v0.1.4.png)
+![OMP Desktop workspace with an illustrative saved release-review conversation](docs/images/workspace-v0.1.5.png)
 
 ## Requirements
 
@@ -76,13 +76,13 @@ from your application menu; the daemon above must remain running.
   Native completion notifications use the installed OMP logo.
 
 <details>
-<summary>Settings screenshot — 3840 × 2160</summary>
+<summary>Settings screenshot — 2880 × 1800</summary>
 
-![OMP Desktop settings with Appearance, Notifications, Sessions, and Keyboard shortcuts](docs/images/settings-v0.1.4.png)
+![OMP Desktop settings with Appearance, Notifications, Sessions, and Keyboard shortcuts](docs/images/settings-v0.1.5.png)
 
 </details>
 
-## Unreleased
+## v0.1.5
 
 - Keep app shortcuts active in saved-session draft composers, so Alt+1–9 still switches spaces after closing or opening tabs.
   `bun run scripts/space-hotkeys-smoke.ts` checks space renumbering, draft retention and editor isolation in Chromium.
@@ -190,8 +190,8 @@ corroborates masked NVIDIA rendering with the owned WebKit process's driver mapp
 
 ## Releases and links
 
-[v0.1.4](https://github.com/cpu23/omp-desktop/releases/tag/v0.1.4)
-([notes and native-shell requirements](docs/release-v0.1.4.md)) · [all releases](https://github.com/cpu23/omp-desktop/releases).
+[v0.1.5](https://github.com/cpu23/omp-desktop/releases/tag/v0.1.5)
+([notes and native-shell requirements](docs/release-v0.1.5.md)) · [all releases](https://github.com/cpu23/omp-desktop/releases).
 The release includes source and a Linux x86_64 native-shell archive; Bun, OMP, the daemon checkout, and system GTK/WebKit
 libraries are still required. It is not a standalone installer. Build from source for other systems.
 
