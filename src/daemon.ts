@@ -9,7 +9,7 @@ import { SessionArchiveStore } from "./session-archives";
 import { isRecord } from "./guards";
 import { MAX_RUNTIME_INPUT_CODE_UNITS, parseClientMessage, type RuntimeInfo, type RuntimesResponse, type ServerMessage } from "./protocol";
 import { PresentationReader } from "./presentation";
-import { STATE_LIMIT_BYTES, WorkspaceStateStore, RuntimeLedgerStore } from "./state";
+import { STATE_LIMIT_BYTES, WorkspaceStateStore, RuntimeLedgerStore, type LiveSession } from "./state";
 import {
   DaemonSettingsStore,
   isIdleTimeoutMinutes,
@@ -213,7 +213,13 @@ function sameOriginRequest(req: Request, requestUrl: URL, port: number): boolean
 }
 
 
-type WsData = { runtime?: Runtime; output?: TerminalOutput; unsubData?: () => void; unsubExit?: () => void };
+type WsData = {
+  runtime?: Runtime;
+  output?: TerminalOutput;
+  unsubData?: () => void;
+  unsubExit?: () => void;
+  unsubReady?: () => void;
+};
 
 
 /** Resume is restricted to real session files under the store: the daemon runs
@@ -296,16 +302,186 @@ async function waitForActivity(runtime: Runtime, expectedFile?: string): Promise
     if (result.kind === "available") {
       if (result.status.unloading) throw new RuntimeUnavailableError("session is unloading; send again after it closes");
       const file = result.status.sessionFile;
-      if (file !== null) {
+      if (file !== null && file.length > 0) {
         if (expectedFile && file !== expectedFile) {
           throw new SessionIdentityError("the runtime opened a different transcript; the request was not sent");
         }
-        return result.status;
+        if (runtime.ready) return result.status;
       }
     }
     await Bun.sleep(100);
   }
-  throw new RuntimeUnavailableError("session did not become ready; the request was not sent");
+  if (!runtime.ready) {
+    throw new RuntimeUnavailableError("terminal did not initialize before the startup timeout; the request was not sent");
+  }
+  throw new RuntimeUnavailableError(
+    "session did not become ready (terminal frame, idle socket, and session file are required); the request was not sent",
+  );
+}
+
+/**
+ * Retire a fresh startup only when the runtime identity and host both prove it
+ * is still unadmitted and idle. The host rechecks activity before shutdown.
+ */
+async function retireUnadmittedFreshRuntime(runtime: Runtime): Promise<void> {
+  if (!runtime.alive || runtime.ready || manager.get(runtime.id) !== runtime) return;
+  const sessionFile = runtime.sessionFile;
+  if (!sessionFile || unloadingBySession.has(sessionFile) || requestingSessions.has(sessionFile)) return;
+  const cleanupDeadline = Date.now() + 5_000;
+
+  const settled = Promise.withResolvers<void>();
+  const attempt = { runtime, done: settled.promise };
+  unloadingBySession.set(sessionFile, attempt);
+  unloadingRuntimes.add(runtime);
+  let retainFenceUntilExit = false;
+  let unloadAttempted = false;
+  let cleanupFinished = false;
+  let readyDuringCleanup = false;
+  let unloadCancelled = false;
+  const unloadAttemptId = crypto.randomUUID();
+  let unsubscribeExit: (() => void) | undefined;
+  let unsubscribeReady: (() => void) | undefined;
+  let cancelPromise: Promise<boolean> | undefined;
+  const releaseAttempt = () => {
+    if (unloadingBySession.get(sessionFile) === attempt) unloadingBySession.delete(sessionFile);
+    unloadingRuntimes.delete(runtime);
+    unsubscribeExit?.();
+    unsubscribeReady?.();
+    settled.resolve();
+  };
+  const cancelAcceptedUnload = async (): Promise<boolean> => {
+    const result = await idleClient.cancelUnload(runtime.id, { sessionFile, attemptId: unloadAttemptId });
+    // A status read cannot prove cancellation of an in-flight unload. In
+    // particular, waiting for one here can consume the host's shutdown grace.
+    if (result.kind === "accepted") unloadCancelled = true;
+    return result.kind === "accepted";
+  };
+  const onReady = (): void => {
+    readyDuringCleanup = true;
+    if (!unloadAttempted) return;
+    cancelPromise = cancelAcceptedUnload();
+    void cancelPromise.then((outcome) => {
+      if (cleanupFinished && outcome && runtime.alive && manager.get(runtime.id) === runtime) {
+        retainFenceUntilExit = false;
+        releaseAttempt();
+      }
+    }).catch((error: unknown) => {
+      console.warn(`omp-desktopd: ready runtime unload cancellation unavailable: ${String(error)}`);
+    });
+  };
+  unsubscribeReady = runtime.subscribeReady(onReady);
+  const keepFenceUntilExit = (): void => {
+    if (!runtime.alive) return;
+    retainFenceUntilExit = true;
+    unsubscribeExit = runtime.subscribeExit(releaseAttempt);
+    if (!runtime.alive) releaseAttempt();
+  };
+  try {
+    const before = await idleClient.status(runtime.id);
+    if (before.kind !== "available" || before.status.sessionFile !== sessionFile ||
+        before.status.unloading || before.status.idleSince === null || before.status.reasons.length !== 0 ||
+        !runtime.alive || runtime.ready || runtime.sessionFile !== sessionFile ||
+        manager.get(runtime.id) !== runtime || requestingSessions.has(sessionFile) ||
+        Date.now() >= cleanupDeadline || readyDuringCleanup) return;
+
+    unloadAttempted = true;
+    if (runtime.ready || readyDuringCleanup) return;
+    const result = await idleClient.unload(runtime.id, { sessionFile, idleTimeoutMs: 1, attemptId: unloadAttemptId });
+    if (runtime.ready || readyDuringCleanup) {
+      let cancellation = cancelPromise ? await cancelPromise : false;
+      if (!cancellation) cancellation = await cancelAcceptedUnload();
+      if (!cancellation) {
+        keepFenceUntilExit();
+      }
+      return;
+    }
+    let accepted = result.kind === "accepted";
+    if (result.kind === "unavailable") {
+      // A missing acknowledgement does not prove that the host rejected unload.
+      const fresh = await idleClient.status(runtime.id);
+      if (fresh.kind === "available" && fresh.status.sessionFile === sessionFile && fresh.status.unloading) {
+        accepted = true;
+      } else {
+        const cancellation = await idleClient.cancelUnload(runtime.id, { sessionFile, attemptId: unloadAttemptId });
+        if (cancellation.kind === "accepted") return;
+        keepFenceUntilExit();
+        return;
+      }
+    }
+    if (!accepted) return;
+    while (runtime.alive && !shuttingDown && Date.now() < cleanupDeadline) {
+      if (runtime.ready || readyDuringCleanup) {
+        let cancellation = cancelPromise ? await cancelPromise : false;
+        if (!cancellation) cancellation = await cancelAcceptedUnload();
+        if (!cancellation) keepFenceUntilExit();
+        return;
+      }
+      const fresh = await idleClient.status(runtime.id);
+      if (runtime.ready || readyDuringCleanup) continue;
+      if (fresh.kind === "available") {
+        if (fresh.status.sessionFile !== sessionFile) {
+          keepFenceUntilExit();
+          return;
+        }
+        if (!fresh.status.unloading) return;
+      }
+      if (Date.now() < cleanupDeadline) {
+        await Bun.sleep(Math.min(250, cleanupDeadline - Date.now()));
+      }
+    }
+    if (shuttingDown) return;
+    if (runtime.alive) {
+      // Shutdown was accepted but did not settle before the request deadline.
+      // Keep prompts and terminal input fenced until the runtime exits.
+      keepFenceUntilExit();
+      return;
+    }
+    while (manager.get(runtime.id) === runtime && !shuttingDown && Date.now() < cleanupDeadline) {
+      await Bun.sleep(25);
+    }
+    if (manager.get(runtime.id) === runtime) keepFenceUntilExit();
+  } catch (error) {
+    if (unloadAttempted) keepFenceUntilExit();
+    console.warn(`omp-desktopd: unadmitted startup cleanup unavailable: ${String(error)}`);
+  } finally {
+    cleanupFinished = true;
+    // Cancellation can finish before the final status read crosses its deadline.
+    // Its callback cannot release the fence until cleanup has finished.
+    if (unloadCancelled && runtime.alive && manager.get(runtime.id) === runtime) {
+      retainFenceUntilExit = false;
+    }
+    // The manager can remove an alive runtime during the precheck or a rejected
+    // unload. Keep queued resumes fenced until that runtime exits.
+    if (!retainFenceUntilExit && runtime.alive && manager.get(runtime.id) !== runtime) {
+      keepFenceUntilExit();
+    }
+    const retainFence = retainFenceUntilExit && runtime.alive;
+    if (!retainFence && !shuttingDown && !runtime.alive && manager.get(runtime.id) !== runtime) {
+      // Ledger reconciliation is best-effort persistence, not part of the HTTP
+      // startup failure. A slow filesystem must not hold the request open.
+      void (async () => {
+        await ledgerWrite;
+        const previousSessions = await ledger.read();
+        if (shuttingDown) return;
+        const preserveUnsettledSessions = restoringPool || exitSaveTimer !== null;
+        const snapshot = new Map<string, LiveSession>();
+        if (preserveUnsettledSessions) {
+          for (const session of previousSessions) {
+            if (session.sessionFile !== sessionFile) snapshot.set(session.sessionFile, session);
+          }
+        }
+        // The input fence has been released: a newer runtime may now own this
+        // same transcript. Reconcile against the current pool, not the retiree.
+        for (const session of manager.liveSessions()) {
+          snapshot.set(session.sessionFile, session);
+        }
+        writeLedger([...snapshot.values()]);
+      })().catch((error: unknown) => {
+        console.warn(`omp-desktopd: startup cleanup ledger reconciliation unavailable: ${String(error)}`);
+      });
+    }
+    if (!retainFence) releaseAttempt();
+  }
 }
 
 
@@ -783,6 +959,7 @@ const server = Bun.serve<WsData>({
           return new Response(IDLE_REQUEST_TOO_LARGE, { status: 413 });
         }
         let runtime: Runtime | undefined;
+        let promptAttempted = false;
         try {
           runtime = await createRequestedRuntime({
             resume,
@@ -795,6 +972,7 @@ const server = Bun.serve<WsData>({
           const file = ready.sessionFile;
           if (file === null) throw new RuntimeUnavailableError("session has no transcript yet; the request was not sent");
           runtime.lastInputAt = Date.now();
+          promptAttempted = true;
           const dispatched = await idleClient.prompt(runtime.id, {
             sessionFile: file, text: body.text, files: body.files as string[] | undefined,
           });
@@ -826,6 +1004,7 @@ const server = Bun.serve<WsData>({
           return Response.json({ runtime: runtime.info() }, { headers: NO_STORE });
         } catch (error) {
           if (runtime && !runtime.alive && manager.get(runtime.id) === runtime) await manager.kill(runtime.id);
+          else if (runtime && !resume && !promptAttempted) await retireUnadmittedFreshRuntime(runtime);
           if (error instanceof ArchivedSessionError) return new Response(error.message, { status: 400 });
           if (error instanceof RuntimeCapacityError) {
             return new Response("session limit reached; stop a session or raise the runtime limit in Settings", { status: 409 });
@@ -919,6 +1098,9 @@ const server = Bun.serve<WsData>({
       }
       if (terminalMatch[2] === "input" && req.method === "POST") {
         if (!runtime.alive) return new Response("runtime is not running", { status: 409 });
+        if (!runtime.ready) {
+          return new Response("terminal is still starting; input was not accepted", { status: 503 });
+        }
         let body: unknown;
         try {
           body = JSON.parse(new TextDecoder().decode(await readLimitedBytes(req, 128 * 1024)));
@@ -962,6 +1144,16 @@ const server = Bun.serve<WsData>({
         return;
       }
       const output = ws.data.output = new TerminalOutput(ws);
+      let helloSent = false;
+      let readyBeforeHello = false;
+      ws.data.unsubReady = runtime.subscribeReady(() => {
+        if (!helloSent) {
+          readyBeforeHello = true;
+          return;
+        }
+        const message: ServerMessage = { type: "ready", runtime: runtime.info() };
+        output.send(JSON.stringify(message));
+      });
       ws.data.unsubData = runtime.subscribeOutput((replay, info) => {
         const hello: ServerMessage = {
           type: "hello",
@@ -970,6 +1162,12 @@ const server = Bun.serve<WsData>({
         };
         output.send(JSON.stringify(hello));
         if (replay.length > 0) output.replay(replay, hello.replayBytes);
+        helloSent = true;
+        if (readyBeforeHello && info.status === "starting") {
+          const message: ServerMessage = { type: "ready", runtime: runtime.info() };
+          output.send(JSON.stringify(message));
+        }
+        readyBeforeHello = false;
       }, (data) => output.send(data));
       ws.data.unsubExit = runtime.subscribeExit((exit) => {
         const message: ServerMessage = { type: "exit", exitCode: exit.exitCode, daemonShutdown: shuttingDown };
@@ -982,6 +1180,10 @@ const server = Bun.serve<WsData>({
       const msg = parseClientMessage(raw);
       if (!msg) return;
       if (msg.type === "input") {
+        if (!runtime.ready) {
+          ws.close(1013, "Runtime is still starting; input was not accepted");
+          return;
+        }
         const unloading = runtime.sessionFile ? unloadingBySession.get(runtime.sessionFile) : undefined;
         if (unloading?.runtime === runtime) await unloading.done;
         if (!runtime.alive || unloadingRuntimes.has(runtime) || manager.get(runtime.id) !== runtime) {
@@ -993,6 +1195,12 @@ const server = Bun.serve<WsData>({
           const ack: ServerMessage = { type: "inputAck", id: msg.id };
           ws.data.output?.send(JSON.stringify(ack));
         }
+      } else if (msg.type === "terminalReply") {
+        if (!runtime.alive || unloadingRuntimes.has(runtime) || manager.get(runtime.id) !== runtime) {
+          ws.close(1012, "Session unavailable");
+          return;
+        }
+        runtime.writeTerminalReply(msg.data);
       } else runtime.resize(msg.cols, msg.rows);
     },
     drain(ws) {
@@ -1002,6 +1210,7 @@ const server = Bun.serve<WsData>({
       ws.data.output?.dispose();
       ws.data.unsubData?.();
       ws.data.unsubExit?.();
+      ws.data.unsubReady?.();
     },
   },
 });
@@ -1049,8 +1258,8 @@ let ledgerWrite: Promise<void> = Promise.resolve();
  */
 let restoringPool = true;
 
-function writeLedger(): void {
-  ledgerWrite = ledger.save(manager.liveSessions()).catch((error) => {
+function writeLedger(sessions: LiveSession[] = manager.liveSessions()): void {
+  ledgerWrite = ledger.save(sessions).catch((error) => {
     console.warn(`omp-desktopd: runtime ledger not saved: ${error instanceof Error ? error.message : String(error)}`);
   });
 }

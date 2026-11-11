@@ -41,11 +41,13 @@ export class Runtime {
 
   #pty: IPty | null = null;
   #exit: RuntimeExit | null = null;
+  #ready = false;
   #replay: TerminalReplay;
   #resources: RuntimeResourceLease;
   #dataSubs = new Set<(data: Uint8Array) => void>();
   #pendingDataSubscribers = 0;
   #exitSubs = new Set<(exit: RuntimeExit) => void>();
+  #readySubs = new Set<() => void>();
   #fileSubs = new Set<(sessionFile: string) => void>();
   #terminationTimer: Timer | null = null;
   #terminating = false;
@@ -81,9 +83,25 @@ export class Runtime {
     return this.#pty?.rows ?? this.spec.rows;
   }
 
-  /** See RuntimeStatus: recent bytes = omp is painting or streaming. */
+  get ready(): boolean {
+    return this.#ready;
+  }
+
+  /** Fires once after the parser has completed OMP's initial clear-screen frame. */
+  subscribeReady(sub: () => void): () => void {
+    if (this.#ready) {
+      sub();
+      return () => {};
+    }
+    if (this.#disposed || this.#exit) return () => {};
+    this.#readySubs.add(sub);
+    return () => this.#readySubs.delete(sub);
+  }
+
+  /** See RuntimeStatus: starting persists until a real initial frame is parsed. */
   get status(): RuntimeInfo["status"] {
     if (!this.alive) return this.#exit ? "exited" : "idle";
+    if (!this.#ready) return "starting";
     return this.lastActivityAt !== null && Date.now() - this.lastActivityAt < STREAMING_WINDOW_MS
       ? "streaming"
       : "idle";
@@ -140,11 +158,16 @@ export class Runtime {
         this.sessionFile = sniffed.sessionFile;
         for (const sub of this.#fileSubs) sub(this.sessionFile);
       }
-      this.#replay.append(data, () => {
+      this.#replay.append(data, (initialClearScreenSeen) => {
         const bytes = liveBytes;
         liveBytes = undefined;
-        if (!bytes) return;
-        for (const sub of this.#dataSubs) sub(bytes);
+        if (bytes) for (const sub of this.#dataSubs) sub(bytes);
+        if (!this.#ready && initialClearScreenSeen) {
+          this.#ready = true;
+          const readySubs = [...this.#readySubs];
+          this.#readySubs.clear();
+          for (const sub of readySubs) sub();
+        }
       });
     });
     pty.onExit((event) => {
@@ -209,8 +232,17 @@ export class Runtime {
   }
 
   write(data: string): void {
+    this.#write(data, true);
+  }
+
+  /** Terminal query replies are protocol traffic, not accepted user activity. */
+  writeTerminalReply(data: string): void {
+    this.#write(data, false);
+  }
+
+  #write(data: string, trackActivity: boolean): void {
     if (!this.#pty || data.length === 0) return;
-    this.lastInputAt = Date.now();
+    if (trackActivity) this.lastInputAt = Date.now();
     this.#pty.write(data);
   }
 
@@ -242,6 +274,7 @@ export class Runtime {
     this.#dataSubs.clear();
     this.#exitSubs.clear();
     this.#fileSubs.clear();
+    this.#readySubs.clear();
   }
   /**
    * Stop the PTY's dedicated process group. Keep the PTY reader open so its

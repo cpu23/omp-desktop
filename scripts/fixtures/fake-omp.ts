@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { appendFileSync, chmodSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { isRecord } from "../../src/guards";
 
@@ -80,11 +80,32 @@ function announceSessionFile(): void {
   process.stdout.write(`\x1b]1337;SetUserVar=omp_session_file=${encodedPath}\x07`);
 }
 if (process.env.OMP_DESKTOP_TEST_DEFER_SESSION_FILE !== "1") announceSessionFile();
-process.stdout.write("FAKE-OMP READY\r\n");
+const startupGate = process.env.OMP_DESKTOP_TEST_STARTUP_GATE;
+const cleanupHold = process.env.OMP_DESKTOP_TEST_CLEANUP_HOLD_UNLOAD;
+const cleanupAcceptHold = process.env.OMP_DESKTOP_TEST_CLEANUP_ACCEPT_HOLD;
+const cleanupAcceptMarker = process.env.OMP_DESKTOP_TEST_CLEANUP_ACCEPT_MARKER;
+const cleanupCancelAttemptMarker = process.env.OMP_DESKTOP_TEST_CLEANUP_CANCEL_ATTEMPT_MARKER;
+const cleanupCancelMarker = process.env.OMP_DESKTOP_TEST_CLEANUP_CANCEL_MARKER;
+const cleanupResultMarker = process.env.OMP_DESKTOP_TEST_CLEANUP_RESULT_MARKER;
+const cleanupPrecheckHold = process.env.OMP_DESKTOP_TEST_CLEANUP_PRECHECK_HOLD;
+const cleanupPrecheckMarker = process.env.OMP_DESKTOP_TEST_CLEANUP_PRECHECK_MARKER;
+const pidMarker = process.env.OMP_DESKTOP_TEST_PID_MARKER;
+if (pidMarker) writeFileSync(pidMarker, String(process.pid));
+if (process.env.OMP_DESKTOP_TEST_IGNORE_SIGTERM === "1") {
+  process.on("SIGTERM", () => {
+    const marker = process.env.OMP_DESKTOP_TEST_SIGTERM_MARKER;
+    if (marker) writeFileSync(marker, "received");
+  });
+}
+// OMP reads terminal negotiation replies in raw mode during startup.
+if (startupGate) process.stdin.setRawMode?.(true);
 
 let idleSince = Date.now();
-let unloading = false;
+let unloading = process.env.OMP_DESKTOP_TEST_START_UNLOADING === "1";
+let idleStatusUnavailable = false;
+let idleStatusRequests = 0;
 let revision = 0;
+let unloadTimer: Timer | undefined;
 const idleDir = process.env.OMP_DESKTOP_IDLE_IPC_DIR;
 const idleToken = process.env.OMP_DESKTOP_IDLE_IPC_TOKEN;
 if (idleDir && idleToken) {
@@ -98,6 +119,14 @@ if (idleDir && idleToken) {
       }
       const path = new URL(request.url).pathname;
       if (request.method === "GET" && path === "/status") {
+        idleStatusRequests += 1;
+        if (unloading && idleStatusRequests > 1 && cleanupPrecheckHold) {
+          if (cleanupPrecheckMarker) writeFileSync(cleanupPrecheckMarker, "attempted");
+          while (existsSync(cleanupPrecheckHold)) await Bun.sleep(10);
+        }
+        if (idleStatusUnavailable) {
+          return Response.json({ kind: "unavailable", reason: "fixture status unavailable" }, { status: 503 });
+        }
         return Response.json({
           hostId: `fixture-${process.pid}`, sessionId: runtimeId, sessionFile: transcript || null,
           idleSince: unloading ? null : idleSince, reasons: unloading ? ["unloading"] : [],
@@ -105,9 +134,19 @@ if (idleDir && idleToken) {
         });
       }
       const body: unknown = await request.json().catch(() => null);
-      if (!isRecord(body) || body.sessionFile !== transcript || unloading) {
+      if (!isRecord(body) || body.sessionFile !== transcript) {
         return Response.json({ kind: "conflict", reason: "session changed or unloading" }, { status: 409 });
       }
+      if (request.method === "POST" && path === "/cancel-unload") {
+        if (cleanupCancelAttemptMarker) appendFileSync(cleanupCancelAttemptMarker, `${unloading ? "unloading" : "open"}\n`);
+        if (!unloading) return Response.json({ kind: "conflict", reason: "unload is not pending" }, { status: 409 });
+        clearTimeout(unloadTimer);
+        unloadTimer = undefined;
+        unloading = false;
+        if (cleanupCancelMarker) writeFileSync(cleanupCancelMarker, "cancelled");
+        return Response.json({ kind: "accepted" }, { status: 202 });
+      }
+      if (unloading) return Response.json({ kind: "conflict", reason: "session is unloading" }, { status: 409 });
       if (request.method === "POST" && path === "/prompt") {
         if (process.env.OMP_DESKTOP_TEST_REJECT_PROMPT === "unavailable") {
           return Response.json({ kind: "unavailable", reason: "fixture acknowledgement unavailable" }, { status: 503 });
@@ -136,21 +175,35 @@ if (idleDir && idleToken) {
         return Response.json({ kind: "accepted" }, { status: 202 });
       }
       if (request.method === "POST" && path === "/unload") {
+        if (process.env.OMP_DESKTOP_TEST_CLEANUP_STATUS_UNAVAILABLE === "1") {
+          if (startupGate) writeFileSync(`${startupGate}.unload-attempted`, "attempted");
+          while (cleanupHold && existsSync(cleanupHold)) await Bun.sleep(10);
+          idleStatusUnavailable = true;
+          return Response.json({ kind: "unavailable", reason: "fixture unload acknowledgement lost" }, { status: 503 });
+        }
         if (process.env.OMP_DESKTOP_TEST_PROTECT_UNLOAD === "1") {
           return Response.json({ kind: "conflict", reason: "fixture active work" }, { status: 409 });
         }
+        if (cleanupAcceptHold) {
+          if (cleanupAcceptMarker) writeFileSync(cleanupAcceptMarker, "attempted");
+          while (existsSync(cleanupAcceptHold)) await Bun.sleep(10);
+        }
         if (typeof body.idleTimeoutMs !== "number" || body.idleTimeoutMs <= 0 ||
             Date.now() - idleSince < body.idleTimeoutMs) {
+          if (cleanupResultMarker) writeFileSync(cleanupResultMarker, `conflict:${Date.now() - idleSince}`);
           return Response.json({ kind: "conflict", reason: "not idle long enough" }, { status: 409 });
         }
         unloading = true;
-        setTimeout(() => process.exit(0), 25);
+        if (cleanupResultMarker) writeFileSync(cleanupResultMarker, "accepted");
+        const exitDelay = Number(process.env.OMP_DESKTOP_TEST_CLEANUP_EXIT_DELAY_MS ?? 25);
+        unloadTimer = setTimeout(() => process.exit(0), exitDelay);
         return Response.json({ kind: "accepted" }, { status: 202 });
       }
       return new Response("not found", { status: 404 });
     },
   });
   chmodSync(socket, 0o600);
+  if (startupGate) writeFileSync(`${startupGate}.online`, "idle IPC listening");
   process.on("exit", () => {
     idleServer.stop(true);
     try { unlinkSync(socket); } catch {}
@@ -185,3 +238,12 @@ process.stdin.on("data", (chunk: Buffer) => {
 });
 
 process.stdin.resume();
+
+const startupMode = process.env.OMP_DESKTOP_TEST_STARTUP_MODE;
+if (startupMode === "no-frame") {
+  await new Promise<void>(() => {});
+} else {
+  while (startupGate && existsSync(startupGate)) await Bun.sleep(10);
+  if (startupGate) process.stdin.setRawMode?.(false);
+  process.stdout.write("\x1b[2JFAKE-OMP READY\r\n");
+}

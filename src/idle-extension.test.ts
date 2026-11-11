@@ -66,17 +66,19 @@ describe("desktop idle service registry executable selection", () => {
       },
       logger: { info() {}, warn() {}, error() {} },
     } as Parameters<typeof registerDesktopIdleExtension>[0];
+    const shutdownCallbacks: Array<() => void> = [];
+    let shutdowns = 0;
     const context = {
       cwd: root,
       hasUI: false,
       isIdle: () => true,
       hasPendingMessages: () => false,
-      getAsyncJobSnapshot: () => [],
+      getAsyncJobSnapshot: () => ({ running: [], recent: [], delivery: { queued: 0, delivering: false, pendingJobIds: [] } }),
       getPendingPlanReview: () => null,
       setInterval: () => 1,
-      setTimeout: () => 1,
+      setTimeout: (callback: () => void) => { shutdownCallbacks.push(callback); return 1; },
       clearTimer() {},
-      shutdown() {},
+      shutdown() { shutdowns += 1; },
       sessionManager,
     };
 
@@ -98,12 +100,12 @@ describe("desktop idle service registry executable selection", () => {
           .toBe(expectedStatus === 413 ? "body_too_large" : "invalid_idle_timeout");
       }
 
+      const client = new IdleRuntimeClient({ dir: socketDir, token: environment.OMP_DESKTOP_IDLE_IPC_TOKEN });
       handlers.get("tool_execution_end")?.({
         toolCallId: "service-call",
         toolName: "bash",
         result: { details: { service: { name: "named-service", cwd: root } } },
       }, context);
-      const client = new IdleRuntimeClient({ dir: socketDir, token: environment.OMP_DESKTOP_IDLE_IPC_TOKEN });
       const status = await client.status(runtimeId);
       expect(status.kind).toBe("available");
       const invocation = JSON.parse(await readFile(invocationFile, "utf8")) as string[];
@@ -113,6 +115,73 @@ describe("desktop idle service registry executable selection", () => {
         expect(status.status.reasons).toContain("named_bash_service_running");
         expect(status.status.unloading).toBe(false);
       }
+      handlers.get("session_shutdown")?.({}, context);
+      registerDesktopIdleExtension(host);
+      handlers.get("session_start")?.({}, context);
+      await client.status(runtimeId);
+      await Bun.sleep(5);
+      const attemptId = "test-unload";
+      const unload = await client.unload(runtimeId, { sessionFile, idleTimeoutMs: 1, attemptId });
+      expect(unload.kind, JSON.stringify(unload)).toBe("accepted");
+      const cancel = await client.cancelUnload(runtimeId, { sessionFile, attemptId });
+      expect(cancel.kind).toBe("accepted");
+      const reopened = await client.status(runtimeId);
+      expect(reopened.kind).toBe("available");
+      if (reopened.kind === "available") expect(reopened.status.unloading).toBe(false);
+
+      // Cancellation before arrival must also reject a delayed/replayed unload.
+      expect((await client.cancelUnload(runtimeId, { sessionFile, attemptId: "early" })).kind).toBe("accepted");
+      await Bun.sleep(5);
+      for (let repeat = 0; repeat < 2; repeat++) {
+        expect(await client.unload(runtimeId, { sessionFile, idleTimeoutMs: 1, attemptId: "early" }))
+          .toEqual({ kind: "conflict", reason: "unload_cancelled" });
+      }
+      expect((await client.unload(runtimeId, { sessionFile, idleTimeoutMs: 1, attemptId: "next" })).kind).toBe("accepted");
+      // A host may already have queued a cancelled callback and reuse its handle.
+      shutdownCallbacks[0]!();
+      expect(shutdowns).toBe(0);
+      shutdownCallbacks[1]!();
+      expect(shutdowns).toBe(1);
+      expect((await client.cancelUnload(runtimeId, { sessionFile, attemptId: "next" })).kind).toBe("conflict");
+
+      handlers.get("session_shutdown")?.({}, context);
+      registerDesktopIdleExtension(host);
+      handlers.get("session_start")?.({}, context);
+      await client.status(runtimeId);
+      expect(await client.unload(runtimeId, { sessionFile, idleTimeoutMs: 1, attemptId: "x".repeat(129) }))
+        .toEqual({ kind: "conflict", reason: "invalid_attempt_id" });
+      for (let index = 0; index < 127; index++) {
+        expect((await client.cancelUnload(runtimeId, { sessionFile, attemptId: `reserved-${index}` })).kind)
+          .toBe("accepted");
+      }
+      await Bun.sleep(5);
+      const callbackCount = shutdownCallbacks.length;
+      expect((await client.unload(runtimeId, { sessionFile, idleTimeoutMs: 1, attemptId: "last-slot" })).kind)
+        .toBe("accepted");
+      expect((await client.cancelUnload(runtimeId, { sessionFile, attemptId: "unrelated" })).kind)
+        .not.toBe("accepted");
+      expect((await client.cancelUnload(runtimeId, { sessionFile, attemptId: "last-slot" })).kind)
+        .toBe("accepted");
+      shutdownCallbacks[callbackCount]!();
+      expect(shutdowns).toBe(1);
+      await client.status(runtimeId);
+      await Bun.sleep(5);
+      expect((await client.unload(runtimeId, { sessionFile, idleTimeoutMs: 1, attemptId: "over-capacity" })).kind)
+        .toBe("unavailable");
+      const full = await fetch("http://localhost/unload", {
+        unix: join(socketDir, `${runtimeId}.sock`), method: "POST",
+        headers: { authorization: `Bearer ${environment.OMP_DESKTOP_IDLE_IPC_TOKEN}`, "content-type": "application/json" },
+        body: JSON.stringify({ sessionFile, idleTimeoutMs: 1, attemptId: "still-over-capacity" }),
+      });
+      expect(full.status).toBe(503);
+      expect(await full.json()).toEqual({ kind: "unavailable", reason: "cancellation_capacity" });
+      expect(shutdownCallbacks.length).toBe(callbackCount + 1);
+      // Idempotent cancellation and ordinary idle unload still work at capacity.
+      expect((await client.cancelUnload(runtimeId, { sessionFile, attemptId: "last-slot" })).kind)
+        .toBe("accepted");
+      expect((await client.unload(runtimeId, { sessionFile, idleTimeoutMs: 1 })).kind).toBe("accepted");
+      shutdownCallbacks.at(-1)!();
+      expect(shutdowns).toBe(2);
     } finally {
       handlers.get("session_shutdown")?.({}, context);
       for (const [key, value] of previous) {

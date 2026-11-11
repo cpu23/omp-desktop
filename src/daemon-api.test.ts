@@ -1,14 +1,21 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
-import { chmod, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, open, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { connect as connectTcp } from "node:net";
 import { IMAGE_FILE_LIMIT } from "./image-limits";
 import { isRecord } from "./guards";
-import { parseServerMessage } from "./protocol";
+import { parseServerMessage, type ServerMessage } from "./protocol";
 import { fakeOmpRecordPath, startTestDaemon, testSessionsRoot, writeTestTranscript } from "../scripts/fixtures/daemon";
 
-type RuntimeInfo = { id: string; alive: boolean; pid: number | null; sessionFile: string | null; cwd: string };
+type RuntimeInfo = {
+  id: string;
+  alive: boolean;
+  pid: number | null;
+  sessionFile: string | null;
+  cwd: string;
+  status?: string;
+};
 
 function binaryMessagesContain(
   messages: ReadonlyArray<{ raw: string | ArrayBuffer }>,
@@ -60,6 +67,7 @@ async function runtimeList(base: string): Promise<RuntimeInfo[]> {
       pid: typeof record.pid === "number" ? record.pid : null,
       sessionFile: typeof record.sessionFile === "string" ? record.sessionFile : null,
       cwd: typeof record.cwd === "string" ? record.cwd : "",
+      status: typeof record.status === "string" ? record.status : undefined,
     };
   });
 }
@@ -465,8 +473,10 @@ describe("real daemon API behavior", () => {
       await opened.promise;
       await waitFor(
         () => messages.some((entry) => entry.parsed?.type === "hello") &&
-          binaryMessagesContain(messages, "FAKE-OMP READY"),
-        "WebSocket hello and ready marker replay",
+          binaryMessagesContain(messages, "FAKE-OMP READY") &&
+          (messages.some((entry) => entry.parsed?.type === "ready") ||
+            messages.some((entry) => entry.parsed?.type === "hello" && entry.parsed.runtime.status !== "starting")),
+        "WebSocket hello, initial frame and readiness",
       );
       const helloIndex = messages.findIndex((entry) => entry.parsed?.type === "hello");
       const replayIndex = messages.findIndex((entry) => entry.raw instanceof ArrayBuffer);
@@ -512,6 +522,552 @@ describe("real daemon API behavior", () => {
       await daemon.stop();
     }
   }, 60_000);
+  test("cold prompts and raw input wait for the parsed startup frame", async () => {
+    const gateDir = await mkdtemp(join(tmpdir(), "omp-startup-gate-"));
+    const gatePath = join(gateDir, "hold-first-frame");
+    await writeFile(gatePath, "held");
+    const daemon = await startTestDaemon({ env: { OMP_DESKTOP_TEST_STARTUP_GATE: gatePath } });
+    let earlySocket: WebSocket | null = null;
+    let observerSocket: WebSocket | null = null;
+    let coldRequest: Promise<Response> | null = null;
+    try {
+      const marker = `cold-start-prompt-${crypto.randomUUID()}`;
+      coldRequest = fetch(`${daemon.base}/api/sessions/request`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: marker }),
+      }).catch(error => new Response(String(error), { status: 599 }));
+
+      let runtime: RuntimeInfo | undefined;
+      await waitFor(async () => {
+        runtime = (await runtimeList(daemon.base)).find(entry => entry.id.length > 0);
+        return runtime?.alive === true &&
+          runtime.status === "starting" &&
+          typeof runtime.sessionFile === "string" &&
+          await Bun.file(`${gatePath}.online`).exists();
+      }, "the idle IPC socket while the PTY is still starting");
+      if (!runtime?.sessionFile) throw new Error("cold startup did not announce its transcript");
+      const sessionFile = runtime.sessionFile;
+      const recordPath = fakeOmpRecordPath(daemon.root, runtime.id);
+      expect(await Bun.file(sessionFile).text()).not.toContain(marker);
+
+      const earlyHttpText = `early-http-input-${crypto.randomUUID()}\n`;
+      const earlyHttp = await inputRequest(daemon.base, runtime.id, JSON.stringify({ data: earlyHttpText }));
+      expect(earlyHttp.status).toBe(503);
+      expect(await earlyHttp.text()).toContain("still starting");
+
+      const earlyFrames: Array<{ raw: string; parsed: ServerMessage | null }> = [];
+      earlySocket = new WebSocket(`ws://127.0.0.1:${daemon.port}/ws/term?runtime=${encodeURIComponent(runtime.id)}`);
+      earlySocket.onmessage = event => {
+        if (typeof event.data === "string") earlyFrames.push({ raw: event.data, parsed: parseServerMessage(event.data) });
+      };
+      const earlyOpened = Promise.withResolvers<void>();
+      const earlyClosed = Promise.withResolvers<CloseEvent>();
+      earlySocket.onopen = () => earlyOpened.resolve();
+      earlySocket.onerror = () => earlyOpened.reject(new Error("early runtime WebSocket failed"));
+      earlySocket.onclose = event => earlyClosed.resolve(event);
+      await earlyOpened.promise;
+      await waitFor(() => earlyFrames.some(frame => frame.parsed?.type === "hello"), "the starting hello");
+      const earlyHello = earlyFrames.find(frame => frame.parsed?.type === "hello")?.parsed;
+      expect(earlyHello?.type === "hello" ? earlyHello.runtime.status : null).toBe("starting");
+
+      const terminalReply = "\x1b[0n";
+      earlySocket.send(JSON.stringify({ type: "terminalReply", data: terminalReply }));
+      await waitFor(async () => {
+        if (!await Bun.file(recordPath).exists()) return false;
+        const recorded = Buffer.from(await Bun.file(recordPath).arrayBuffer());
+        return recorded.equals(Buffer.from(terminalReply));
+      }, "a valid terminal reply reaching the starting PTY");
+
+      const earlyWsText = `early-ws-input-${crypto.randomUUID()}\n`;
+      earlySocket.send(JSON.stringify({ type: "input", id: "rejected-starting-input", data: earlyWsText }));
+      const close = await earlyClosed.promise;
+      expect(close.code).toBe(1013);
+      expect(earlyFrames.some(frame =>
+        frame.parsed?.type === "inputAck" && frame.parsed.id === "rejected-starting-input",
+      )).toBe(false);
+      expect(Buffer.from(await Bun.file(recordPath).arrayBuffer())).toEqual(Buffer.from(terminalReply));
+
+      const observed: Array<{ raw: string; parsed: ServerMessage | null; binary: boolean }> = [];
+      observerSocket = new WebSocket(`ws://127.0.0.1:${daemon.port}/ws/term?runtime=${encodeURIComponent(runtime.id)}`);
+      observerSocket.binaryType = "arraybuffer";
+      observerSocket.onmessage = event => {
+        const binary = typeof event.data !== "string";
+        const raw = binary ? new TextDecoder().decode(event.data as ArrayBuffer) : event.data as string;
+        observed.push({ raw, parsed: binary ? null : parseServerMessage(raw), binary });
+      };
+      const observerOpened = Promise.withResolvers<void>();
+      observerSocket.onopen = () => observerOpened.resolve();
+      observerSocket.onerror = () => observerOpened.reject(new Error("readiness observer WebSocket failed"));
+      await observerOpened.promise;
+      await waitFor(() => observed.some(frame => frame.parsed?.type === "hello"), "the observer hello");
+      const observerHello = observed.find(frame => frame.parsed?.type === "hello")?.parsed;
+      expect(observerHello?.type === "hello" ? observerHello.runtime.status : null).toBe("starting");
+
+      await rm(gatePath, { force: true });
+      const response = await coldRequest;
+      expect(response.status).toBe(200);
+      await waitFor(
+        () => observed.some(frame => frame.parsed?.type === "ready"),
+        "the parsed-frame ready event",
+      );
+      const helloIndex = observed.findIndex(frame => frame.parsed?.type === "hello");
+      const clearFrameIndex = observed.findIndex(frame => frame.binary && frame.raw.includes("\x1b[2J"));
+      const readyIndex = observed.findIndex(frame => frame.parsed?.type === "ready");
+      expect(helloIndex).toBeGreaterThanOrEqual(0);
+      expect(clearFrameIndex).toBeGreaterThan(helloIndex);
+      expect(readyIndex).toBeGreaterThan(clearFrameIndex);
+      const readyMessage = observed[readyIndex]?.parsed;
+      expect(readyMessage?.type === "ready" ? readyMessage.runtime.status : "starting").not.toBe("starting");
+      const transcript = await Bun.file(sessionFile).text();
+      const submittedMessages = transcript.split("\n").filter(line => {
+        try {
+          const entry: unknown = JSON.parse(line);
+          return isRecord(entry) &&
+            isRecord(entry.message) &&
+            entry.message.role === "user" &&
+            entry.message.content === marker;
+        } catch {
+          return false;
+        }
+      });
+      expect(submittedMessages).toHaveLength(1);
+    } finally {
+      earlySocket?.close();
+      observerSocket?.close();
+      await daemon.stop();
+      await rm(gateDir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("fresh no-frame startup timeouts retire only unadmitted idle runtimes", async () => {
+    const daemon = await startTestDaemon({ env: { OMP_DESKTOP_TEST_STARTUP_MODE: "no-frame" } });
+    const marker = `unsubmitted-startup-prompt-${crypto.randomUUID()}`;
+    let pendingExitPath = "";
+    try {
+      pendingExitPath = await writeTestTranscript(daemon.root, "pending-exit-sibling");
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const unrelated = attempt === 1 ? await createRuntime(daemon.base) : null;
+        let starting: RuntimeInfo | undefined;
+        const pending = fetch(`${daemon.base}/api/sessions/request`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ text: marker }),
+        });
+        await waitFor(async () => {
+          starting = (await runtimeList(daemon.base)).find(runtime => runtime.status === "starting");
+          return starting?.alive === true && typeof starting.sessionFile === "string";
+        }, `fresh runtime ${attempt + 1} to announce its transcript`);
+        if (!starting?.sessionFile || starting.pid === null) {
+          throw new Error("no-frame runtime did not expose its startup identity");
+        }
+        const sessionFile = starting.sessionFile;
+        const pid = starting.pid;
+        if (attempt === 0) {
+          // Preserve a sibling exit that is still inside the daemon's settle window.
+          const ledgerPath = join(daemon.root, "state", "sessions.json");
+          const saved: unknown = await Bun.file(ledgerPath).json();
+          if (!isRecord(saved) || !Array.isArray(saved.sessions)) throw new Error("bad runtime ledger fixture");
+          await Bun.write(ledgerPath, JSON.stringify({
+            ...saved,
+            sessions: [...saved.sessions, { sessionFile: pendingExitPath, cwd: daemon.root, cols: 80, rows: 24 }],
+          }));
+        }
+        const response = await pending;
+        expect(response.status).toBe(503);
+        expect(await response.text()).toContain("terminal did not initialize");
+        const expectedRemaining = unrelated ? [unrelated.id] : [];
+        await waitFor(async () =>
+          (await runtimeList(daemon.base)).map(runtime => runtime.id).sort().join(",") === expectedRemaining.sort().join(","),
+        "only the unadmitted startup runtime to be retired");
+        if (unrelated) {
+          expect((await runtimeList(daemon.base)).find(runtime => runtime.id === unrelated.id))
+            .toMatchObject({ alive: false, pid: null });
+        }
+        await waitFor(() => {
+          try {
+            process.kill(pid, 0);
+            return false;
+          } catch (error) {
+            return (error as NodeJS.ErrnoException).code === "ESRCH";
+          }
+        }, "unadmitted startup process reaping");
+        expect(await Bun.file(sessionFile).text()).not.toContain(marker);
+        if (attempt === 0) {
+          await daemon.restart();
+          await waitFor(async () => (await runtimeList(daemon.base)).some(runtime => runtime.sessionFile === pendingExitPath),
+            "the unsettled sibling to be restored");
+          const restored = await runtimeList(daemon.base);
+          expect(restored.map(runtime => runtime.sessionFile)).toEqual([pendingExitPath]);
+          const stopped = await fetch(`${daemon.base}/api/runtimes/${restored[0]!.id}`, { method: "DELETE" });
+          expect(stopped.status).toBe(200);
+          await waitFor(async () => (await runtimeList(daemon.base)).length === 0, "restored sibling stop");
+        }
+      }
+    } finally {
+      await daemon.stop();
+    }
+  }, 120_000);
+  test("startup timeout cleanup leaves protected runtimes running", async () => {
+    const daemon = await startTestDaemon({ env: {
+      OMP_DESKTOP_TEST_STARTUP_MODE: "no-frame",
+      OMP_DESKTOP_TEST_PROTECT_UNLOAD: "1",
+    } });
+    try {
+      let starting: RuntimeInfo | undefined;
+      const pending = fetch(`${daemon.base}/api/sessions/request`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: "unsubmitted protected startup" }),
+      });
+      await waitFor(async () => {
+        starting = (await runtimeList(daemon.base)).find(runtime => runtime.status === "starting");
+        return starting?.alive === true && typeof starting.sessionFile === "string";
+      }, "protected fresh runtime to announce its transcript");
+      const response = await pending;
+      expect(response.status).toBe(503);
+      const remaining = await runtimeList(daemon.base);
+      expect(remaining).toHaveLength(1);
+      expect(remaining[0]).toMatchObject({ id: starting!.id, alive: true, status: "starting" });
+    } finally {
+      await daemon.stop();
+    }
+  }, 60_000);
+
+  test("startup cleanup bounds unavailable idle IPC and preserves the ambiguous runtime", async () => {
+    const gateDir = await mkdtemp(join(tmpdir(), "omp-startup-cleanup-unavailable-"));
+    const gatePath = join(gateDir, "hold-first-frame");
+    await writeFile(gatePath, "held");
+    const daemon = await startTestDaemon({ env: {
+      OMP_DESKTOP_TEST_STARTUP_MODE: "no-frame",
+      OMP_DESKTOP_TEST_STARTUP_GATE: gatePath,
+      OMP_DESKTOP_TEST_CLEANUP_STATUS_UNAVAILABLE: "1",
+    } });
+    let pending: Promise<Response> | undefined;
+    try {
+      pending = fetch(`${daemon.base}/api/sessions/request`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: "unsubmitted ambiguous startup" }),
+      }).catch(() => new Response("daemon stopped", { status: 599 }));
+      let starting: RuntimeInfo | undefined;
+      await waitFor(async () => {
+        starting = (await runtimeList(daemon.base)).find(runtime => runtime.status === "starting");
+        return starting?.alive === true &&
+          typeof starting.sessionFile === "string" &&
+          await Bun.file(`${gatePath}.online`).exists();
+      }, "unready runtime and idle IPC fixture");
+      if (!starting) throw new Error("unready runtime identity missing");
+      const runtime = starting;
+      const sessionFile = runtime.sessionFile;
+      const pid = runtime.pid;
+      if (!sessionFile || pid === null) throw new Error("unready runtime lacks a session file or process id");
+      const unloadAttempt = `${gatePath}.unload-attempted`;
+      await waitFor(() => Bun.file(unloadAttempt).exists(), "cleanup unload attempt", 30_000);
+
+      const result = await new Promise<
+        | { kind: "response"; status: number; body: string }
+        | { kind: "timeout" }
+      >(resolve => {
+        const timer = setTimeout(() => resolve({ kind: "timeout" }), 4_000);
+        void pending!.then(async response => {
+          clearTimeout(timer);
+          resolve({ kind: "response", status: response.status, body: await response.text() });
+        });
+      });
+      if (result.kind !== "response") {
+        throw new Error("startup cleanup did not return a failure while idle IPC remained unavailable");
+      }
+      expect(result.status).toBe(503);
+      expect(result.body).toContain("terminal did not initialize");
+      const remaining = await runtimeList(daemon.base);
+      expect(remaining).toHaveLength(1);
+      expect(remaining[0]).toMatchObject({
+        id: runtime.id,
+        alive: true,
+        status: "starting",
+        sessionFile,
+      });
+      expect(() => process.kill(pid, 0)).not.toThrow();
+    } finally {
+      await daemon.stop();
+      await pending?.catch(() => undefined);
+      await rm(gateDir, { recursive: true, force: true });
+    }
+  }, 45_000);
+
+  test("startup cleanup cancels an accepted unload if the runtime becomes ready before shutdown", async () => {
+    const gateDir = await mkdtemp(join(tmpdir(), "omp-startup-ready-unload-race-"));
+    const gatePath = join(gateDir, "hold-first-frame");
+    const cleanupHold = `${gatePath}.hold-accepted-unload`;
+    const unloadAttempted = `${gatePath}.accepted-unload-attempted`;
+    const cancelAttempted = `${gatePath}.unload-cancel-attempted`;
+    const unloadCancelled = `${gatePath}.unload-cancelled`;
+    const unloadResult = `${gatePath}.unload-result`;
+    await writeFile(gatePath, "held");
+    await writeFile(cleanupHold, "held");
+    const daemon = await startTestDaemon({ env: {
+      OMP_DESKTOP_TEST_STARTUP_GATE: gatePath,
+      OMP_DESKTOP_TEST_CLEANUP_ACCEPT_HOLD: cleanupHold,
+      OMP_DESKTOP_TEST_CLEANUP_ACCEPT_MARKER: unloadAttempted,
+      OMP_DESKTOP_TEST_CLEANUP_CANCEL_ATTEMPT_MARKER: cancelAttempted,
+      OMP_DESKTOP_TEST_CLEANUP_CANCEL_MARKER: unloadCancelled,
+      OMP_DESKTOP_TEST_CLEANUP_RESULT_MARKER: unloadResult,
+      OMP_DESKTOP_TEST_CLEANUP_EXIT_DELAY_MS: "150",
+    } });
+    let pending: Promise<Response> | undefined;
+    try {
+      pending = fetch(`${daemon.base}/api/sessions/request`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: "fresh startup that becomes ready during cleanup" }),
+      }).catch(() => new Response("daemon stopped", { status: 599 }));
+      let starting: RuntimeInfo | undefined;
+      await waitFor(async () => {
+        starting = (await runtimeList(daemon.base)).find(runtime => runtime.status === "starting");
+        return starting?.alive === true && typeof starting.sessionFile === "string" &&
+          await Bun.file(`${gatePath}.online`).exists();
+      }, "fresh unready runtime and idle IPC fixture");
+      const runtime = starting;
+      if (!runtime?.sessionFile || runtime.pid === null) throw new Error("runtime identity missing");
+      const originalPid = runtime.pid;
+      await waitFor(() => Bun.file(unloadAttempted).exists(), "host unload request to be held", 30_000);
+      await rm(gatePath, { force: true });
+      await waitFor(async () => {
+        const current = (await runtimeList(daemon.base)).find(item => item.id === runtime.id);
+        return current?.alive === true && current.status !== "starting";
+      }, "runtime to become ready while unload is pending");
+      await rm(cleanupHold, { force: true });
+
+      const response = await pending;
+      expect(response.status).toBe(503);
+      expect(await response.text()).toContain("terminal did not initialize");
+      expect(await Bun.file(cancelAttempted).exists(), JSON.stringify(await runtimeList(daemon.base))).toBe(true);
+      expect(await Bun.file(unloadResult).text()).toBe("accepted");
+      expect(await Bun.file(unloadCancelled).exists(), daemon.diagnostics() + await Bun.file(cancelAttempted).text()).toBe(true);
+      await Bun.sleep(250); // Survive the host shutdown deadline, not just its acknowledgement.
+      const remaining = await runtimeList(daemon.base);
+      expect(remaining).toHaveLength(1);
+      expect(remaining[0]).toMatchObject({ id: runtime.id, alive: true, pid: originalPid, sessionFile: runtime.sessionFile });
+      expect(remaining[0]?.status).not.toBe("starting");
+      expect(() => process.kill(originalPid, 0)).not.toThrow();
+    } finally {
+      await rm(cleanupHold, { force: true });
+      await rm(gatePath, { force: true });
+      await daemon.stop();
+      await pending?.catch(() => undefined);
+      await rm(gateDir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test.skipIf(process.platform === "win32")("startup failure responds before a blocked ledger read completes", async () => {
+    const daemon = await startTestDaemon({ env: { OMP_DESKTOP_TEST_STARTUP_MODE: "no-frame" } });
+    let pending: Promise<Response> | undefined;
+    let writer: Awaited<ReturnType<typeof open>> | undefined;
+    try {
+      pending = fetch(`${daemon.base}/api/sessions/request`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: "unsubmitted startup with delayed ledger" }),
+      }).catch(() => new Response("daemon stopped", { status: 599 }));
+      let runtime: RuntimeInfo | undefined;
+      await waitFor(async () => {
+        runtime = (await runtimeList(daemon.base)).find(item => item.status === "starting");
+        return runtime?.alive === true && typeof runtime.sessionFile === "string";
+      }, "unready runtime and transcript");
+      if (!runtime?.sessionFile) throw new Error("runtime transcript missing");
+      const ledgerPath = join(daemon.root, "state", "sessions.json");
+      await waitFor(async () => {
+        const value: unknown = await Bun.file(ledgerPath).json().catch(() => null);
+        return isRecord(value) && Array.isArray(value.sessions) &&
+          value.sessions.some(entry => isRecord(entry) && entry.sessionFile === runtime!.sessionFile);
+      }, "runtime to be recorded in the ledger");
+      await rm(ledgerPath, { force: true });
+      const mkfifo = Bun.spawn(["mkfifo", ledgerPath], { stdin: "ignore", stdout: "ignore", stderr: "pipe" });
+      const fifoExit = await mkfifo.exited;
+      if (fifoExit !== 0) throw new Error(`mkfifo failed with ${fifoExit}`);
+      const opened = open(ledgerPath, "w").then(handle => { writer = handle; return true; });
+      const writerReady = await Promise.race([opened, Bun.sleep(30_000).then(() => false)]);
+      expect(writerReady, "ledger cleanup should open the FIFO").toBe(true);
+
+      const result = await Promise.race([
+        pending.then(async response => ({ kind: "response" as const, status: response.status, body: await response.text() })),
+        Bun.sleep(3_000).then(() => ({ kind: "timeout" as const })),
+      ]);
+      expect(result.kind, "request should not wait for ledger I/O").toBe("response");
+      if (result.kind === "response") {
+        expect(result.status).toBe(503);
+        expect(result.body).toContain("terminal did not initialize");
+      }
+      // The response released the fence while reconciliation is still blocked.
+      // A new owner of this transcript must survive the delayed snapshot write.
+      const resumed = await createRuntime(daemon.base, { resume: runtime.sessionFile });
+      expect(resumed.alive).toBe(true);
+      await writer!.writeFile(JSON.stringify({ version: 1, sessions: [] }));
+      await writer!.close();
+      writer = undefined;
+      await Bun.sleep(250);
+      const reconciled: unknown = await Bun.file(ledgerPath).json();
+      expect(isRecord(reconciled) && Array.isArray(reconciled.sessions) &&
+        reconciled.sessions.some(entry => isRecord(entry) && entry.sessionFile === runtime!.sessionFile)).toBe(true);
+    } finally {
+      if (writer) {
+        await writer.writeFile(JSON.stringify({ version: 1, savedAt: new Date().toISOString(), sessions: [] }));
+        await writer.close();
+      }
+      await daemon.stop();
+      await pending?.catch(() => undefined);
+    }
+  }, 60_000);
+
+  test("ambiguous startup cleanup retains its session fence when the manager removes the runtime", async () => {
+    const gateDir = await mkdtemp(join(tmpdir(), "omp-startup-cleanup-stop-race-"));
+    const gatePath = join(gateDir, "hold-first-frame");
+    const cleanupHold = `${gatePath}.hold-unload`;
+    const sigtermMarker = `${gatePath}.sigterm`;
+    await writeFile(gatePath, "held");
+    await writeFile(cleanupHold, "held");
+    const daemon = await startTestDaemon({ env: {
+      OMP_DESKTOP_TEST_STARTUP_MODE: "no-frame",
+      OMP_DESKTOP_TEST_STARTUP_GATE: gatePath,
+      OMP_DESKTOP_TEST_CLEANUP_STATUS_UNAVAILABLE: "1",
+      OMP_DESKTOP_TEST_CLEANUP_HOLD_UNLOAD: cleanupHold,
+      OMP_DESKTOP_TEST_IGNORE_SIGTERM: "1",
+      OMP_DESKTOP_TEST_SIGTERM_MARKER: sigtermMarker,
+    } });
+    let pending: Promise<Response> | undefined;
+    let stopping: Promise<Response> | undefined;
+    try {
+      pending = fetch(`${daemon.base}/api/sessions/request`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: "unsubmitted stop-race startup" }),
+      }).catch(() => new Response("daemon stopped", { status: 599 }));
+      let starting: RuntimeInfo | undefined;
+      await waitFor(async () => {
+        starting = (await runtimeList(daemon.base)).find(runtime => runtime.status === "starting");
+        return starting?.alive === true && typeof starting.sessionFile === "string" &&
+          await Bun.file(`${gatePath}.online`).exists();
+      }, "unready runtime and cleanup fixture");
+      const runtime = starting;
+      if (!runtime?.sessionFile || runtime.pid === null) throw new Error("unready runtime identity missing");
+      const sessionFile = runtime.sessionFile;
+      const oldPid = runtime.pid;
+      await waitFor(() => Bun.file(`${gatePath}.unload-attempted`).exists(), "cleanup unload request");
+      const resuming = createRuntime(daemon.base, { resume: sessionFile });
+
+      stopping = fetch(`${daemon.base}/api/runtimes/${runtime.id}`, { method: "DELETE" });
+      await waitFor(() => Bun.file(sigtermMarker).exists(), "manager stop to signal the still-running PTY");
+      expect(() => process.kill(oldPid, 0)).not.toThrow();
+
+      await rm(cleanupHold, { force: true });
+      const [startupResponse, resumed] = await Promise.all([pending, resuming]);
+      expect(startupResponse.status).toBe(503);
+      expect((await startupResponse.text())).toContain("terminal did not initialize");
+
+      expect(resumed.sessionFile).toBe(sessionFile);
+      expect(resumed.pid).not.toBeNull();
+      expect(resumed.pid).not.toBe(oldPid);
+      expect(() => process.kill(oldPid, 0)).toThrow();
+      expect((await stopping).status).toBe(200);
+    } finally {
+      await rm(cleanupHold, { force: true });
+      await daemon.stop();
+      await stopping?.catch(() => undefined);
+      await pending?.catch(() => undefined);
+      await rm(gateDir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("startup cleanup retains its fence if the manager removes the runtime during precheck", async () => {
+    const gateDir = await mkdtemp(join(tmpdir(), "omp-startup-precheck-stop-race-"));
+    const gatePath = join(gateDir, "hold-first-frame");
+    const precheckHold = `${gatePath}.hold-precheck`;
+    const precheckMarker = `${gatePath}.precheck-attempted`;
+    const sigtermMarker = `${gatePath}.sigterm`;
+    const pidMarker = `${gatePath}.fake-pid`;
+    await writeFile(gatePath, "held");
+    await writeFile(precheckHold, "held");
+    const daemon = await startTestDaemon({ env: {
+      OMP_DESKTOP_TEST_STARTUP_MODE: "no-frame",
+      OMP_DESKTOP_TEST_STARTUP_GATE: gatePath,
+      OMP_DESKTOP_TEST_START_UNLOADING: "1",
+      OMP_DESKTOP_TEST_CLEANUP_PRECHECK_HOLD: precheckHold,
+      OMP_DESKTOP_TEST_CLEANUP_PRECHECK_MARKER: precheckMarker,
+      OMP_DESKTOP_TEST_IGNORE_SIGTERM: "1",
+      OMP_DESKTOP_TEST_SIGTERM_MARKER: sigtermMarker,
+      OMP_DESKTOP_TEST_PID_MARKER: pidMarker,
+    } });
+    let pending: Promise<Response> | undefined;
+    let stopping: Promise<Response> | undefined;
+    try {
+      pending = fetch(`${daemon.base}/api/sessions/request`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: "unsubmitted precheck stop-race startup" }),
+      }).catch(() => new Response("daemon stopped", { status: 599 }));
+      let starting: RuntimeInfo | undefined;
+      await waitFor(async () => {
+        starting = (await runtimeList(daemon.base)).find(runtime => runtime.status === "starting");
+        return starting?.alive === true && typeof starting.sessionFile === "string" &&
+          await Bun.file(`${gatePath}.online`).exists();
+      }, "unready runtime and cleanup precheck fixture");
+      const runtime = starting;
+      if (!runtime?.sessionFile || runtime.pid === null) throw new Error("unready runtime identity missing");
+      const sessionFile = runtime.sessionFile;
+      const oldPid = runtime.pid;
+      const oldFakePid = Number(await readFile(pidMarker, "utf8"));
+      expect(Number.isSafeInteger(oldFakePid)).toBe(true);
+      await waitFor(() => Bun.file(precheckMarker).exists(), "cleanup precheck status request");
+      const resuming = createRuntime(daemon.base, { resume: sessionFile });
+
+      stopping = fetch(`${daemon.base}/api/runtimes/${runtime.id}`, { method: "DELETE" });
+      await waitFor(() => Bun.file(sigtermMarker).exists(), "manager stop to signal the still-running PTY");
+      expect(() => process.kill(oldPid, 0)).not.toThrow();
+      expect(() => process.kill(oldFakePid, 0)).not.toThrow();
+
+      await rm(precheckHold, { force: true });
+      const [startupResponse, resumed] = await Promise.all([pending, resuming]);
+      expect(startupResponse.status).toBe(503);
+      expect(resumed.sessionFile).toBe(sessionFile);
+      expect(resumed.pid).not.toBeNull();
+      expect(resumed.pid).not.toBe(oldPid);
+      expect(() => process.kill(oldPid, 0)).toThrow();
+      expect(() => process.kill(oldFakePid, 0)).toThrow();
+      expect((await stopping).status).toBe(200);
+    } finally {
+      await rm(precheckHold, { force: true });
+      await daemon.stop();
+      await stopping?.catch(() => undefined);
+      await pending?.catch(() => undefined);
+      await rm(gateDir, { recursive: true, force: true });
+    }
+  }, 45_000);
+
+  test("startup timeout leaves resumed sessions running", async () => {
+    const daemon = await startTestDaemon({ env: { OMP_DESKTOP_TEST_STARTUP_MODE: "no-frame" } });
+    const path = await writeTestTranscript(daemon.root, "resumed-startup-timeout");
+    const marker = `unsubmitted-resume-${crypto.randomUUID()}`;
+    try {
+      const pending = fetch(`${daemon.base}/api/sessions/request`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ path, text: marker }),
+      });
+      await waitFor(async () => (await runtimeList(daemon.base)).some(runtime =>
+        runtime.alive && runtime.status === "starting" && runtime.sessionFile === path),
+      "resumed runtime to enter startup");
+      const response = await pending;
+      expect(response.status).toBe(503);
+      const remaining = await runtimeList(daemon.base);
+      expect(remaining).toHaveLength(1);
+      expect(remaining[0]).toMatchObject({ alive: true, status: "starting", sessionFile: path });
+      expect(await Bun.file(path).text()).not.toContain(marker);
+    } finally {
+      await daemon.stop();
+    }
+  }, 60_000);
+
   test("the deterministic fake OMP exits with its requested status through a real PTY", async () => {
     const daemon = await startTestDaemon();
     let ws: WebSocket | null = null;
@@ -528,7 +1084,13 @@ describe("real daemon API behavior", () => {
       ws.onopen = () => opened.resolve();
       ws.onerror = () => opened.reject(new Error("fake OMP exit-status WebSocket failed"));
       await opened.promise;
-      await waitFor(() => messages.some((message) => message?.type === "hello"), "the PTY attachment hello");
+      await waitFor(
+        () => messages.some(message =>
+          message?.type === "ready" ||
+          message?.type === "hello" && message.runtime.status !== "starting",
+        ),
+        "the initial parsed frame",
+      );
       expect((await inputRequest(daemon.base, runtime.id, JSON.stringify({ data: "exit 7\n" }))).status).toBe(200);
       await waitFor(
         () => messages.some((message) => message?.type === "exit" && message.exitCode === 7),

@@ -30,7 +30,7 @@ import {
   runtimeForSession,
   type PaneBinding,
 } from "./lifecycle";
-import { parsePasteResponse, parseRuntimesResponse, parseRuntimeOne, parseServerMessage, parseSessionList, parseStateResponse, type RuntimeInfo, type ServerMessage, type SessionSummaryLike } from "./protocol";
+import { isTerminalReply, parsePasteResponse, parseRuntimesResponse, parseRuntimeOne, parseServerMessage, parseSessionList, parseStateResponse, type RuntimeInfo, type ServerMessage, type SessionSummaryLike } from "./protocol";
 
 // Sidebar preferences share the durable-save path with panes, pins and font size.
 onSidebarStateChange((persist) => {
@@ -737,7 +737,12 @@ class Pane {
   #orphanText: HTMLElement;
   #starting: HTMLElement;
   #startupTimer: number | undefined;
-  #startupFrame = false;
+  #serverReady = false;
+  #replayComplete = false;
+  #writeFencePending = false;
+  #rendererReady = false;
+  #startupDiagnostic = false;
+  #failedStartupRuntimeId: string | null = null;
   #placeholderKey = "";
   #jumpLatest: HTMLButtonElement;
   #titleEl: HTMLInputElement;
@@ -969,16 +974,11 @@ class Pane {
       }
     }
     loadImageAddon(this.term);
-    // OMP clears the screen before replacing its startup protocol with the TUI.
-    this.term.parser.registerCsiHandler({ final: "J" }, (params) => {
-      if (!this.#replaying && params[0] === 2) this.#startupFrame = true;
-      return false;
-    });
-    this.term.onWriteParsed(() => {
-      if (this.#startupFrame && !this.#replaying) this.#finishStartup();
-    });
     this.term.loadAddon(new WebLinksAddon(openTerminalLink));
-    this.term.onData((data) => this.#sendInput(data));
+    this.term.onData((data) => {
+      if (isTerminalReply(data)) this.#sendTerminalReply(data);
+      else this.#sendInput(data);
+    });
     this.term.onSelectionChange(() => { this.#selectionRevision++; });
     this.term.onScroll(() => this.#syncJumpLatest());
     this.term.onWriteParsed(() => this.#syncJumpLatest());
@@ -1018,9 +1018,33 @@ class Pane {
 
     wireSessionDrag(header, { kind: "pane", paneId: this.id });
     this.#wireDrop();
+    const dropStatus = document.createElement("span");
+    dropStatus.className = "cold-composer-status";
+    dropStatus.setAttribute("role", "status");
+    dropStatus.hidden = true;
+    // Keep feedback outside the body's startup cover and the pinned save banner.
+    this.el.append(dropStatus);
+    const warnRejectedDrop = () => {
+      dropStatus.textContent = "Files were not inserted. Drop them again after the terminal is ready.";
+      dropStatus.hidden = false;
+      setStatus(dropStatus.textContent, "warn");
+    };
     this.#disposeFileDrop = wireFileDrop(this.el, {
-      onPaths: (paths) => insertFilePaths((data, files) => this.#sendOrStageInput(data, files), paths, !this.binding.runtimeId),
-      upload: uploadPaste,
+      onPaths: (paths) => {
+        if (!insertFilePaths((data, files) => this.#sendOrStageInput(data, files), paths, !this.binding.runtimeId)) {
+          warnRejectedDrop();
+        } else {
+          dropStatus.textContent = "";
+          dropStatus.hidden = true;
+        }
+      },
+      upload: (file) => {
+        if (this.binding.runtimeId && !this.#inputReady) {
+          warnRejectedDrop();
+          return Promise.resolve(null);
+        }
+        return uploadPaste(file);
+      },
     });
     // xterm stops paste propagation at its textarea. Capture image files before
     // that text-only handler can consume the event or emit an empty paste.
@@ -1069,6 +1093,15 @@ class Pane {
       : "Type a message · Enter to start · Shift+Enter for newline";
     this.#draftInput.disabled = this.#submitting;
   }
+  get #inputReady(): boolean {
+    return Boolean(
+      this.binding.runtimeId &&
+      this.ws?.readyState === WebSocket.OPEN &&
+      this.#rendererReady &&
+      !this.#replaying
+    );
+  }
+
 
   #sendOrStageInput(data: string, files?: readonly FileReference[]): boolean {
     if (this.binding.runtimeId) return this.#sendInput(data);
@@ -1101,7 +1134,7 @@ class Pane {
 
   #sendInput(data: string): boolean {
     const socket = this.ws;
-    if (socket?.readyState !== WebSocket.OPEN || !this.binding.runtimeId) return false;
+    if (!this.#inputReady || socket?.readyState !== WebSocket.OPEN) return false;
     try {
       for (const chunk of splitInputChunks(data)) {
         const id = `i${++this.#inputSequence}`;
@@ -1113,6 +1146,18 @@ class Pane {
       return false;
     }
   }
+
+  #sendTerminalReply(data: string): boolean {
+    const socket = this.ws;
+    if (!this.binding.runtimeId || socket?.readyState !== WebSocket.OPEN || !isTerminalReply(data)) return false;
+    try {
+      socket.send(JSON.stringify({ type: "terminalReply", data }));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
 
   #preservePendingInput(sessionFile: string | null): void {
     if (!sessionFile) return;
@@ -1166,6 +1211,7 @@ class Pane {
     }
   }
 
+
   async #submitColdDraft(): Promise<void> {
     const path = this.binding.sessionFile;
     const cwd = path ? sessionSummary(path)?.cwd ?? this.binding.cwd : this.binding.cwd;
@@ -1185,8 +1231,9 @@ class Pane {
       !this.binding.runtimeId && daemonId === generation;
     this.#submissions.set(identity, submission);
     if (this.#historyLoading) this.#cancelColdHistory();
-    this.#composerStatus.textContent = "Sending request…";
+    this.#composerStatus.textContent = "Starting session…";
     this.#updateComposer();
+    this.renderPlaceholder();
     try {
       const res = await fetch("/api/sessions/request", {
         method: "POST",
@@ -1203,16 +1250,16 @@ class Pane {
       if (!res.ok) {
         const message = (await res.text().catch(() => "")).trim() ||
           `The session request failed (HTTP ${res.status}).`;
-        if (isCurrent()) this.#composerStatus.textContent = message;
+        if (isCurrent()) this.#composerStatus.textContent = `${message} Your draft is preserved; submit again to retry.`;
         return;
       }
       const runtime = parseRuntimeOne(await res.json().catch(() => null));
       if (!runtime) {
-        if (isCurrent()) this.#composerStatus.textContent = "The daemon returned an invalid session response.";
+        if (isCurrent()) this.#composerStatus.textContent = "The daemon returned an invalid session response. Your draft is preserved; submit again to retry.";
         return;
       }
       if (path && runtime.sessionFile && runtime.sessionFile !== path) {
-        if (isCurrent()) this.#composerStatus.textContent = "The daemon attached a different saved session.";
+        if (isCurrent()) this.#composerStatus.textContent = "The daemon attached a different saved session. Your draft is preserved; review it before retrying.";
         return;
       }
       if (this.binding.drafts?.[identity] === text) this.#storeDraft(identity, "");
@@ -1225,13 +1272,12 @@ class Pane {
       }
       if (!current) return;
       if (path) runtime.sessionFile = path;
-      this.#composerStatus.textContent = "";
       const next = bindingForRuntime(runtime, binding.title ?? displayTitle(runtime));
       next.cwd = runtime.cwd || cwd;
       next.drafts = this.binding.drafts;
       this.bind(next);
     } catch {
-      if (isCurrent()) this.#composerStatus.textContent = "The daemon could not be reached; your draft is still here.";
+      if (isCurrent()) this.#composerStatus.textContent = "The daemon could not be reached; your draft is preserved. Submit again to retry.";
     } finally {
       if (this.#submissions.get(identity) === submission) this.#submissions.delete(identity);
       this.#updateComposer();
@@ -1367,6 +1413,11 @@ class Pane {
   /** Clipboard images: the browser holds the bytes, omp reads text, so the daemon
    *  stores the file and the pane types its path — what image-paste terminals do. */
   async #handlePaste(event: ClipboardEvent): Promise<void> {
+    if (this.binding.runtimeId && !this.#inputReady) {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
     const item = Array.from(event.clipboardData?.items ?? []).find(
       (entry) => entry.kind === "file" && entry.type.startsWith("image/"),
     );
@@ -1446,7 +1497,7 @@ class Pane {
     }
     if (!terminal && !this.binding.runtimeId && (this.binding.sessionFile || this.binding.cwd)) {
       this.#draftInput.focus();
-    } else {
+    } else if (!this.binding.runtimeId || this.#rendererReady) {
       this.term.focus();
     }
   }
@@ -1518,6 +1569,7 @@ class Pane {
     if (runtimeChanged && previous.runtimeId) this.#preservePendingInputs();
     if (mergePreviousRecovery) binding = rebindPaneBinding(previous, binding);
     if (runtimeChanged || !binding.runtimeId) this.detach();
+    if (identityChanged || binding.runtimeId) this.#failedStartupRuntimeId = null;
     if (identityChanged || (binding.runtimeId && !previous.runtimeId)) this.#cancelColdHistory();
     this.binding = binding;
     if (identityChanged || runtimeChanged) this.#draftInput.value = this.#draftFor(binding.sessionFile);
@@ -1531,17 +1583,69 @@ class Pane {
     renderSidebar();
   }
 
-  #finishStartup(): void {
-    const wasStarting = !this.#starting.hidden;
+  #lockStartup(): void {
+    const alreadyStarting = !this.#starting.hidden;
+    this.#serverReady = false;
+    this.#replayComplete = false;
+    this.#writeFencePending = false;
+    this.#rendererReady = false;
+    if (!alreadyStarting) {
+      this.#startupDiagnostic = false;
+      this.#starting.textContent = "Starting session…";
+    }
+    this.#starting.hidden = false;
+    this.#body.setAttribute("aria-busy", "true");
+    this.#host.inert = true;
+    if (this.#startupTimer === undefined) {
+      this.#startupTimer = window.setTimeout(() => {
+        if (this.#rendererReady || this.#starting.hidden) return;
+        this.#startupDiagnostic = true;
+        this.#starting.textContent =
+          "Still waiting for terminal initialization. Input remains disabled; wait, or stop the session to retry.";
+      }, 10_000);
+    }
+  }
+
+  #unlockStartup(): void {
     window.clearTimeout(this.#startupTimer);
     this.#startupTimer = undefined;
-    this.#startupFrame = false;
+    this.#rendererReady = true;
+    this.#startupDiagnostic = false;
     this.#starting.hidden = true;
     this.#body.removeAttribute("aria-busy");
     this.#host.inert = false;
-    if (wasStarting && this.ws?.readyState === WebSocket.OPEN && layout.focused === this.id && this.visible) {
+    if (this.ws?.readyState === WebSocket.OPEN && layout.focused === this.id && this.visible) {
       this.term.focus();
     }
+  }
+
+
+  #maybeFinishStartup(socket: WebSocket): void {
+    if (
+      this.ws !== socket || this.#rendererReady || this.#writeFencePending ||
+      !this.#serverReady || !this.#replayComplete || this.#replaying
+    ) return;
+    this.#writeFencePending = true;
+    // NUL is ignored by the terminal parser; its write callback fences all
+    // replay/live bytes already queued locally behind the server's ready event.
+    this.term.write("\x00", () => {
+      if (this.ws !== socket || !this.#serverReady || !this.#replayComplete || this.#replaying) return;
+      this.#writeFencePending = false;
+      this.#unlockStartup();
+    });
+  }
+
+  #clearStartup(): void {
+    window.clearTimeout(this.#startupTimer);
+    this.#startupTimer = undefined;
+    this.#serverReady = false;
+    this.#replayComplete = false;
+    this.#writeFencePending = false;
+    this.#rendererReady = false;
+    this.#startupDiagnostic = false;
+    this.#starting.hidden = true;
+    this.#body.removeAttribute("aria-busy");
+    this.#host.inert = false;
   }
 
   detach(): void {
@@ -1549,7 +1653,7 @@ class Pane {
     const socket = this.ws;
     this.ws = null;
     this.#replaying = false;
-    this.#finishStartup();
+    this.#clearStartup();
     socket?.close();
   }
 
@@ -1558,31 +1662,28 @@ class Pane {
     if (!runtimeId) return;
     // A pane owns one stream. Rebinding must stop its previous subscription
     // before replacing the socket that detach() knows how to close.
-    this.detach();
+    const reconnecting = !this.ws && this.retry !== Number.POSITIVE_INFINITY && !this.#starting.hidden;
+    if (this.ws || !reconnecting) this.detach();
     this.term.options.convertEol = false;
     const runtime = runtimes.find((candidate) => candidate.id === runtimeId);
     if (!runtime) {
       this.runtimeGone();
       return;
     }
-    this.retry = 0;
+    if (!reconnecting) this.retry = 0;
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const socket = new WebSocket(`${proto}://${location.host}/ws/term?runtime=${encodeURIComponent(runtimeId)}`);
     socket.binaryType = "arraybuffer";
     this.ws = socket;
     this.#replaying = true;
-    this.#starting.hidden = false;
-    this.#body.setAttribute("aria-busy", "true");
-    this.#host.inert = true;
-    // Failed/non-OMP startups must not leave diagnostic output covered forever.
-    this.#startupTimer = window.setTimeout(() => this.#finishStartup(), 10_000);
-    let starting = true;
+    this.#lockStartup();
     let replayBytes = 0;
     const finishReplay = () => {
-      if (this.ws !== socket) return;
+      if (this.ws !== socket || this.#replayComplete) return;
       this.#replaying = false;
+      this.#replayComplete = true;
       this.refreshAfterAttach();
-      if (!starting || this.#startupFrame) this.#finishStartup();
+      this.#maybeFinishStartup(socket);
     };
     socket.onopen = () => {
       if (this.ws !== socket) return;
@@ -1591,7 +1692,6 @@ class Pane {
         this.binding.sessionFile = runtime.sessionFile;
         this.#associateUnknownInputs(runtime.sessionFile);
       }
-      if (layout.focused === this.id && this.visible) this.term.focus();
       save();
     };
     socket.onmessage = (event) => {
@@ -1599,10 +1699,6 @@ class Pane {
       if (typeof event.data === "string") {
         const message = parseServerMessage(event.data);
         if (message?.type === "hello") {
-          const startedAt = message.runtime.startedAt;
-          // Established sessions need only finish replay; newly started ones
-          // may still be negotiating the terminal fallback behind the cover.
-          starting = !startedAt || Date.now() - Date.parse(startedAt) < 3000;
           // TUI replay contains absolute cursor moves and may disable wrapping.
           // Parse it at the producer's size before fitting the restored pane.
           if (this.term.cols !== message.runtime.cols || this.term.rows !== message.runtime.rows) {
@@ -1626,8 +1722,9 @@ class Pane {
     };
     socket.onclose = () => {
       if (this.ws !== socket) return;
-      this.#finishStartup();
       this.ws = null;
+      this.#replaying = true;
+      this.#lockStartup();
       if (this.retry < 5) {
         this.retry += 1;
         window.setTimeout(() => {
@@ -1651,20 +1748,44 @@ class Pane {
         this.binding.sessionFile = msg.runtime.sessionFile;
         this.#associateUnknownInputs(msg.runtime.sessionFile);
       }
+      runtimes = [...runtimes.filter((runtime) => runtime.id !== msg.runtime.id), msg.runtime];
+      this.#serverReady = msg.runtime.status !== "starting" && msg.runtime.status !== "exited";
       this.renderHeader();
       renderSidebar();
       save();
+      if (this.ws) this.#maybeFinishStartup(this.ws);
+    } else if (msg.type === "ready") {
+      if (msg.runtime.id !== this.binding.runtimeId || msg.runtime.status === "starting" || msg.runtime.status === "exited") return;
+      this.binding.title = displayTitle(msg.runtime);
+      if (msg.runtime.sessionFile) {
+        this.binding.sessionFile = msg.runtime.sessionFile;
+        this.#associateUnknownInputs(msg.runtime.sessionFile);
+      }
+      runtimes = [...runtimes.filter((runtime) => runtime.id !== msg.runtime.id), msg.runtime];
+      this.#serverReady = true;
+      this.renderHeader();
+      renderSidebar();
+      save();
+      if (this.ws) this.#maybeFinishStartup(this.ws);
     } else if (msg.type === "exit") {
-      this.#finishStartup();
       this.runtimeGone();
     }
   }
 
   runtimeGone(): void {
+    const startupFailed = !this.#rendererReady && !this.#starting.hidden;
+    const startupDiagnostic = this.#startupDiagnostic;
+    const runtimeId = this.binding.runtimeId;
+    if (startupFailed && runtimeId) this.#failedStartupRuntimeId = runtimeId;
     this.#preservePendingInputs();
     this.detach();
     this.binding.runtimeId = null;
     this.#stateEl.textContent = this.binding.sessionFile ? "saved" : "exited";
+    this.#composerStatus.textContent = startupFailed
+      ? startupDiagnostic
+        ? "Terminal initialization did not finish. Any unsubmitted draft is preserved; review it before retrying."
+        : "Session startup or reconnect failed. Any unsubmitted draft is preserved; review it before retrying."
+      : "";
     this.#draftInput.value = this.#draftFor(this.binding.sessionFile);
     this.renderHeader();
     this.renderPlaceholder();
@@ -1680,9 +1801,18 @@ class Pane {
     const current = this.binding.runtimeId
       ? runtimes.find((candidate) => candidate.id === this.binding.runtimeId) ?? null
       : null;
+    const sessionRuntime = runtimeForSession(this.binding.sessionFile, runtimes);
+    const hasColdDraft = !this.binding.runtimeId && Boolean(this.#draftFor(this.binding.sessionFile));
+    // Keep failed/unsent drafts visible even if their runtime becomes ready
+    // later. Explicit submission or sidebar selection may attach that runtime.
     const runtime = current && attachable(current)
       ? current
-      : runtimeForSession(this.binding.sessionFile, runtimes);
+      : sessionRuntime && !(
+          (sessionRuntime.id === this.#failedStartupRuntimeId && sessionRuntime.status === "starting") ||
+          hasColdDraft
+        )
+        ? sessionRuntime
+        : null;
     if (!runtime) {
       if (this.binding.runtimeId) this.runtimeGone();
       else this.renderPlaceholder();
@@ -1738,7 +1868,10 @@ class Pane {
     this.#titleEl.style.width = `${Math.max(2, this.#titleEl.value.length + 2)}ch`;
     this.#titleEl.disabled = !sessionFile;
     this.#titleEl.title = sessionFile ? "Click to edit title · Enter to save · Click away to cancel" : "Waiting for session file";
-    if (this.binding.runtimeId && this.#stateEl.textContent !== "") this.#stateEl.textContent = "";
+    const runtime = this.binding.runtimeId
+      ? runtimes.find((candidate) => candidate.id === this.binding.runtimeId)
+      : null;
+    this.#stateEl.textContent = runtime?.status === "starting" ? "Starting" : "";
   }
 
   renderPlaceholder(): void {
@@ -1753,6 +1886,7 @@ class Pane {
     const hostDisplay = bound || cold ? "" : "none";
     if (this.#host.style.display !== hostDisplay) this.#host.style.display = hostDisplay;
     this.#updateComposer();
+    if (!bound && this.#submitting) this.#stateEl.textContent = "Starting";
     if (coldSaved) {
       if (this.visible && !this.#replaying) this.#fitGrid();
       this.#ensureColdHistory();
@@ -1768,12 +1902,12 @@ class Pane {
     }
     if (coldNew) {
       this.#placeholderKey = "new-session";
-      this.#stateEl.textContent = "draft";
+      this.#stateEl.textContent = this.#submitting ? "Starting" : "draft";
       return;
     }
     if (historyReady) {
       this.#placeholderKey = "history-ready";
-      this.#stateEl.textContent = "saved";
+      this.#stateEl.textContent = this.#submitting ? "Starting" : "saved";
       return;
     }
     const title = this.binding.title;
@@ -2538,6 +2672,7 @@ function updateRuntimeSidebarRow(
   const workspace = normalizeDirectoryPath(cwd) ?? cwd;
   if (record.element.dataset.cwd !== workspace) record.element.dataset.cwd = workspace;
   const state = !daemonUp ? "Connection unavailable" : !attachable(runtime) ? "Saved · loads on request"
+    : runtime.status === "starting" ? "Starting"
     : runtime.presentation?.agentActive ? "Working" : runtime.alive ? "Running" : "Starting";
   record.element.dataset.state = state;
   const rowTitle = `${title}\n${state}\n${cwd}\n${runtime.sessionFile ?? "(session file not known yet)"}`;
@@ -2547,7 +2682,7 @@ function updateRuntimeSidebarRow(
     record.element.style.setProperty("--row-accent", accent);
   }
   const presentation = runtime.presentation;
-  const indicator = daemonUp && runtime.alive && presentation
+  const indicator = daemonUp && runtime.status !== "starting" && runtime.alive && presentation
     ? presentation.agentActive
       ? "working"
       : presentation.completion &&

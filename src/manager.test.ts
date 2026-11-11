@@ -22,14 +22,14 @@ const waitingOmp = join(dir, "fake-omp");
 const sniffingOmp = join(dir, "fake-omp-sniff");
 const announced = join(dir, "sessions", "-tmp-fixture", "2026-10-05T00-00-00-000Z_01a10000-0000-7000-8000-00000000ab01.jsonl");
 
-writeFileSync(waitingOmp, "#!/bin/sh\nprintf 'fake-omp-ready\\n'\nread line\nexit 0\n");
+writeFileSync(waitingOmp, "#!/bin/sh\nprintf '\\033[2Jfake-omp-ready\\n'\nread line\nexit 0\n");
 const exitingOmp = join(dir, "fake-omp-exit");
 writeFileSync(exitingOmp, "#!/bin/sh\nprintf 'final-output\\n'\nexit 7\n");
 chmodSync(exitingOmp, 0o755);
 chmodSync(waitingOmp, 0o755);
 writeFileSync(
   sniffingOmp,
-  `#!/bin/sh\nprintf '\\033]1337;SetUserVar=omp_session_file=${Buffer.from(announced).toString("base64")}\\007'\nread line\nexit 0\n`,
+  `#!/bin/sh\nprintf '\\033]1337;SetUserVar=omp_session_file=${Buffer.from(announced).toString("base64")}\\007\\033[2J'\nread line\nexit 0\n`,
 );
 chmodSync(sniffingOmp, 0o755);
 

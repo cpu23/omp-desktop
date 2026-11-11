@@ -271,12 +271,13 @@ export class IdleActivityState {
     return true;
   }
 
-  cancelPendingUnload(): void {
-    if (this.#phase !== "unload-pending") return;
+  cancelPendingUnload(sessionFile: string): boolean {
+    if (this.#phase !== "unload-pending" || this.#pendingUnload?.sessionFile !== sessionFile) return false;
     this.#phase = "open";
     this.#pendingUnload = null;
     this.#idleSince = null;
     this.#bump();
+    return true;
   }
 
   #observe(observation: IdleHostObservation, now: number): Set<string> {

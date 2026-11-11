@@ -3,6 +3,7 @@ import { chmod, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
+import { createServer } from "node:net";
 import { IdleRuntimeClient } from "./idle-ipc";
 
 const roots: string[] = [];
@@ -23,6 +24,33 @@ const statusBody = {
 };
 
 describe("desktop idle IPC client", () => {
+  test("delivers a complete acknowledgement while the host keeps the connection open", async () => {
+    const root = await mkdtemp(join(tmpdir(), "omp-idle-response-"));
+    roots.push(root);
+    const socketPath = join(root, "rt-response.sock");
+    const body = JSON.stringify({ kind: "accepted" });
+    const server = createServer(socket => {
+      socket.once("data", () => {
+        socket.write(`HTTP/1.1 202 Accepted\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n`);
+        socket.write(body.slice(0, 5));
+        setTimeout(() => socket.write(body.slice(5)), 10);
+        // EOF deliberately depends on the client consuming the acknowledgement.
+      });
+    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(socketPath, resolve);
+      });
+      await chmod(socketPath, 0o600);
+      const client = new IdleRuntimeClient({ dir: root, token: "test-token", timeoutMs: 500 });
+      expect(await client.unload("rt-response", { sessionFile: statusBody.sessionFile, idleTimeoutMs: 1 }))
+        .toEqual({ kind: "accepted" });
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
+
   test("authenticates, parses typed status, queues large follow-up prompts, and reports conflicts", async () => {
     const root = await mkdtemp(join(tmpdir(), "omp-desktop-idle-ipc-"));
     roots.push(root);
