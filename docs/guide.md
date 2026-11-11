@@ -81,8 +81,8 @@ a sidebar session onto another space's tab to move/open it there. Right-click a 
 the top-right split button: 1×1 becomes side-by-side, then 2×2. The button previews the next layout and disables at
 four panes. Panes meet at a single 1px separator with no gutter or duplicate borders;
 drag on or just beside the separator to resize. In a 2×2 grid, closing one pane leaves an empty
-slot; closing another occupied pane collapses the grid. New panes prepare local drafts; clicking a sidebar session
-opens it in the focused pane. Neither action starts a new agent.
+slot; closing another occupied pane collapses the grid. New-session controls and newly split panes
+start regular live OMP terminals immediately, without a first message. Clicking a saved sidebar session opens its read-only history.
 
 The sidebar's magnifying-glass button opens search over its heading row, with the search icon on the left and
 a close button on the right. Close it with **×** or **Escape** to clear the filter and restore the full list.
@@ -94,7 +94,7 @@ Output is spooled to a private temporary file before streaming to the pane, so l
 do not lose their final messages when the renderer exits. The temporary output is removed after delivery or cancellation.
 No resident agent or model request is started, and the transcript is not modified.
 Opening an unloaded session or clicking its pane focuses the draft; there is no Send button.
-Type and press **Enter** to create or resume an agent; **Shift+Enter** inserts a newline.
+Type and press **Enter** to resume a saved agent; **Shift+Enter** inserts a newline.
 Typing alone never starts an agent. History selection, scrolling and links remain usable.
 Drafts and attachment references survive navigation; unconfirmed input is retained for review, never automatically resubmitted.
 

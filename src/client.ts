@@ -3012,14 +3012,38 @@ async function killRuntime(id: string): Promise<void> {
   await refreshRuntimes();
 }
 
-function newSession(pane: Pane, focus = true, cwd = sidebarActiveWorkspace() ?? defaultCwd): void {
-  pane.bind({
-    runtimeId: null,
-    title: null,
-    sessionFile: null,
-    ...(cwd ? { cwd } : {}),
-  });
-  if (focus) pane.focus();
+const startingSessions = new WeakSet<Pane>();
+
+async function newSession(pane: Pane, focus = true, cwd = sidebarActiveWorkspace() ?? defaultCwd): Promise<void> {
+  if (startingSessions.has(pane)) return;
+  startingSessions.add(pane);
+  const previous = pane.binding;
+  const generation = daemonId;
+  setStatus("Starting session…", "idle");
+  try {
+    const response = await fetch("/api/runtimes", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ cwd, cols: pane.term.cols, rows: pane.term.rows }),
+    });
+    if (!response.ok) {
+      setStatus((await response.text()).trim() || `Session startup failed (HTTP ${response.status})`, "warn");
+      return;
+    }
+    const runtime = parseRuntimeOne(await response.json());
+    if (!runtime) throw new Error("Invalid session response");
+    if (daemonId !== generation) return;
+    runtimes = [...runtimes.filter((candidate) => candidate.id !== runtime.id), runtime];
+    renderSidebar();
+    // Navigation during startup must not replace the newly selected conversation.
+    if (panes.get(pane.id) !== pane || pane.binding !== previous) return;
+    pane.bind(bindingForRuntime(runtime, displayTitle(runtime)));
+    if (focus) pane.focus();
+  } catch {
+    setStatus("Session startup could not be confirmed; check the sidebar before trying again", "warn");
+  } finally {
+    startingSessions.delete(pane);
+  }
 }
 
 /** Bind a saved session read-only unless an attachable runtime already owns it. */
