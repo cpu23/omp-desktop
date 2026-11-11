@@ -1250,12 +1250,12 @@ class Pane {
       if (!res.ok) {
         const message = (await res.text().catch(() => "")).trim() ||
           `The session request failed (HTTP ${res.status}).`;
-        if (isCurrent()) this.#composerStatus.textContent = `${message} Your draft is preserved; submit again to retry.`;
+        if (isCurrent()) this.#composerStatus.textContent = `${message} Your draft is preserved. Check the session before submitting again.`;
         return;
       }
       const runtime = parseRuntimeOne(await res.json().catch(() => null));
       if (!runtime) {
-        if (isCurrent()) this.#composerStatus.textContent = "The daemon returned an invalid session response. Your draft is preserved; submit again to retry.";
+        if (isCurrent()) this.#composerStatus.textContent = "The daemon returned an invalid session response. Your draft is preserved. Check the session before submitting again.";
         return;
       }
       if (path && runtime.sessionFile && runtime.sessionFile !== path) {
@@ -1277,7 +1277,7 @@ class Pane {
       next.drafts = this.binding.drafts;
       this.bind(next);
     } catch {
-      if (isCurrent()) this.#composerStatus.textContent = "The daemon could not be reached; your draft is preserved. Submit again to retry.";
+      if (isCurrent()) this.#composerStatus.textContent = "The request could not be confirmed; your draft is preserved. Check the session before submitting again.";
     } finally {
       if (this.#submissions.get(identity) === submission) this.#submissions.delete(identity);
       this.#updateComposer();
@@ -1609,6 +1609,8 @@ class Pane {
   #unlockStartup(): void {
     window.clearTimeout(this.#startupTimer);
     this.#startupTimer = undefined;
+    // Bound consecutive failed attempts, not a healthy session's lifetime.
+    this.retry = 0;
     this.#rendererReady = true;
     this.#startupDiagnostic = false;
     this.#starting.hidden = true;
