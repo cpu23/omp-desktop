@@ -160,6 +160,13 @@ jobs:
           OMP_DESKTOP_NATIVE_SCREENSHOT: ${{ runner.temp }}/native-smoke.png
         run: xvfb-run -a dbus-run-session -- bun run smoke:native -- --images
 
+      - name: Upload verified Linux shell
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-linux-x86_64
+          path: src-tauri/target/release/omp-desktop
+          if-no-files-found: error
+
       - name: Upload native shell screenshot
         if: always()
         uses: actions/upload-artifact@v4
