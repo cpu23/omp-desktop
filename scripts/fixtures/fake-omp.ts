@@ -81,6 +81,13 @@ function announceSessionFile(): void {
 }
 if (process.env.OMP_DESKTOP_TEST_DEFER_SESSION_FILE !== "1") announceSessionFile();
 const startupGate = process.env.OMP_DESKTOP_TEST_STARTUP_GATE;
+const cleanupHold = process.env.OMP_DESKTOP_TEST_CLEANUP_HOLD_UNLOAD;
+if (process.env.OMP_DESKTOP_TEST_IGNORE_SIGTERM === "1") {
+  process.on("SIGTERM", () => {
+    const marker = process.env.OMP_DESKTOP_TEST_SIGTERM_MARKER;
+    if (marker) writeFileSync(marker, "received");
+  });
+}
 // OMP reads terminal negotiation replies in raw mode during startup.
 if (startupGate) process.stdin.setRawMode?.(true);
 
@@ -144,6 +151,7 @@ if (idleDir && idleToken) {
       if (request.method === "POST" && path === "/unload") {
         if (process.env.OMP_DESKTOP_TEST_CLEANUP_STATUS_UNAVAILABLE === "1") {
           if (startupGate) writeFileSync(`${startupGate}.unload-attempted`, "attempted");
+          while (cleanupHold && existsSync(cleanupHold)) await Bun.sleep(10);
           idleStatusUnavailable = true;
           return Response.json({ kind: "unavailable", reason: "fixture unload acknowledgement lost" }, { status: 503 });
         }

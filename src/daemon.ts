@@ -343,10 +343,10 @@ async function retireUnadmittedFreshRuntime(runtime: Runtime): Promise<void> {
     settled.resolve();
   };
   const keepFenceUntilExit = (): void => {
-    if (!runtime.alive || manager.get(runtime.id) !== runtime) return;
+    if (!runtime.alive) return;
     retainFenceUntilExit = true;
     unsubscribeExit = runtime.subscribeExit(releaseAttempt);
-    if (!runtime.alive || manager.get(runtime.id) !== runtime) releaseAttempt();
+    if (!runtime.alive) releaseAttempt();
   };
   try {
     const before = await idleClient.status(runtime.id);
@@ -398,7 +398,7 @@ async function retireUnadmittedFreshRuntime(runtime: Runtime): Promise<void> {
     if (unloadAttempted) keepFenceUntilExit();
     console.warn(`omp-desktopd: unadmitted startup cleanup unavailable: ${String(error)}`);
   } finally {
-    const retainFence = retainFenceUntilExit && runtime.alive && manager.get(runtime.id) === runtime;
+    const retainFence = retainFenceUntilExit && runtime.alive;
     if (!retainFence && !shuttingDown && !runtime.alive && manager.get(runtime.id) !== runtime) {
       await ledgerWrite;
       const previousSessions = await ledger.read();

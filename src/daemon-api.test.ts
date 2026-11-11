@@ -780,6 +780,65 @@ describe("real daemon API behavior", () => {
     }
   }, 45_000);
 
+  test("ambiguous startup cleanup retains its session fence when the manager removes the runtime", async () => {
+    const gateDir = await mkdtemp(join(tmpdir(), "omp-startup-cleanup-stop-race-"));
+    const gatePath = join(gateDir, "hold-first-frame");
+    const cleanupHold = `${gatePath}.hold-unload`;
+    const sigtermMarker = `${gatePath}.sigterm`;
+    await writeFile(gatePath, "held");
+    await writeFile(cleanupHold, "held");
+    const daemon = await startTestDaemon({ env: {
+      OMP_DESKTOP_TEST_STARTUP_MODE: "no-frame",
+      OMP_DESKTOP_TEST_STARTUP_GATE: gatePath,
+      OMP_DESKTOP_TEST_CLEANUP_STATUS_UNAVAILABLE: "1",
+      OMP_DESKTOP_TEST_CLEANUP_HOLD_UNLOAD: cleanupHold,
+      OMP_DESKTOP_TEST_IGNORE_SIGTERM: "1",
+      OMP_DESKTOP_TEST_SIGTERM_MARKER: sigtermMarker,
+    } });
+    let pending: Promise<Response> | undefined;
+    let stopping: Promise<Response> | undefined;
+    try {
+      pending = fetch(`${daemon.base}/api/sessions/request`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: "unsubmitted stop-race startup" }),
+      }).catch(() => new Response("daemon stopped", { status: 599 }));
+      let starting: RuntimeInfo | undefined;
+      await waitFor(async () => {
+        starting = (await runtimeList(daemon.base)).find(runtime => runtime.status === "starting");
+        return starting?.alive === true && typeof starting.sessionFile === "string" &&
+          await Bun.file(`${gatePath}.online`).exists();
+      }, "unready runtime and cleanup fixture");
+      const runtime = starting;
+      if (!runtime?.sessionFile || runtime.pid === null) throw new Error("unready runtime identity missing");
+      const sessionFile = runtime.sessionFile;
+      const oldPid = runtime.pid;
+      await waitFor(() => Bun.file(`${gatePath}.unload-attempted`).exists(), "cleanup unload request");
+      const resuming = createRuntime(daemon.base, { resume: sessionFile });
+
+      stopping = fetch(`${daemon.base}/api/runtimes/${runtime.id}`, { method: "DELETE" });
+      await waitFor(() => Bun.file(sigtermMarker).exists(), "manager stop to signal the still-running PTY");
+      expect(() => process.kill(oldPid, 0)).not.toThrow();
+
+      await rm(cleanupHold, { force: true });
+      const [startupResponse, resumed] = await Promise.all([pending, resuming]);
+      expect(startupResponse.status).toBe(503);
+      expect((await startupResponse.text())).toContain("terminal did not initialize");
+
+      expect(resumed.sessionFile).toBe(sessionFile);
+      expect(resumed.pid).not.toBeNull();
+      expect(resumed.pid).not.toBe(oldPid);
+      expect(() => process.kill(oldPid, 0)).toThrow();
+      expect((await stopping).status).toBe(200);
+    } finally {
+      await rm(cleanupHold, { force: true });
+      await daemon.stop();
+      await stopping?.catch(() => undefined);
+      await pending?.catch(() => undefined);
+      await rm(gateDir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   test("startup timeout leaves resumed sessions running", async () => {
     const daemon = await startTestDaemon({ env: { OMP_DESKTOP_TEST_STARTUP_MODE: "no-frame" } });
     const path = await writeTestTranscript(daemon.root, "resumed-startup-timeout");
