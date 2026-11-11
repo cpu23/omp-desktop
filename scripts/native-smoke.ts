@@ -1117,7 +1117,7 @@ async function testFirstSessionAndPaneWorkload(
   }, "#new-session to show a cold composer");
   assert((await runtimes(base)).length === 0, "#new-session created a runtime before submission.");
   await driver.sendKeys(coldComposer, "start-native-session");
-  await driver.clickCss("#panes .pane .cold-composer button[type='submit']");
+  await driver.sendKeys(coldComposer, PRIVATE_USE_ENTER);
   const created = await driver.waitFor(async () => {
     const current = await runtimes(base);
     const added = current.filter((runtime) => !beforeSessionIds.has(runtime.id));
@@ -1178,7 +1178,7 @@ async function testFirstSessionAndPaneWorkload(
     const before = (await runtimes(base)).length;
     await driver.sendKeys(await driver.find(`${selector} textarea`), `native-split-${index + 1}`);
     assert((await runtimes(base)).length === before, "Typing a split-pane draft started an agent.");
-    await driver.clickCss(`${selector} button[type='submit']`);
+    await driver.sendKeys(await driver.find(`${selector} textarea`), PRIVATE_USE_ENTER);
     const binding = await driver.waitFor(async () =>
       (await activePaneBindings(driver, base)).find((entry) => entry.paneId === paneId) ?? false,
     `explicit submission to bind split pane ${paneId}`);
@@ -2031,7 +2031,7 @@ async function testConnectionRetry(parent: string, binary: string, busAddress: s
     }, "Retry recovery to show a cold new-session composer");
     assert((await runtimes(daemon.base)).length === 0, "Retry's new-session control created a runtime before submission.");
     await shell.driver.sendKeys(composer, "retry-session");
-    await shell.driver.clickCss("#panes .pane .cold-composer button[type='submit']");
+    await shell.driver.sendKeys(composer, PRIVATE_USE_ENTER);
     await waitFor("Retry's submitted cold draft to create a usable real daemon runtime", async () => {
       const current = await runtimes(daemon!.base);
       return current.some((runtime) => runtime.pid !== null && runtime.alive) ? true : false;
@@ -2745,7 +2745,7 @@ async function testInitialNativeInput(parent: string, binary: string, busAddress
     }, "the fresh app's cold new-session composer");
     assert((await runtimes(daemon.base)).length === 0, "New session created a runtime before explicit submission.");
     await shell.driver.sendKeys(composer, "start-native-input");
-    await shell.driver.clickCss("#panes .pane .cold-composer button[type='submit']");
+    await shell.driver.sendKeys(composer, PRIVATE_USE_ENTER);
     const runtime = await waitFor("the submitted cold composer to create one real runtime", async () => {
       const current = await runtimes(daemon!.base);
       return current.length === 1 && current[0]!.pid !== null ? current[0] : false;

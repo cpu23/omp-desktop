@@ -667,7 +667,6 @@ class Pane {
   #replaying = false;
   #composer: HTMLElement;
   #draftInput: HTMLTextAreaElement;
-  #submitButton: HTMLButtonElement;
   #composerStatus: HTMLElement;
   #historyController: AbortController | null = null;
   #historyKey = "";
@@ -775,24 +774,17 @@ class Pane {
       save();
     });
     this.#orphanReview.append(orphanHeading, this.#orphanText, discardOrphan);
-    this.#composer = document.createElement("form");
+    this.#composer = document.createElement("div");
     this.#composer.className = "cold-composer";
     this.#draftInput = document.createElement("textarea");
     this.#draftInput.rows = 2;
-    this.#draftInput.placeholder = "Write a message. Submit to load or start this session.";
+    this.#draftInput.placeholder = "Type a message · Enter to start · Shift+Enter for newline";
     this.#draftInput.setAttribute("aria-label", "Message this session");
-    this.#submitButton = document.createElement("button");
-    this.#submitButton.type = "submit";
-    this.#submitButton.textContent = "Send";
     this.#composerStatus = document.createElement("span");
     this.#composerStatus.className = "cold-composer-status";
     this.#composerStatus.setAttribute("role", "status");
     this.#composerStatus.setAttribute("aria-live", "polite");
-    this.#composer.append(this.#draftInput, this.#submitButton, this.#composerStatus);
-    this.#composer.addEventListener("submit", (event) => {
-      event.preventDefault();
-      void this.#submitColdDraft();
-    });
+    this.#composer.append(this.#draftInput, this.#composerStatus);
     this.#draftInput.value = this.#draftFor(this.binding.sessionFile);
     this.#draftInput.addEventListener("input", () => {
       this.#storeCurrentDraft(this.#draftInput.value);
@@ -802,9 +794,9 @@ class Pane {
       this.#draftSaveTimer = window.setTimeout(() => save(), 250);
     });
     this.#draftInput.addEventListener("keydown", (event) => {
-      if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+      if (event.key === "Enter" && !event.shiftKey && !event.altKey && !event.isComposing) {
         event.preventDefault();
-        void this.#submitColdDraft();
+        if (!event.repeat) void this.#submitColdDraft();
       }
     });
     this.#body.append(this.#orphanReview, this.#placeholder, this.#host, this.#composer);
@@ -846,9 +838,18 @@ class Pane {
     });
     // Let the WebView deliver clipboard data instead of sending Ctrl+V (0x16)
     // to omp, which would make the child read the OS clipboard itself.
-    this.term.attachCustomKeyEventHandler((event) =>
-      !((event.key === "v" || event.key === "V") && (event.ctrlKey || event.metaKey) && !event.altKey),
-    );
+    this.term.attachCustomKeyEventHandler((event) => {
+      if (event.ctrlKey && !event.metaKey && !event.altKey &&
+          (event.key === "c" || event.key === "C") && !this.term.hasSelection()) {
+        if (event.type === "keydown") {
+          event.preventDefault();
+          // Escape cancels work without OMP's repeated-Ctrl+C session exit.
+          if (!event.shiftKey) this.#sendInput("\x1b");
+        }
+        return false;
+      }
+      return !((event.key === "v" || event.key === "V") && (event.ctrlKey || event.metaKey) && !event.altKey);
+    });
     // xterm paints OSC 8 file targets with a dashed underline even though its
     // default link handler cannot open them. Consume those links only; preserve
     // HTTP links and explicit SGR underlining in the transcript.
@@ -918,6 +919,13 @@ class Pane {
     this.el.addEventListener("mousedown", (event) =>
       this.focus(event.target instanceof Node && this.#host.contains(event.target)),
     );
+    this.el.addEventListener("click", (event) => {
+      if (this.binding.runtimeId || event.button !== 0 || event.detail > 1 ||
+          !(event.target instanceof Element) ||
+          event.target.closest("button, a, input, textarea, select, [role=button]") ||
+          this.term.hasSelection() || window.getSelection()?.toString()) return;
+      this.focus();
+    });
     this.#observer = new ResizeObserver(() => this.#scheduleFit());
     this.#observer.observe(this.#body);
 
@@ -972,10 +980,9 @@ class Pane {
     const cold = !this.binding.runtimeId && Boolean(this.binding.sessionFile || this.binding.cwd);
     this.#composer.hidden = !cold;
     this.#draftInput.placeholder = this.binding.sessionFile
-      ? "Write a message. Submit to load this saved session."
-      : "Write a message. Submit to start this session.";
+      ? "Type a message · Enter to resume · Shift+Enter for newline"
+      : "Type a message · Enter to start · Shift+Enter for newline";
     this.#draftInput.disabled = this.#submitting;
-    this.#submitButton.disabled = this.#submitting || !this.#draftInput.value.trim();
   }
   get #inputReady(): boolean {
     return Boolean(
@@ -2178,7 +2185,7 @@ function closeSpace(id: string): void {
     activeSpaceId = remaining[Math.min(index, remaining.length - 1)];
     layout = spaces.get(activeSpaceId)!;
     renderLayout();
-    focusedPane()?.term.focus();
+    focusedPane()?.focus();
   }
   renderSpaceTabs();
   renderSidebar();
@@ -2194,7 +2201,7 @@ function switchSpace(id: string): void {
   renderLayout();
   renderSpaceTabs();
   save();
-  focusedPane()?.term.focus();
+  focusedPane()?.focus();
 }
 
 function createSpace(): void {
