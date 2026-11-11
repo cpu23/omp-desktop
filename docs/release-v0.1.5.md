@@ -23,3 +23,10 @@ bun run start
 Extract the native archive separately and run `./omp-desktop` while the daemon remains running. Use `bun run app:install` from source for application-menu integration. Do not restart a daemon with active work just to upgrade.
 
 See the [desktop guide](https://github.com/cpu23/omp-desktop/blob/v0.1.5/docs/guide.md#native-linux-app) for build dependencies and setup.
+
+## Verification
+
+- CI runs TypeScript checks, tests, isolated daemon smoke, image regressions, and Linux native GTK4/WebKitGTK 6 smoke.
+- CI also builds and tests the retained macOS and Windows shells.
+- Workspace and settings PNGs were opened and visually inspected; the workspace has no horizontal page overflow.
+- Screenshots show the shared browser client, not a native window. No live-provider inference was used.
