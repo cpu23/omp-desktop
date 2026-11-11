@@ -82,6 +82,10 @@ function announceSessionFile(): void {
 if (process.env.OMP_DESKTOP_TEST_DEFER_SESSION_FILE !== "1") announceSessionFile();
 const startupGate = process.env.OMP_DESKTOP_TEST_STARTUP_GATE;
 const cleanupHold = process.env.OMP_DESKTOP_TEST_CLEANUP_HOLD_UNLOAD;
+const cleanupPrecheckHold = process.env.OMP_DESKTOP_TEST_CLEANUP_PRECHECK_HOLD;
+const cleanupPrecheckMarker = process.env.OMP_DESKTOP_TEST_CLEANUP_PRECHECK_MARKER;
+const pidMarker = process.env.OMP_DESKTOP_TEST_PID_MARKER;
+if (pidMarker) writeFileSync(pidMarker, String(process.pid));
 if (process.env.OMP_DESKTOP_TEST_IGNORE_SIGTERM === "1") {
   process.on("SIGTERM", () => {
     const marker = process.env.OMP_DESKTOP_TEST_SIGTERM_MARKER;
@@ -92,8 +96,9 @@ if (process.env.OMP_DESKTOP_TEST_IGNORE_SIGTERM === "1") {
 if (startupGate) process.stdin.setRawMode?.(true);
 
 let idleSince = Date.now();
-let unloading = false;
+let unloading = process.env.OMP_DESKTOP_TEST_START_UNLOADING === "1";
 let idleStatusUnavailable = false;
+let idleStatusRequests = 0;
 let revision = 0;
 const idleDir = process.env.OMP_DESKTOP_IDLE_IPC_DIR;
 const idleToken = process.env.OMP_DESKTOP_IDLE_IPC_TOKEN;
@@ -108,6 +113,11 @@ if (idleDir && idleToken) {
       }
       const path = new URL(request.url).pathname;
       if (request.method === "GET" && path === "/status") {
+        idleStatusRequests += 1;
+        if (unloading && idleStatusRequests > 1 && cleanupPrecheckHold) {
+          if (cleanupPrecheckMarker) writeFileSync(cleanupPrecheckMarker, "attempted");
+          while (existsSync(cleanupPrecheckHold)) await Bun.sleep(10);
+        }
         if (idleStatusUnavailable) {
           return Response.json({ kind: "unavailable", reason: "fixture status unavailable" }, { status: 503 });
         }

@@ -839,6 +839,71 @@ describe("real daemon API behavior", () => {
     }
   }, 60_000);
 
+  test("startup cleanup retains its fence if the manager removes the runtime during precheck", async () => {
+    const gateDir = await mkdtemp(join(tmpdir(), "omp-startup-precheck-stop-race-"));
+    const gatePath = join(gateDir, "hold-first-frame");
+    const precheckHold = `${gatePath}.hold-precheck`;
+    const precheckMarker = `${gatePath}.precheck-attempted`;
+    const sigtermMarker = `${gatePath}.sigterm`;
+    const pidMarker = `${gatePath}.fake-pid`;
+    await writeFile(gatePath, "held");
+    await writeFile(precheckHold, "held");
+    const daemon = await startTestDaemon({ env: {
+      OMP_DESKTOP_TEST_STARTUP_MODE: "no-frame",
+      OMP_DESKTOP_TEST_STARTUP_GATE: gatePath,
+      OMP_DESKTOP_TEST_START_UNLOADING: "1",
+      OMP_DESKTOP_TEST_CLEANUP_PRECHECK_HOLD: precheckHold,
+      OMP_DESKTOP_TEST_CLEANUP_PRECHECK_MARKER: precheckMarker,
+      OMP_DESKTOP_TEST_IGNORE_SIGTERM: "1",
+      OMP_DESKTOP_TEST_SIGTERM_MARKER: sigtermMarker,
+      OMP_DESKTOP_TEST_PID_MARKER: pidMarker,
+    } });
+    let pending: Promise<Response> | undefined;
+    let stopping: Promise<Response> | undefined;
+    try {
+      pending = fetch(`${daemon.base}/api/sessions/request`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: "unsubmitted precheck stop-race startup" }),
+      }).catch(() => new Response("daemon stopped", { status: 599 }));
+      let starting: RuntimeInfo | undefined;
+      await waitFor(async () => {
+        starting = (await runtimeList(daemon.base)).find(runtime => runtime.status === "starting");
+        return starting?.alive === true && typeof starting.sessionFile === "string" &&
+          await Bun.file(`${gatePath}.online`).exists();
+      }, "unready runtime and cleanup precheck fixture");
+      const runtime = starting;
+      if (!runtime?.sessionFile || runtime.pid === null) throw new Error("unready runtime identity missing");
+      const sessionFile = runtime.sessionFile;
+      const oldPid = runtime.pid;
+      const oldFakePid = Number(await readFile(pidMarker, "utf8"));
+      expect(Number.isSafeInteger(oldFakePid)).toBe(true);
+      await waitFor(() => Bun.file(precheckMarker).exists(), "cleanup precheck status request");
+      const resuming = createRuntime(daemon.base, { resume: sessionFile });
+
+      stopping = fetch(`${daemon.base}/api/runtimes/${runtime.id}`, { method: "DELETE" });
+      await waitFor(() => Bun.file(sigtermMarker).exists(), "manager stop to signal the still-running PTY");
+      expect(() => process.kill(oldPid, 0)).not.toThrow();
+      expect(() => process.kill(oldFakePid, 0)).not.toThrow();
+
+      await rm(precheckHold, { force: true });
+      const [startupResponse, resumed] = await Promise.all([pending, resuming]);
+      expect(startupResponse.status).toBe(503);
+      expect(resumed.sessionFile).toBe(sessionFile);
+      expect(resumed.pid).not.toBeNull();
+      expect(resumed.pid).not.toBe(oldPid);
+      expect(() => process.kill(oldPid, 0)).toThrow();
+      expect(() => process.kill(oldFakePid, 0)).toThrow();
+      expect((await stopping).status).toBe(200);
+    } finally {
+      await rm(precheckHold, { force: true });
+      await daemon.stop();
+      await stopping?.catch(() => undefined);
+      await pending?.catch(() => undefined);
+      await rm(gateDir, { recursive: true, force: true });
+    }
+  }, 45_000);
+
   test("startup timeout leaves resumed sessions running", async () => {
     const daemon = await startTestDaemon({ env: { OMP_DESKTOP_TEST_STARTUP_MODE: "no-frame" } });
     const path = await writeTestTranscript(daemon.root, "resumed-startup-timeout");

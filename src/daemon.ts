@@ -398,6 +398,11 @@ async function retireUnadmittedFreshRuntime(runtime: Runtime): Promise<void> {
     if (unloadAttempted) keepFenceUntilExit();
     console.warn(`omp-desktopd: unadmitted startup cleanup unavailable: ${String(error)}`);
   } finally {
+    // The manager can remove an alive runtime during the precheck or a rejected
+    // unload. Keep queued resumes fenced until that runtime exits.
+    if (!retainFenceUntilExit && runtime.alive && manager.get(runtime.id) !== runtime) {
+      keepFenceUntilExit();
+    }
     const retainFence = retainFenceUntilExit && runtime.alive;
     if (!retainFence && !shuttingDown && !runtime.alive && manager.get(runtime.id) !== runtime) {
       await ledgerWrite;
