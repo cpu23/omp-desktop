@@ -1536,10 +1536,16 @@ async function testFirstSessionAndPaneWorkload(
     `return Array.from(document.querySelectorAll("#space-tabs [role='tab']"), tab => ({ id: tab.dataset.space || "", selected: tab.getAttribute("aria-selected") || "false" }));`,
   );
   assert(spaces.length === 2 && spaces[1]!.selected === "true", "The newly created space was not the displayed selection.");
-  const workspaceWithSecond = await getWorkspace(base);
+  const workspaceWithSecond = await waitFor("the selected second space to reach durable state", async () => {
+    const workspace = await getWorkspace(base);
+    return workspace.activeSpaceId === spaces[1]!.id ? workspace : false;
+  });
   assert(workspaceWithSecond.activeSpaceId === spaces[1]!.id, "Displayed space selection disagrees with the saved active-space id.");
   await driver.click(await driver.find(`#space-tabs [role='tab'][data-space="${spaces[0]!.id}"]`));
-  const workspaceBack = await getWorkspace(base);
+  const workspaceBack = await waitFor("the original space selection to reach durable state", async () => {
+    const workspace = await getWorkspace(base);
+    return workspace.activeSpaceId === spaces[0]!.id ? workspace : false;
+  });
   const selectedAfterBack = await driver.execute<string | null>(
     `return document.querySelector("#space-tabs [role='tab'][aria-selected='true']")?.dataset.space ?? null;`,
   );
