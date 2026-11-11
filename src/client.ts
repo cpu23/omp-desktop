@@ -1,6 +1,6 @@
 import { trimSelectionHighlight } from "./selection";
 import {
-  applySidebarState, readSidebarState, onSidebarStateChange, sidebarFolderView, sidebarFolderExpanded,
+  applySidebarState, onSidebarStateChange, sidebarFolderView, sidebarFolderExpanded,
   toggleSidebarFolder, sidebarWorkspaces, sidebarActiveWorkspace, selectSidebarWorkspace,
   archiveSidebarWorkspace, sidebarWorkspaceArchived, normalizeDirectoryPath, STORE_KEY as SIDEBAR_KEY,
 } from "./sidebar";
@@ -35,7 +35,12 @@ import { isTerminalReply, parsePasteResponse, parseRuntimesResponse, parseRuntim
 // Sidebar preferences share the durable-save path with panes, pins and font size.
 onSidebarStateChange((persist) => {
   renderSidebar();
-  if (persist) queueStateSave();
+  if (persist) {
+    // A successful local retry may follow a failed initial read/cache commit.
+    // Re-read the compatible baseline before this fallback cache can publish.
+    if (stateGate === "blocked" && daemonId) void reconcileWorkspaceState();
+    else queueStateSave();
+  }
 });
 
 const statusEl = document.getElementById("status") as HTMLElement;
@@ -158,6 +163,7 @@ let stateGate: "pending" | "ready" | "blocked" = "pending";
 /** Why publishing is blocked; surfaced when a save is attempted while gated. */
 let stateGateReason = "";
 let stateGateGeneration: string | null = null;
+let stateRestoreAttempt = 0;
 
 function savePins(): void {
   try {
@@ -3220,19 +3226,24 @@ function mergePins(local: SessionSummaryLike[], remote: SessionSummaryLike[]): S
  */
 async function reconcileWorkspaceState(): Promise<void> {
   const generation = daemonId;
+  const attempt = ++stateRestoreAttempt;
+  const isCurrent = (): boolean => daemonId === generation && stateRestoreAttempt === attempt;
   if (!generation) {
     stateGate = "blocked";
     stateGateGeneration = null;
     stateGateReason = "daemon generation is unavailable";
     return;
   }
+  stateGate = "pending";
+  stateGateGeneration = null;
   const payload = parseStateResponse(await getJson("/api/state"));
-  if (daemonId !== generation) return;
+  if (!isCurrent()) return;
   if (payload === null) {
     // Unreadable copy: publishing stays closed so fallback state cannot replace it.
     stateGate = "blocked";
     stateGateGeneration = null;
     stateGateReason = "the daemon's saved workspace could not be read";
+    setStatus(stateGateReason, "warn");
     return;
   }
   if (payload.kind === "unsupported") {
@@ -3241,6 +3252,21 @@ async function reconcileWorkspaceState(): Promise<void> {
     stateGateGeneration = null;
     stateGateReason = `the state file is version ${String(payload.version)} — update the app to read it`;
     setStatus(`workspace state file is version ${String(payload.version)} — update the app to read it`, "warn");
+    return;
+  }
+  let remoteSidebar: unknown = null;
+  if (payload.kind === "state" && typeof payload.state.sidebar === "string" && payload.state.sidebar.length <= STATE_LIMIT_BYTES) {
+    try { remoteSidebar = JSON.parse(payload.state.sidebar); } catch { /* Malformed preferences are ignored. */ }
+  }
+  // Finish the guarded sidebar transaction before adopting any other fields.
+  // Its lock may span a restart; canceled work must never mutate/cache G1 in G2.
+  const cached = await applySidebarState(remoteSidebar, isCurrent);
+  if (!isCurrent()) return;
+  if (!cached) {
+    stateGate = "blocked";
+    stateGateGeneration = null;
+    stateGateReason = "restored sidebar preferences could not be safely cached";
+    setStatus(stateGateReason, "warn");
     return;
   }
   if (payload.kind === "none") {
@@ -3265,21 +3291,6 @@ async function reconcileWorkspaceState(): Promise<void> {
     }
     const remoteCellSize = typeof state.cellSize === "number" && Number.isFinite(state.cellSize) ? state.cellSize : null;
     if (remoteCellSize !== null && localStorage.getItem(CELL_KEY) === null) setCellSize(remoteCellSize);
-    const remoteSidebar = typeof state.sidebar === "string" && state.sidebar.length <= STATE_LIMIT_BYTES ? state.sidebar : null;
-    if (remoteSidebar && readSidebarState() === null) {
-      try {
-        const cached = await applySidebarState(JSON.parse(remoteSidebar));
-        if (daemonId !== generation) return;
-        if (!cached) {
-          stateGate = "blocked";
-          stateGateGeneration = null;
-          stateGateReason = "restored sidebar preferences could not be safely cached";
-          return;
-        }
-      } catch {
-        // Malformed sidebar preferences are ignored.
-      }
-    }
   }
   // Compatible read and every adopted field in memory: the next publish carries
   // the whole workspace, never a partial one.

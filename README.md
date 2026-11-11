@@ -144,14 +144,19 @@ homes, with private state and an OS-selected loopback port. Install the browser 
 `bunx playwright install --with-deps chromium`, then run `bun run smoke:sidebar`.
 It covers controlled overlapping read/merge/write operations, stale-tab saves, independent archives,
 queued archive/re-add ordering, delayed storage events and daemon PUTs, reload, corrupt cold-start
-cache restoration, valid local preferences, denied/full browser storage, and unavailable/rejected
-browser locking. It needs no OMP installation or credentials; the directory picker is stubbed,
+cache restoration, delayed initial reads with interactive edits, edits queued behind restoration,
+real daemon generation changes during GET/lock waits, valid local preferences, denied/full browser
+storage, unavailable/rejected browser locking, and same-window restoration recovery. It needs no
+OMP installation or credentials; the directory picker is stubbed,
 so native-shell behavior is not exercised.
 
 Sidebar persistence and daemon workspace saves require Web Locks (a supported browser on localhost
 or HTTPS). If locking or storage fails, edits stay in memory with a visible warning; a later
-preference change retries them. If initial daemon restoration cannot be cached, reload after
-recovery to reopen daemon saving. The app does not fall back to an unsafe concurrent write.
+preference change retries them. If initial restoration fails, a successful local preference save
+retries the daemon read before reopening publication. Initial restore eligibility is captured before
+boot reads; fallback cache writes do not complete it. Explicit local width/view/workspace and archive
+edits survive delayed reads and queued restores. Canceled generations cannot adopt or cache state.
+The app does not fall back to an unsafe concurrent write.
 Same-origin daemon saves are also serialized so an older in-flight request cannot replace a newer
 archive snapshot. Reload all open tabs after updating so every writer uses the same lock.
 Independent browser profiles/devices still use the daemon's whole-document last-writer policy.

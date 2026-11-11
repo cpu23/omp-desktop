@@ -37,10 +37,31 @@ let workspaces: string[] = [];
 let activeWorkspace: string | null = null;
 let collapsedWorkspaces = new Set<string>();
 let archivedWorkspaces = new Map<string, string>();
-// Retain explicit archive/re-add actions (or daemon restoration) if storage is
+// Retain explicit archive/re-add actions if storage is
 // denied or full, until a write succeeds. Unrelated saves introduce no archive edits.
 type ArchiveIntent = { path: string | null; committed?: boolean };
 const pendingArchives = new Map<string, ArchiveIntent>();
+// Captured before controls become interactive, not after an asynchronous boot
+// read. A successful fallback save is not a compatible daemon baseline.
+let restorePending = true;
+// If the initial read was denied, the first readable cache may still be the
+// user's valid pre-existing preferences. Distinguish it from our own fallback.
+let restoreFallbackWritten = false;
+let restoreLocalBaseline: SidebarState | null = null;
+function rememberRestoreBaseline(stored: SidebarState | null): void {
+  if (restorePending && !restoreFallbackWritten && stored !== null) restoreLocalBaseline = stored;
+}
+type EditedPreference = "width" | "view" | "workspaces" | "activeWorkspace";
+const restoreEdits = new Set<EditedPreference>();
+const restoreCollapsed = new Map<string, boolean>();
+const restoreArchives = new Map<string, string | null>();
+function edited(...fields: EditedPreference[]): void {
+  for (const field of fields) restoreEdits.add(field);
+}
+function archiveIntent(key: string, path: string | null): void {
+  pendingArchives.set(key, { path });
+  if (restorePending) restoreArchives.set(key, path);
+}
 let savePreferences: (() => void) | null = null;
 let refreshViewControls: (() => void) | null = null;
 
@@ -59,6 +80,7 @@ export function toggleSidebarFolder(cwd: string): void {
   const key = workspacePathKey(path);
   if (collapsedWorkspaces.has(key)) collapsedWorkspaces.delete(key);
   else collapsedWorkspaces.add(key);
+  restoreCollapsed.set(key, collapsedWorkspaces.has(key));
   savePreferences?.();
 }
 
@@ -76,7 +98,7 @@ export function archiveSidebarWorkspace(cwd: string): void {
   if (path === null) return;
   const key = workspacePathKey(path);
   archivedWorkspaces.set(key, path);
-  pendingArchives.set(key, { path });
+  archiveIntent(key, path);
   savePreferences?.();
 }
 
@@ -87,10 +109,12 @@ export function addSidebarWorkspace(cwd: string): void {
   const existing = workspaces.find((workspace) => workspacePathKey(workspace) === key);
   if (existing === undefined) workspaces = [...workspaces, path];
   archivedWorkspaces.delete(key);
-  pendingArchives.set(key, { path: null });
+  archiveIntent(key, null);
   activeWorkspace = existing ?? path;
   collapsedWorkspaces.delete(key);
   view = "workspaces";
+  restoreCollapsed.set(key, false);
+  edited("workspaces", "activeWorkspace", "view");
   refreshViewControls?.();
   savePreferences?.();
 }
@@ -106,6 +130,7 @@ export function selectSidebarWorkspace(cwd: string): void {
   const selected = existing ?? path;
   if (activeWorkspace !== null && workspacePathKey(activeWorkspace) === workspacePathKey(selected)) return;
   activeWorkspace = selected;
+  edited("activeWorkspace");
   savePreferences?.();
 }
 
@@ -163,7 +188,7 @@ function normalizedDirectoryPaths(value: unknown): string[] {
 }
 
 /** Set by init(); null only in the instant before the controls are wired. */
-let applyExternalState: ((state: SidebarState) => Promise<boolean>) | null = null;
+let applyExternalState: ((state: SidebarState | null, isCurrent: () => boolean) => Promise<boolean>) | null = null;
 
 /** Storage-event adoption refreshes the view without republishing the mirror. */
 let notifyStateChange: ((persist: boolean) => void) | null = null;
@@ -177,14 +202,12 @@ export function onSidebarStateChange(listener: (persist: boolean) => void): void
   notifyStateChange = listener;
 }
 
-/**
- * Adopt a persisted sidebar state, e.g. one the client restored from the
- * daemon's durable workspace after browser storage was lost. Applies live once
- * the controls are wired and persists it to the local cache.
- */
-export async function applySidebarState(value: unknown): Promise<boolean> {
-  const state = parseSidebarState(value);
-  return applyExternalState ? applyExternalState(state) : false;
+/** Commit a compatible initial baseline, retaining edits made during async boot. */
+export async function applySidebarState(value: unknown, isCurrent: () => boolean): Promise<boolean> {
+  if (!isCurrent()) return false;
+  const state = typeof value === "object" && value !== null && !Array.isArray(value)
+    ? parseSidebarState(value) : null;
+  return applyExternalState ? applyExternalState(state, isCurrent) : false;
 }
 
 function maxWidth(): number {
@@ -276,7 +299,9 @@ function init(): void {
     return;
   }
 
-  const stored = readSidebarState() ?? parseSidebarState(null);
+  const cached = readSidebarState();
+  restorePending = cached === null;
+  const stored = cached ?? parseSidebarState(null);
   let width = stored.width;
 
   view = stored.view;
@@ -359,6 +384,7 @@ function init(): void {
   for (const button of viewButtons) {
     button.addEventListener("click", () => {
       view = button.dataset.sidebarView === "sessions" ? "sessions" : "workspaces";
+      edited("view");
       renderView();
       saveState();
     });
@@ -405,6 +431,7 @@ function init(): void {
         // A denied read must abort even if writes happen to be allowed: without
         // the shared snapshot we cannot safely merge other tabs' archives.
         const stored = parseSidebarCache(localStorage.getItem(STORE_KEY));
+        rememberRestoreBaseline(stored);
         if (stored === null) archivedWorkspaces = new Map(fallbackArchives);
         const liveActive = activeWorkspace;
         try {
@@ -417,6 +444,7 @@ function init(): void {
             collapsedWorkspaces: [...collapsedWorkspaces],
             archivedWorkspaces: [...archivedWorkspaces.values()],
           } satisfies SidebarState));
+          if (restorePending) restoreFallbackWritten = true;
         } finally {
           // An older queued archive must not deselect a newer explicit re-add.
           activeWorkspace = liveActive;
@@ -460,6 +488,7 @@ function init(): void {
 
   function setWidth(px: number, persist: boolean): void {
     width = clampWidth(px);
+    edited("width");
     render();
     if (persist) saveState();
   }
@@ -535,19 +564,78 @@ function init(): void {
     notifyStateChange?.(false);
   });
 
-  applyExternalState = async (state) => {
-    width = clampWidth(state.width);
-    view = state.view;
-    workspaces = state.workspaces;
-    activeWorkspace = state.activeWorkspace;
-    collapsedWorkspaces = new Set(state.collapsedWorkspaces.map(workspacePathKey));
-    pendingArchives.clear();
-    for (const key of archivedWorkspaces.keys()) pendingArchives.set(key, { path: null });
-    archivedWorkspaces = new Map(state.archivedWorkspaces.map((path) => [workspacePathKey(path), path]));
-    for (const [key, path] of archivedWorkspaces) pendingArchives.set(key, { path });
-    renderView();
-    render();
-    return saveState();
+  applyExternalState = async (state, isCurrent) => {
+    if (!isCurrent()) return false;
+    try {
+      if (!navigator.locks?.request) return persistenceUnavailable();
+      return await navigator.locks.request(STORE_KEY, () => {
+        // Generation/attempt cancellation precedes EVERY side effect, including
+        // live adoption. Never call saveState here: it would reacquire this lock.
+        if (!isCurrent()) return false;
+        const cached = parseSidebarCache(localStorage.getItem(STORE_KEY));
+        rememberRestoreBaseline(cached);
+        if (!restorePending && cached !== null) return true;
+        const live: SidebarState = {
+          width, view, workspaces, activeWorkspace,
+          collapsedWorkspaces: [...collapsedWorkspaces],
+          archivedWorkspaces: [...archivedWorkspaces.values()],
+        };
+        const baseline = restoreLocalBaseline ?? state;
+        const next = { ...(baseline ?? live) };
+        for (const field of restoreEdits) {
+          // Each explicitly edited preference wins; untouched preferences can
+          // still come from the daemon. Workspace additions retain remote rows.
+          Object.assign(next, { [field]: live[field] });
+        }
+        if (restoreEdits.has("workspaces") && baseline) {
+          next.workspaces = normalizedDirectoryPaths([...baseline.workspaces, ...workspaces]);
+        }
+        const collapsed = new Set(next.collapsedWorkspaces.map(workspacePathKey));
+        for (const [key, isCollapsed] of restoreCollapsed) {
+          if (isCollapsed) collapsed.add(key); else collapsed.delete(key);
+        }
+        next.collapsedWorkspaces = [...collapsed];
+        const archives = new Map(next.archivedWorkspaces.map((path) => [workspacePathKey(path), path]));
+        for (const path of cached?.archivedWorkspaces ?? []) archives.set(workspacePathKey(path), path);
+        // Already cached actions still override the initial remote baseline;
+        // pending actions include newer edits made while this request queued.
+        for (const [key, path] of restoreArchives) {
+          if (path === null) archives.delete(key); else archives.set(key, path);
+        }
+        for (const [key, intent] of pendingArchives) {
+          if (intent.path === null) archives.delete(key); else archives.set(key, intent.path);
+        }
+        next.archivedWorkspaces = [...archives.values()];
+        if (next.activeWorkspace !== null && archives.has(workspacePathKey(next.activeWorkspace))) {
+          next.activeWorkspace = next.workspaces.find((path) => !archives.has(workspacePathKey(path))) ?? null;
+        }
+        // Stage first: a denied read/write leaves both the baseline and live
+        // preferences untouched, and retains all edit intent for a later retry.
+        localStorage.setItem(STORE_KEY, JSON.stringify(next));
+        width = next.width;
+        view = next.view;
+        workspaces = next.workspaces;
+        activeWorkspace = next.activeWorkspace;
+        collapsedWorkspaces = new Set(next.collapsedWorkspaces.map(workspacePathKey));
+        archivedWorkspaces = archives;
+        restorePending = false;
+        restoreLocalBaseline = null;
+        restoreEdits.clear();
+        restoreCollapsed.clear();
+        restoreArchives.clear();
+        if (pickerStatus.textContent === persistenceWarning) {
+          pickerStatus.textContent = "";
+          pickerStatus.hidden = true;
+        }
+        renderView();
+        render();
+        notifyStateChange?.(true);
+        return true;
+      });
+    } catch {
+      if (!isCurrent()) return false;
+      return persistenceUnavailable();
+    }
   };
 
   render();

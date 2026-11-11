@@ -5,6 +5,7 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { chromium, type Page } from "playwright";
 import { startTestDaemon } from "./fixtures/daemon";
+import { restoreRegressions } from "./sidebar-restore-smoke";
 
 const KEY = "omp-desktop.sidebar.v1";
 type Sidebar = { width: number; archivedWorkspaces: string[]; activeWorkspace: string | null };
@@ -27,16 +28,21 @@ async function waitFor(check: () => Promise<boolean>, label: string): Promise<vo
   throw new Error(`timed out waiting for ${label}`);
 }
 
-const daemon = await startTestDaemon();
+// Keep the origin stable across real fixture restarts.
+const portReservation = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
+const port = portReservation.port!;
+await portReservation.stop(true);
+const daemon = await startTestDaemon({ port });
 const browserHome = join(daemon.root, "browser-home");
 await mkdir(browserHome, { mode: 0o700 });
 const browser = await chromium.launch({
   headless: true,
   env: {
-    HOME: browserHome, PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C.UTF-8",
+    HOME: browserHome, TMPDIR: browserHome, PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C.UTF-8",
     XDG_CONFIG_HOME: browserHome, XDG_CACHE_HOME: browserHome, XDG_DATA_HOME: browserHome,
   },
 }).catch(async (error: unknown) => { await daemon.stop(); throw error; });
+console.log(`Chromium ${browser.version()}`);
 const context = await browser.newContext();
 const puts: string[] = [];
 context.on("request", (request) => {
@@ -249,7 +255,7 @@ async function sequentialRegressions(): Promise<void> {
 
 const regression = process.argv.find((arg) => arg.startsWith("--regression="))?.split("=")[1];
 try {
-  if (regression && !["overlap", "ordering", "delivery", "locking", "cold"].includes(regression)) {
+  if (regression && !["overlap", "ordering", "delivery", "locking", "cold", "initial", "generation", "edits", "failure"].includes(regression)) {
     throw new Error(`unknown sidebar regression: ${regression}`);
   }
   if (!regression) await sequentialRegressions();
@@ -465,6 +471,12 @@ try {
       assert.equal((await (await fetch(`${daemon.base}/api/state`)).json()).state.sidebar, durable.state.sidebar);
     } finally { await unavailable.close(); }
     console.log("ok - invalid cold cache restores durable archives, valid local preferences win, failed adoption preserves the daemon");
+  }
+  if (!regression || ["initial", "generation", "edits", "failure"].includes(regression)) {
+    // These scenarios restart the daemon. Older independent browser contexts
+    // would legitimately republish their own whole-document preferences.
+    await context.close();
+    await restoreRegressions(browser, daemon, regression);
   }
   console.log("SIDEBAR SMOKE PASSED");
 } finally {
