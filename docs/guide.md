@@ -300,6 +300,9 @@ Edit shortcuts under sidebar **Settings → Keyboard shortcuts**. Use commas for
 for alternative bindings (for example, `Ctrl+K, Ctrl+1`). The first press must include Ctrl, Meta, Alt or Shift;
 sequences time out after one second. Bindings are stored in the local browser/app profile.
 
+App shortcuts work in both live terminals and saved-session draft composers. Alt+1–9 follows the current
+left-to-right tab order after closing or reordering spaces. Settings, search and title editors retain normal editing keys.
+
 Toggle pane focus expands the selected terminal to fill the workspace; press the same shortcut again to restore
 the split layout and its divider ratios. Other sessions keep running with their existing processes. This
 temporary presentation does not change the saved layout; switching spaces, changing the layout, or reloading

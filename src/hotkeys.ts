@@ -334,8 +334,8 @@ export function shortcutStrokeForEvent(event: KeyboardStrokeEvent): string | nul
 
 function isEditableTarget(target: EventTarget | null): boolean {
   if (!(target instanceof Element)) return false;
-  // xterm's hidden textarea is the terminal transport, not a shortcut editor.
-  if (target.closest(".xterm-helper-textarea")) return false;
+  // Session inputs are terminal surfaces, not shortcut/settings editors.
+  if (target.closest(".xterm-helper-textarea, .cold-composer textarea")) return false;
   if (target.closest("input, textarea, select, [contenteditable='true'], [role='textbox']")) return true;
   return target instanceof HTMLElement && target.isContentEditable;
 }
