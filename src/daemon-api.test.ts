@@ -10,6 +10,24 @@ import { fakeOmpRecordPath, startTestDaemon, testSessionsRoot, writeTestTranscri
 
 type RuntimeInfo = { id: string; alive: boolean; pid: number | null; sessionFile: string | null; cwd: string };
 
+function binaryMessagesContain(
+  messages: ReadonlyArray<{ raw: string | ArrayBuffer }>,
+  marker: string,
+): boolean {
+  return messages
+    .filter((entry) => entry.raw instanceof ArrayBuffer)
+    .map((entry) => new TextDecoder().decode(entry.raw as ArrayBuffer))
+    .join("")
+    .includes(marker);
+}
+
+test("readiness markers can span binary WebSocket messages", () => {
+  const messages = ["FAKE-OMP RE", "ADY"].map((part) => ({
+    raw: new TextEncoder().encode(part).buffer as ArrayBuffer,
+  }));
+  expect(binaryMessagesContain(messages, "FAKE-OMP READY")).toBe(true);
+});
+
 async function createRuntime(base: string, request: Record<string, unknown> = {}): Promise<RuntimeInfo> {
   const response = await fetch(`${base}/api/runtimes`, {
     method: "POST",
@@ -447,8 +465,7 @@ describe("real daemon API behavior", () => {
       await opened.promise;
       await waitFor(
         () => messages.some((entry) => entry.parsed?.type === "hello") &&
-          messages.some((entry) => entry.raw instanceof ArrayBuffer &&
-            new TextDecoder().decode(entry.raw as ArrayBuffer).includes("FAKE-OMP READY")),
+          binaryMessagesContain(messages, "FAKE-OMP READY"),
         "WebSocket hello and ready marker replay",
       );
       const helloIndex = messages.findIndex((entry) => entry.parsed?.type === "hello");
