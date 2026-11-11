@@ -84,6 +84,8 @@ from your application menu; the daemon above must remain running.
 
 ## Unreleased
 
+- Keep app shortcuts active in saved-session draft composers, so Alt+1–9 still switches spaces after closing or opening tabs.
+  `bun run scripts/space-hotkeys-smoke.ts` checks space renumbering, draft retention and editor isolation in Chromium.
 - Keep terminal Ctrl+C from exiting OMP: map an unselected Ctrl+C to Escape and preserve selection copying.
 - Gate session input on real terminal readiness rather than process creation or a timeout. Preserve failed cold
   drafts even if initialization finishes later, and disable unsupported Tern native rendering to avoid its fallback animation race.
