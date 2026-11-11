@@ -54,8 +54,9 @@ try {
   }, "real OMP startup and its OSC 1337 transcript announcement");
   await waitFor(
     () => messages.some((message) => typeof message === "string" && parseServerMessage(message)?.type === "hello") &&
-      messages.some((message) => message instanceof ArrayBuffer),
-    "the real terminal's hello and output stream",
+      messages.some((message) => message instanceof ArrayBuffer) &&
+      messages.some((message) => typeof message === "string" && parseServerMessage(message)?.type === "ready"),
+    "the real terminal's hello, output stream, and parsed readiness frame",
   );
   const first = (await runtimeList()).find((entry) => entry.id === runtimeId);
   if (!first) throw new Error("real OMP runtime disappeared after attach");

@@ -624,25 +624,124 @@ describe("real daemon API behavior", () => {
     }
   }, 60_000);
 
-  test("a no-frame startup times out without submitting its prompt", async () => {
+  test("fresh no-frame startup timeouts retire only unadmitted idle runtimes", async () => {
     const daemon = await startTestDaemon({ env: { OMP_DESKTOP_TEST_STARTUP_MODE: "no-frame" } });
     const marker = `unsubmitted-startup-prompt-${crypto.randomUUID()}`;
+    let pendingExitPath = "";
     try {
-      const response = await fetch(`${daemon.base}/api/sessions/request`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ text: marker }),
-      });
-      expect(response.status).toBe(503);
-      expect(await response.text()).toContain("terminal did not initialize");
-      const runtime = (await runtimeList(daemon.base))[0];
-      if (!runtime?.sessionFile) throw new Error("no-frame runtime did not announce its transcript");
-      expect(runtime.status).toBe("starting");
-      expect(await Bun.file(runtime.sessionFile).text()).not.toContain(marker);
+      pendingExitPath = await writeTestTranscript(daemon.root, "pending-exit-sibling");
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const unrelated = attempt === 1 ? await createRuntime(daemon.base) : null;
+        let starting: RuntimeInfo | undefined;
+        const pending = fetch(`${daemon.base}/api/sessions/request`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ text: marker }),
+        });
+        await waitFor(async () => {
+          starting = (await runtimeList(daemon.base)).find(runtime => runtime.status === "starting");
+          return starting?.alive === true && typeof starting.sessionFile === "string";
+        }, `fresh runtime ${attempt + 1} to announce its transcript`);
+        if (!starting?.sessionFile || starting.pid === null) {
+          throw new Error("no-frame runtime did not expose its startup identity");
+        }
+        const sessionFile = starting.sessionFile;
+        const pid = starting.pid;
+        if (attempt === 0) {
+          // Preserve a sibling exit that is still inside the daemon's settle window.
+          const ledgerPath = join(daemon.root, "state", "sessions.json");
+          const saved: unknown = await Bun.file(ledgerPath).json();
+          if (!isRecord(saved) || !Array.isArray(saved.sessions)) throw new Error("bad runtime ledger fixture");
+          await Bun.write(ledgerPath, JSON.stringify({
+            ...saved,
+            sessions: [...saved.sessions, { sessionFile: pendingExitPath, cwd: daemon.root, cols: 80, rows: 24 }],
+          }));
+        }
+        const response = await pending;
+        expect(response.status).toBe(503);
+        expect(await response.text()).toContain("terminal did not initialize");
+        const expectedRemaining = unrelated ? [unrelated.id] : [];
+        await waitFor(async () =>
+          (await runtimeList(daemon.base)).map(runtime => runtime.id).sort().join(",") === expectedRemaining.sort().join(","),
+        "only the unadmitted startup runtime to be retired");
+        if (unrelated) {
+          expect((await runtimeList(daemon.base)).find(runtime => runtime.id === unrelated.id))
+            .toMatchObject({ alive: false, pid: null });
+        }
+        await waitFor(() => {
+          try {
+            process.kill(pid, 0);
+            return false;
+          } catch (error) {
+            return (error as NodeJS.ErrnoException).code === "ESRCH";
+          }
+        }, "unadmitted startup process reaping");
+        expect(await Bun.file(sessionFile).text()).not.toContain(marker);
+        if (attempt === 0) {
+          await daemon.restart();
+          await waitFor(async () => (await runtimeList(daemon.base)).some(runtime => runtime.sessionFile === pendingExitPath),
+            "the unsettled sibling to be restored");
+          const restored = await runtimeList(daemon.base);
+          expect(restored.map(runtime => runtime.sessionFile)).toEqual([pendingExitPath]);
+          const stopped = await fetch(`${daemon.base}/api/runtimes/${restored[0]!.id}`, { method: "DELETE" });
+          expect(stopped.status).toBe(200);
+          await waitFor(async () => (await runtimeList(daemon.base)).length === 0, "restored sibling stop");
+        }
+      }
     } finally {
       await daemon.stop();
     }
-  }, 30_000);
+  }, 120_000);
+  test("startup timeout cleanup leaves protected runtimes running", async () => {
+    const daemon = await startTestDaemon({ env: {
+      OMP_DESKTOP_TEST_STARTUP_MODE: "no-frame",
+      OMP_DESKTOP_TEST_PROTECT_UNLOAD: "1",
+    } });
+    try {
+      let starting: RuntimeInfo | undefined;
+      const pending = fetch(`${daemon.base}/api/sessions/request`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: "unsubmitted protected startup" }),
+      });
+      await waitFor(async () => {
+        starting = (await runtimeList(daemon.base)).find(runtime => runtime.status === "starting");
+        return starting?.alive === true && typeof starting.sessionFile === "string";
+      }, "protected fresh runtime to announce its transcript");
+      const response = await pending;
+      expect(response.status).toBe(503);
+      const remaining = await runtimeList(daemon.base);
+      expect(remaining).toHaveLength(1);
+      expect(remaining[0]).toMatchObject({ id: starting!.id, alive: true, status: "starting" });
+    } finally {
+      await daemon.stop();
+    }
+  }, 60_000);
+
+  test("startup timeout leaves resumed sessions running", async () => {
+    const daemon = await startTestDaemon({ env: { OMP_DESKTOP_TEST_STARTUP_MODE: "no-frame" } });
+    const path = await writeTestTranscript(daemon.root, "resumed-startup-timeout");
+    const marker = `unsubmitted-resume-${crypto.randomUUID()}`;
+    try {
+      const pending = fetch(`${daemon.base}/api/sessions/request`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ path, text: marker }),
+      });
+      await waitFor(async () => (await runtimeList(daemon.base)).some(runtime =>
+        runtime.alive && runtime.status === "starting" && runtime.sessionFile === path),
+      "resumed runtime to enter startup");
+      const response = await pending;
+      expect(response.status).toBe(503);
+      const remaining = await runtimeList(daemon.base);
+      expect(remaining).toHaveLength(1);
+      expect(remaining[0]).toMatchObject({ alive: true, status: "starting", sessionFile: path });
+      expect(await Bun.file(path).text()).not.toContain(marker);
+    } finally {
+      await daemon.stop();
+    }
+  }, 60_000);
+
   test("the deterministic fake OMP exits with its requested status through a real PTY", async () => {
     const daemon = await startTestDaemon();
     let ws: WebSocket | null = null;

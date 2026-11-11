@@ -9,7 +9,7 @@ import { SessionArchiveStore } from "./session-archives";
 import { isRecord } from "./guards";
 import { MAX_RUNTIME_INPUT_CODE_UNITS, parseClientMessage, type RuntimeInfo, type RuntimesResponse, type ServerMessage } from "./protocol";
 import { PresentationReader } from "./presentation";
-import { STATE_LIMIT_BYTES, WorkspaceStateStore, RuntimeLedgerStore } from "./state";
+import { STATE_LIMIT_BYTES, WorkspaceStateStore, RuntimeLedgerStore, type LiveSession } from "./state";
 import {
   DaemonSettingsStore,
   isIdleTimeoutMinutes,
@@ -317,6 +317,73 @@ async function waitForActivity(runtime: Runtime, expectedFile?: string): Promise
   throw new RuntimeUnavailableError(
     "session did not become ready (terminal frame, idle socket, and session file are required); the request was not sent",
   );
+}
+
+/**
+ * Retire a fresh startup only when the runtime identity and host both prove it
+ * is still unadmitted and idle. The host rechecks activity before shutdown.
+ */
+async function retireUnadmittedFreshRuntime(runtime: Runtime): Promise<void> {
+  if (!runtime.alive || runtime.ready || manager.get(runtime.id) !== runtime) return;
+  const sessionFile = runtime.sessionFile;
+  if (!sessionFile || unloadingBySession.has(sessionFile) || requestingSessions.has(sessionFile)) return;
+
+  const settled = Promise.withResolvers<void>();
+  const attempt = { runtime, done: settled.promise };
+  unloadingBySession.set(sessionFile, attempt);
+  unloadingRuntimes.add(runtime);
+  try {
+    const before = await idleClient.status(runtime.id);
+    if (before.kind !== "available" || before.status.sessionFile !== sessionFile ||
+        before.status.unloading || before.status.idleSince === null || before.status.reasons.length !== 0 ||
+        !runtime.alive || runtime.ready || runtime.sessionFile !== sessionFile ||
+        manager.get(runtime.id) !== runtime || requestingSessions.has(sessionFile)) return;
+
+    const result = await idleClient.unload(runtime.id, { sessionFile, idleTimeoutMs: 1 });
+    let accepted = result.kind === "accepted";
+    if (result.kind === "unavailable") {
+      // A lost acknowledgement may hide an accepted shutdown. Keep the input
+      // fence until fresh host state resolves the result or the process exits.
+      while (runtime.alive && !shuttingDown) {
+        const fresh = await idleClient.status(runtime.id);
+        if (fresh.kind === "available") {
+          accepted = fresh.status.unloading;
+          break;
+        }
+        await Bun.sleep(250);
+      }
+    }
+    if (!accepted) return;
+    while (runtime.alive && !shuttingDown) {
+      const fresh = await idleClient.status(runtime.id);
+      if (fresh.kind === "available" && !fresh.status.unloading) return;
+      await Bun.sleep(250);
+    }
+    if (shuttingDown) return;
+    while (manager.get(runtime.id) === runtime && !shuttingDown) await Bun.sleep(25);
+  } catch (error) {
+    console.warn(`omp-desktopd: unadmitted startup cleanup unavailable: ${String(error)}`);
+  } finally {
+    if (!shuttingDown && !runtime.alive && manager.get(runtime.id) !== runtime) {
+      await ledgerWrite;
+      const previousSessions = await ledger.read();
+      const preserveUnsettledSessions = restoringPool || exitSaveTimer !== null;
+      const snapshot = new Map<string, LiveSession>();
+      if (preserveUnsettledSessions) {
+        for (const session of previousSessions) {
+          if (session.sessionFile !== sessionFile) snapshot.set(session.sessionFile, session);
+        }
+      }
+      for (const session of manager.liveSessions()) {
+        if (session.sessionFile !== sessionFile) snapshot.set(session.sessionFile, session);
+      }
+      writeLedger([...snapshot.values()]);
+      await ledgerWrite;
+    }
+    if (unloadingBySession.get(sessionFile) === attempt) unloadingBySession.delete(sessionFile);
+    unloadingRuntimes.delete(runtime);
+    settled.resolve();
+  }
 }
 
 
@@ -794,6 +861,7 @@ const server = Bun.serve<WsData>({
           return new Response(IDLE_REQUEST_TOO_LARGE, { status: 413 });
         }
         let runtime: Runtime | undefined;
+        let promptAttempted = false;
         try {
           runtime = await createRequestedRuntime({
             resume,
@@ -806,6 +874,7 @@ const server = Bun.serve<WsData>({
           const file = ready.sessionFile;
           if (file === null) throw new RuntimeUnavailableError("session has no transcript yet; the request was not sent");
           runtime.lastInputAt = Date.now();
+          promptAttempted = true;
           const dispatched = await idleClient.prompt(runtime.id, {
             sessionFile: file, text: body.text, files: body.files as string[] | undefined,
           });
@@ -837,6 +906,7 @@ const server = Bun.serve<WsData>({
           return Response.json({ runtime: runtime.info() }, { headers: NO_STORE });
         } catch (error) {
           if (runtime && !runtime.alive && manager.get(runtime.id) === runtime) await manager.kill(runtime.id);
+          else if (runtime && !resume && !promptAttempted) await retireUnadmittedFreshRuntime(runtime);
           if (error instanceof ArchivedSessionError) return new Response(error.message, { status: 400 });
           if (error instanceof RuntimeCapacityError) {
             return new Response("session limit reached; stop a session or raise the runtime limit in Settings", { status: 409 });
@@ -1090,8 +1160,8 @@ let ledgerWrite: Promise<void> = Promise.resolve();
  */
 let restoringPool = true;
 
-function writeLedger(): void {
-  ledgerWrite = ledger.save(manager.liveSessions()).catch((error) => {
+function writeLedger(sessions: LiveSession[] = manager.liveSessions()): void {
+  ledgerWrite = ledger.save(sessions).catch((error) => {
     console.warn(`omp-desktopd: runtime ledger not saved: ${error instanceof Error ? error.message : String(error)}`);
   });
 }
