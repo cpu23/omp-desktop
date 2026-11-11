@@ -327,44 +327,79 @@ async function retireUnadmittedFreshRuntime(runtime: Runtime): Promise<void> {
   if (!runtime.alive || runtime.ready || manager.get(runtime.id) !== runtime) return;
   const sessionFile = runtime.sessionFile;
   if (!sessionFile || unloadingBySession.has(sessionFile) || requestingSessions.has(sessionFile)) return;
+  const cleanupDeadline = Date.now() + 5_000;
 
   const settled = Promise.withResolvers<void>();
   const attempt = { runtime, done: settled.promise };
   unloadingBySession.set(sessionFile, attempt);
   unloadingRuntimes.add(runtime);
+  let retainFenceUntilExit = false;
+  let unloadAttempted = false;
+  let unsubscribeExit: (() => void) | undefined;
+  const releaseAttempt = () => {
+    if (unloadingBySession.get(sessionFile) === attempt) unloadingBySession.delete(sessionFile);
+    unloadingRuntimes.delete(runtime);
+    unsubscribeExit?.();
+    settled.resolve();
+  };
+  const keepFenceUntilExit = (): void => {
+    if (!runtime.alive || manager.get(runtime.id) !== runtime) return;
+    retainFenceUntilExit = true;
+    unsubscribeExit = runtime.subscribeExit(releaseAttempt);
+    if (!runtime.alive || manager.get(runtime.id) !== runtime) releaseAttempt();
+  };
   try {
     const before = await idleClient.status(runtime.id);
     if (before.kind !== "available" || before.status.sessionFile !== sessionFile ||
         before.status.unloading || before.status.idleSince === null || before.status.reasons.length !== 0 ||
         !runtime.alive || runtime.ready || runtime.sessionFile !== sessionFile ||
-        manager.get(runtime.id) !== runtime || requestingSessions.has(sessionFile)) return;
+        manager.get(runtime.id) !== runtime || requestingSessions.has(sessionFile) ||
+        Date.now() >= cleanupDeadline) return;
 
+    unloadAttempted = true;
     const result = await idleClient.unload(runtime.id, { sessionFile, idleTimeoutMs: 1 });
     let accepted = result.kind === "accepted";
     if (result.kind === "unavailable") {
-      // A lost acknowledgement may hide an accepted shutdown. Keep the input
-      // fence until fresh host state resolves the result or the process exits.
-      while (runtime.alive && !shuttingDown) {
-        const fresh = await idleClient.status(runtime.id);
-        if (fresh.kind === "available") {
-          accepted = fresh.status.unloading;
-          break;
-        }
-        await Bun.sleep(250);
+      // Resolve a lost acknowledgement once. If host state is also unavailable,
+      // return the startup failure but retain the input fence until process exit.
+      const fresh = await idleClient.status(runtime.id);
+      if (fresh.kind !== "available" || fresh.status.sessionFile !== sessionFile) {
+        keepFenceUntilExit();
+        return;
       }
+      accepted = fresh.status.unloading;
     }
     if (!accepted) return;
-    while (runtime.alive && !shuttingDown) {
+    while (runtime.alive && !shuttingDown && Date.now() < cleanupDeadline) {
       const fresh = await idleClient.status(runtime.id);
-      if (fresh.kind === "available" && !fresh.status.unloading) return;
-      await Bun.sleep(250);
+      if (fresh.kind === "available") {
+        if (fresh.status.sessionFile !== sessionFile) {
+          keepFenceUntilExit();
+          return;
+        }
+        if (!fresh.status.unloading) return;
+      }
+      if (Date.now() < cleanupDeadline) {
+        await Bun.sleep(Math.min(250, cleanupDeadline - Date.now()));
+      }
     }
     if (shuttingDown) return;
-    while (manager.get(runtime.id) === runtime && !shuttingDown) await Bun.sleep(25);
+    if (runtime.alive) {
+      // Shutdown was accepted but did not settle before the request deadline.
+      // Keep prompts and terminal input fenced until the runtime exits.
+      keepFenceUntilExit();
+      return;
+    }
+    while (manager.get(runtime.id) === runtime && !shuttingDown && Date.now() < cleanupDeadline) {
+      await Bun.sleep(25);
+    }
+    if (manager.get(runtime.id) === runtime) keepFenceUntilExit();
   } catch (error) {
+    if (unloadAttempted) keepFenceUntilExit();
     console.warn(`omp-desktopd: unadmitted startup cleanup unavailable: ${String(error)}`);
   } finally {
-    if (!shuttingDown && !runtime.alive && manager.get(runtime.id) !== runtime) {
+    const retainFence = retainFenceUntilExit && runtime.alive && manager.get(runtime.id) === runtime;
+    if (!retainFence && !shuttingDown && !runtime.alive && manager.get(runtime.id) !== runtime) {
       await ledgerWrite;
       const previousSessions = await ledger.read();
       const preserveUnsettledSessions = restoringPool || exitSaveTimer !== null;
@@ -380,9 +415,7 @@ async function retireUnadmittedFreshRuntime(runtime: Runtime): Promise<void> {
       writeLedger([...snapshot.values()]);
       await ledgerWrite;
     }
-    if (unloadingBySession.get(sessionFile) === attempt) unloadingBySession.delete(sessionFile);
-    unloadingRuntimes.delete(runtime);
-    settled.resolve();
+    if (!retainFence) releaseAttempt();
   }
 }
 

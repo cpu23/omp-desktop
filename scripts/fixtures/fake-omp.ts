@@ -86,6 +86,7 @@ if (startupGate) process.stdin.setRawMode?.(true);
 
 let idleSince = Date.now();
 let unloading = false;
+let idleStatusUnavailable = false;
 let revision = 0;
 const idleDir = process.env.OMP_DESKTOP_IDLE_IPC_DIR;
 const idleToken = process.env.OMP_DESKTOP_IDLE_IPC_TOKEN;
@@ -100,6 +101,9 @@ if (idleDir && idleToken) {
       }
       const path = new URL(request.url).pathname;
       if (request.method === "GET" && path === "/status") {
+        if (idleStatusUnavailable) {
+          return Response.json({ kind: "unavailable", reason: "fixture status unavailable" }, { status: 503 });
+        }
         return Response.json({
           hostId: `fixture-${process.pid}`, sessionId: runtimeId, sessionFile: transcript || null,
           idleSince: unloading ? null : idleSince, reasons: unloading ? ["unloading"] : [],
@@ -138,6 +142,11 @@ if (idleDir && idleToken) {
         return Response.json({ kind: "accepted" }, { status: 202 });
       }
       if (request.method === "POST" && path === "/unload") {
+        if (process.env.OMP_DESKTOP_TEST_CLEANUP_STATUS_UNAVAILABLE === "1") {
+          if (startupGate) writeFileSync(`${startupGate}.unload-attempted`, "attempted");
+          idleStatusUnavailable = true;
+          return Response.json({ kind: "unavailable", reason: "fixture unload acknowledgement lost" }, { status: 503 });
+        }
         if (process.env.OMP_DESKTOP_TEST_PROTECT_UNLOAD === "1") {
           return Response.json({ kind: "conflict", reason: "fixture active work" }, { status: 409 });
         }
