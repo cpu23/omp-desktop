@@ -81,8 +81,12 @@ export class IdleRuntimeClient {
       : { kind: "unavailable", reason: "invalid_status" };
   }
 
-  unload(id: string, input: { sessionFile: string; idleTimeoutMs: number }): Promise<IdleCommandResult> {
+  unload(id: string, input: { sessionFile: string; idleTimeoutMs: number; attemptId?: string }): Promise<IdleCommandResult> {
     return this.#command(id, "/unload", input);
+  }
+
+  cancelUnload(id: string, input: { sessionFile: string; attemptId: string }): Promise<IdleCommandResult> {
+    return this.#command(id, "/cancel-unload", input);
   }
 
   prompt(id: string, input: { sessionFile: string; text: string; files?: string[] }): Promise<IdleCommandResult> {
@@ -150,8 +154,18 @@ export class IdleRuntimeClient {
         return;
       }
       chunks.push(chunk);
+      // A complete HTTP response need not be followed immediately by EOF.
+      // Deliver acknowledgements before the host's graceful shutdown timer.
+      const bytes = Buffer.concat(chunks, totalBytes);
+      const delimiter = bytes.indexOf("\r\n\r\n");
+      if (delimiter >= 0) {
+        const header = bytes.subarray(0, delimiter).toString("latin1");
+        const length = /(?:^|\r\n)content-length:\s*(\d+)\s*(?:\r\n|$)/i.exec(header);
+        if (length && bytes.byteLength >= delimiter + 4 + Number(length[1])) parseReply();
+      }
     });
-    socket.once("end", () => {
+    socket.once("end", () => parseReply());
+    const parseReply = () => {
       const bytes = Buffer.concat(chunks, totalBytes);
       const delimiter = bytes.indexOf("\r\n\r\n");
       if (delimiter < 0) {
@@ -193,7 +207,7 @@ export class IdleRuntimeClient {
         }
       }
       finish({ status: Number(statusMatch[1]), body: bodyBytes.toString("utf8") });
-    });
+    };
     socket.once("connect", () => {
       const headers = [
         `${method} ${path} HTTP/1.1`,

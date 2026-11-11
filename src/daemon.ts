@@ -335,13 +335,39 @@ async function retireUnadmittedFreshRuntime(runtime: Runtime): Promise<void> {
   unloadingRuntimes.add(runtime);
   let retainFenceUntilExit = false;
   let unloadAttempted = false;
+  let cleanupFinished = false;
+  let readyDuringCleanup = false;
+  const unloadAttemptId = crypto.randomUUID();
   let unsubscribeExit: (() => void) | undefined;
+  let unsubscribeReady: (() => void) | undefined;
+  let cancelPromise: Promise<boolean> | undefined;
   const releaseAttempt = () => {
     if (unloadingBySession.get(sessionFile) === attempt) unloadingBySession.delete(sessionFile);
     unloadingRuntimes.delete(runtime);
     unsubscribeExit?.();
+    unsubscribeReady?.();
     settled.resolve();
   };
+  const cancelAcceptedUnload = async (): Promise<boolean> => {
+    const result = await idleClient.cancelUnload(runtime.id, { sessionFile, attemptId: unloadAttemptId });
+    // A status read cannot prove cancellation of an in-flight unload. In
+    // particular, waiting for one here can consume the host's shutdown grace.
+    return result.kind === "accepted";
+  };
+  const onReady = (): void => {
+    readyDuringCleanup = true;
+    if (!unloadAttempted) return;
+    cancelPromise = cancelAcceptedUnload();
+    void cancelPromise.then((outcome) => {
+      if (cleanupFinished && outcome && runtime.alive && manager.get(runtime.id) === runtime) {
+        retainFenceUntilExit = false;
+        releaseAttempt();
+      }
+    }).catch((error: unknown) => {
+      console.warn(`omp-desktopd: ready runtime unload cancellation unavailable: ${String(error)}`);
+    });
+  };
+  unsubscribeReady = runtime.subscribeReady(onReady);
   const keepFenceUntilExit = (): void => {
     if (!runtime.alive) return;
     retainFenceUntilExit = true;
@@ -354,24 +380,42 @@ async function retireUnadmittedFreshRuntime(runtime: Runtime): Promise<void> {
         before.status.unloading || before.status.idleSince === null || before.status.reasons.length !== 0 ||
         !runtime.alive || runtime.ready || runtime.sessionFile !== sessionFile ||
         manager.get(runtime.id) !== runtime || requestingSessions.has(sessionFile) ||
-        Date.now() >= cleanupDeadline) return;
+        Date.now() >= cleanupDeadline || readyDuringCleanup) return;
 
     unloadAttempted = true;
-    const result = await idleClient.unload(runtime.id, { sessionFile, idleTimeoutMs: 1 });
+    if (runtime.ready || readyDuringCleanup) return;
+    const result = await idleClient.unload(runtime.id, { sessionFile, idleTimeoutMs: 1, attemptId: unloadAttemptId });
+    if (runtime.ready || readyDuringCleanup) {
+      let cancellation = cancelPromise ? await cancelPromise : false;
+      if (!cancellation) cancellation = await cancelAcceptedUnload();
+      if (!cancellation) {
+        keepFenceUntilExit();
+      }
+      return;
+    }
     let accepted = result.kind === "accepted";
     if (result.kind === "unavailable") {
-      // Resolve a lost acknowledgement once. If host state is also unavailable,
-      // return the startup failure but retain the input fence until process exit.
+      // A missing acknowledgement does not prove that the host rejected unload.
       const fresh = await idleClient.status(runtime.id);
-      if (fresh.kind !== "available" || fresh.status.sessionFile !== sessionFile) {
+      if (fresh.kind === "available" && fresh.status.sessionFile === sessionFile && fresh.status.unloading) {
+        accepted = true;
+      } else {
+        const cancellation = await idleClient.cancelUnload(runtime.id, { sessionFile, attemptId: unloadAttemptId });
+        if (cancellation.kind === "accepted") return;
         keepFenceUntilExit();
         return;
       }
-      accepted = fresh.status.unloading;
     }
     if (!accepted) return;
     while (runtime.alive && !shuttingDown && Date.now() < cleanupDeadline) {
+      if (runtime.ready || readyDuringCleanup) {
+        let cancellation = cancelPromise ? await cancelPromise : false;
+        if (!cancellation) cancellation = await cancelAcceptedUnload();
+        if (!cancellation) keepFenceUntilExit();
+        return;
+      }
       const fresh = await idleClient.status(runtime.id);
+      if (runtime.ready || readyDuringCleanup) continue;
       if (fresh.kind === "available") {
         if (fresh.status.sessionFile !== sessionFile) {
           keepFenceUntilExit();
@@ -398,6 +442,7 @@ async function retireUnadmittedFreshRuntime(runtime: Runtime): Promise<void> {
     if (unloadAttempted) keepFenceUntilExit();
     console.warn(`omp-desktopd: unadmitted startup cleanup unavailable: ${String(error)}`);
   } finally {
+    cleanupFinished = true;
     // The manager can remove an alive runtime during the precheck or a rejected
     // unload. Keep queued resumes fenced until that runtime exits.
     if (!retainFenceUntilExit && runtime.alive && manager.get(runtime.id) !== runtime) {
@@ -405,20 +450,28 @@ async function retireUnadmittedFreshRuntime(runtime: Runtime): Promise<void> {
     }
     const retainFence = retainFenceUntilExit && runtime.alive;
     if (!retainFence && !shuttingDown && !runtime.alive && manager.get(runtime.id) !== runtime) {
-      await ledgerWrite;
-      const previousSessions = await ledger.read();
-      const preserveUnsettledSessions = restoringPool || exitSaveTimer !== null;
-      const snapshot = new Map<string, LiveSession>();
-      if (preserveUnsettledSessions) {
-        for (const session of previousSessions) {
-          if (session.sessionFile !== sessionFile) snapshot.set(session.sessionFile, session);
+      // Ledger reconciliation is best-effort persistence, not part of the HTTP
+      // startup failure. A slow filesystem must not hold the request open.
+      void (async () => {
+        await ledgerWrite;
+        const previousSessions = await ledger.read();
+        if (shuttingDown) return;
+        const preserveUnsettledSessions = restoringPool || exitSaveTimer !== null;
+        const snapshot = new Map<string, LiveSession>();
+        if (preserveUnsettledSessions) {
+          for (const session of previousSessions) {
+            if (session.sessionFile !== sessionFile) snapshot.set(session.sessionFile, session);
+          }
         }
-      }
-      for (const session of manager.liveSessions()) {
-        if (session.sessionFile !== sessionFile) snapshot.set(session.sessionFile, session);
-      }
-      writeLedger([...snapshot.values()]);
-      await ledgerWrite;
+        // The input fence has been released: a newer runtime may now own this
+        // same transcript. Reconcile against the current pool, not the retiree.
+        for (const session of manager.liveSessions()) {
+          snapshot.set(session.sessionFile, session);
+        }
+        writeLedger([...snapshot.values()]);
+      })().catch((error: unknown) => {
+        console.warn(`omp-desktopd: startup cleanup ledger reconciliation unavailable: ${String(error)}`);
+      });
     }
     if (!retainFence) releaseAttempt();
   }

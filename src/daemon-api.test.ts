@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
-import { chmod, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, open, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { connect as connectTcp } from "node:net";
 import { IMAGE_FILE_LIMIT } from "./image-limits";
@@ -779,6 +779,130 @@ describe("real daemon API behavior", () => {
       await rm(gateDir, { recursive: true, force: true });
     }
   }, 45_000);
+
+  test("startup cleanup cancels an accepted unload if the runtime becomes ready before shutdown", async () => {
+    const gateDir = await mkdtemp(join(tmpdir(), "omp-startup-ready-unload-race-"));
+    const gatePath = join(gateDir, "hold-first-frame");
+    const cleanupHold = `${gatePath}.hold-accepted-unload`;
+    const unloadAttempted = `${gatePath}.accepted-unload-attempted`;
+    const cancelAttempted = `${gatePath}.unload-cancel-attempted`;
+    const unloadCancelled = `${gatePath}.unload-cancelled`;
+    const unloadResult = `${gatePath}.unload-result`;
+    await writeFile(gatePath, "held");
+    await writeFile(cleanupHold, "held");
+    const daemon = await startTestDaemon({ env: {
+      OMP_DESKTOP_TEST_STARTUP_GATE: gatePath,
+      OMP_DESKTOP_TEST_CLEANUP_ACCEPT_HOLD: cleanupHold,
+      OMP_DESKTOP_TEST_CLEANUP_ACCEPT_MARKER: unloadAttempted,
+      OMP_DESKTOP_TEST_CLEANUP_CANCEL_ATTEMPT_MARKER: cancelAttempted,
+      OMP_DESKTOP_TEST_CLEANUP_CANCEL_MARKER: unloadCancelled,
+      OMP_DESKTOP_TEST_CLEANUP_RESULT_MARKER: unloadResult,
+      OMP_DESKTOP_TEST_CLEANUP_EXIT_DELAY_MS: "150",
+    } });
+    let pending: Promise<Response> | undefined;
+    try {
+      pending = fetch(`${daemon.base}/api/sessions/request`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: "fresh startup that becomes ready during cleanup" }),
+      }).catch(() => new Response("daemon stopped", { status: 599 }));
+      let starting: RuntimeInfo | undefined;
+      await waitFor(async () => {
+        starting = (await runtimeList(daemon.base)).find(runtime => runtime.status === "starting");
+        return starting?.alive === true && typeof starting.sessionFile === "string" &&
+          await Bun.file(`${gatePath}.online`).exists();
+      }, "fresh unready runtime and idle IPC fixture");
+      const runtime = starting;
+      if (!runtime?.sessionFile || runtime.pid === null) throw new Error("runtime identity missing");
+      const originalPid = runtime.pid;
+      await waitFor(() => Bun.file(unloadAttempted).exists(), "host unload request to be held", 30_000);
+      await rm(gatePath, { force: true });
+      await waitFor(async () => {
+        const current = (await runtimeList(daemon.base)).find(item => item.id === runtime.id);
+        return current?.alive === true && current.status !== "starting";
+      }, "runtime to become ready while unload is pending");
+      await rm(cleanupHold, { force: true });
+
+      const response = await pending;
+      expect(response.status).toBe(503);
+      expect(await response.text()).toContain("terminal did not initialize");
+      expect(await Bun.file(cancelAttempted).exists(), JSON.stringify(await runtimeList(daemon.base))).toBe(true);
+      expect(await Bun.file(unloadResult).text()).toBe("accepted");
+      expect(await Bun.file(unloadCancelled).exists(), daemon.diagnostics() + await Bun.file(cancelAttempted).text()).toBe(true);
+      await Bun.sleep(250); // Survive the host shutdown deadline, not just its acknowledgement.
+      const remaining = await runtimeList(daemon.base);
+      expect(remaining).toHaveLength(1);
+      expect(remaining[0]).toMatchObject({ id: runtime.id, alive: true, pid: originalPid, sessionFile: runtime.sessionFile });
+      expect(remaining[0]?.status).not.toBe("starting");
+      expect(() => process.kill(originalPid, 0)).not.toThrow();
+    } finally {
+      await rm(cleanupHold, { force: true });
+      await rm(gatePath, { force: true });
+      await daemon.stop();
+      await pending?.catch(() => undefined);
+      await rm(gateDir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test.skipIf(process.platform === "win32")("startup failure responds before a blocked ledger read completes", async () => {
+    const daemon = await startTestDaemon({ env: { OMP_DESKTOP_TEST_STARTUP_MODE: "no-frame" } });
+    let pending: Promise<Response> | undefined;
+    let writer: Awaited<ReturnType<typeof open>> | undefined;
+    try {
+      pending = fetch(`${daemon.base}/api/sessions/request`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: "unsubmitted startup with delayed ledger" }),
+      }).catch(() => new Response("daemon stopped", { status: 599 }));
+      let runtime: RuntimeInfo | undefined;
+      await waitFor(async () => {
+        runtime = (await runtimeList(daemon.base)).find(item => item.status === "starting");
+        return runtime?.alive === true && typeof runtime.sessionFile === "string";
+      }, "unready runtime and transcript");
+      if (!runtime?.sessionFile) throw new Error("runtime transcript missing");
+      const ledgerPath = join(daemon.root, "state", "sessions.json");
+      await waitFor(async () => {
+        const value: unknown = await Bun.file(ledgerPath).json().catch(() => null);
+        return isRecord(value) && Array.isArray(value.sessions) &&
+          value.sessions.some(entry => isRecord(entry) && entry.sessionFile === runtime!.sessionFile);
+      }, "runtime to be recorded in the ledger");
+      await rm(ledgerPath, { force: true });
+      const mkfifo = Bun.spawn(["mkfifo", ledgerPath], { stdin: "ignore", stdout: "ignore", stderr: "pipe" });
+      const fifoExit = await mkfifo.exited;
+      if (fifoExit !== 0) throw new Error(`mkfifo failed with ${fifoExit}`);
+      const opened = open(ledgerPath, "w").then(handle => { writer = handle; return true; });
+      const writerReady = await Promise.race([opened, Bun.sleep(30_000).then(() => false)]);
+      expect(writerReady, "ledger cleanup should open the FIFO").toBe(true);
+
+      const result = await Promise.race([
+        pending.then(async response => ({ kind: "response" as const, status: response.status, body: await response.text() })),
+        Bun.sleep(3_000).then(() => ({ kind: "timeout" as const })),
+      ]);
+      expect(result.kind, "request should not wait for ledger I/O").toBe("response");
+      if (result.kind === "response") {
+        expect(result.status).toBe(503);
+        expect(result.body).toContain("terminal did not initialize");
+      }
+      // The response released the fence while reconciliation is still blocked.
+      // A new owner of this transcript must survive the delayed snapshot write.
+      const resumed = await createRuntime(daemon.base, { resume: runtime.sessionFile });
+      expect(resumed.alive).toBe(true);
+      await writer!.writeFile(JSON.stringify({ version: 1, sessions: [] }));
+      await writer!.close();
+      writer = undefined;
+      await Bun.sleep(250);
+      const reconciled: unknown = await Bun.file(ledgerPath).json();
+      expect(isRecord(reconciled) && Array.isArray(reconciled.sessions) &&
+        reconciled.sessions.some(entry => isRecord(entry) && entry.sessionFile === runtime!.sessionFile)).toBe(true);
+    } finally {
+      if (writer) {
+        await writer.writeFile(JSON.stringify({ version: 1, savedAt: new Date().toISOString(), sessions: [] }));
+        await writer.close();
+      }
+      await daemon.stop();
+      await pending?.catch(() => undefined);
+    }
+  }, 60_000);
 
   test("ambiguous startup cleanup retains its session fence when the manager removes the runtime", async () => {
     const gateDir = await mkdtemp(join(tmpdir(), "omp-startup-cleanup-stop-race-"));

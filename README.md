@@ -43,6 +43,10 @@ from your application menu; the daemon above must remain running.
 - Sessions transition from unloaded to **Starting** before becoming available for input. Cold submissions wait
   for the terminal's first frame and idle IPC readiness; live panes unlock only after replay and local parsing finish.
   Startup failure preserves the draft for an explicit retry. Saved panes remain read-only transcript views until submission.
+  A fresh, unsubmitted startup that times out is retired only with host idle authorization; resumed,
+  ready, active, or ambiguously admitted sessions stay protected. If readiness arrives during cleanup,
+  the daemon cancels its pending unload. Uncertain cancellation keeps input fenced until process exit.
+  Ledger reconciliation runs in the background so slow storage cannot hold the startup error response open.
 
 - **Workspaces** is the default sidebar view. In the native app, use the folder-plus icon to add a directory
   through the system chooser, starting at your home folder. Empty workspaces remain available after a reload.
