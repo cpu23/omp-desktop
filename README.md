@@ -40,8 +40,13 @@ from your application menu; the daemon above must remain running.
 
 ## Sessions and settings
 
-- Panes show **Starting session…** while an agent initializes. Live panes replay daemon terminal state;
-  saved panes use a short-lived read-only transcript renderer.
+- Sessions transition from unloaded to **Starting** before becoming available for input. Cold submissions wait
+  for the terminal's first frame and idle IPC readiness; live panes unlock only after replay and local parsing finish.
+  Startup failure preserves the draft for an explicit retry. Saved panes remain read-only transcript views until submission.
+  A fresh, unsubmitted startup that times out is retired only with host idle authorization; resumed,
+  ready, active, or ambiguously admitted sessions stay protected. If readiness arrives during cleanup,
+  the daemon cancels its pending unload. Uncertain cancellation keeps input fenced until process exit.
+  Ledger reconciliation runs in the background so slow storage cannot hold the startup error response open.
 
 - **Workspaces** is the default sidebar view. In the native app, use the folder-plus icon to add a directory
   through the system chooser, starting at your home folder. Empty workspaces remain available after a reload.
@@ -80,7 +85,8 @@ from your application menu; the daemon above must remain running.
 ## Unreleased
 
 - Keep terminal Ctrl+C from exiting OMP: map an unselected Ctrl+C to Escape and preserve selection copying.
-
+- Gate session input on real terminal readiness rather than process creation or a timeout. Preserve failed cold
+  drafts even if initialization finishes later, and disable unsupported Tern native rendering to avoid its fallback animation race.
 - Default the sidebar to Workspaces, add a home-rooted native directory chooser on Linux/macOS/Windows, persist
   empty workspaces and selection, and prepare new-session drafts in the selected directory.
 - Unify running and saved conversations instead of separating Loaded/Recent sections; omit redundant directory

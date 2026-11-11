@@ -5,6 +5,12 @@ import { TerminalReplay } from "./terminal-replay";
 
 function append(replay: TerminalReplay, data: string): Promise<void> {
   const { promise, resolve } = Promise.withResolvers<void>();
+  replay.append(data, () => resolve());
+  return promise;
+}
+
+function appendClearState(replay: TerminalReplay, data: string): Promise<boolean> {
+  const { promise, resolve } = Promise.withResolvers<boolean>();
   replay.append(data, resolve);
   return promise;
 }
@@ -115,6 +121,16 @@ describe("terminal replay snapshots", () => {
     } finally {
       replay.dispose();
       restored.dispose();
+    }
+  });
+  test("recognizes the first clear-screen marker when CSI is split across chunks", async () => {
+    const replay = new TerminalReplay(40, 8);
+    try {
+      expect(await appendClearState(replay, "\x1b[0J")).toBe(false);
+      expect(await appendClearState(replay, "\x1b[")).toBe(false);
+      expect(await appendClearState(replay, "2J")).toBe(true);
+    } finally {
+      replay.dispose();
     }
   });
 

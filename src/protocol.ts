@@ -7,13 +7,11 @@ import type { SessionSummary as StoredSessionSummary } from "./sessions";
 export type { SessionSummary } from "./sessions";
 
 /**
- * `streaming` = bytes arrived recently. It is a
- * byte-rate heuristic, not knowledge of what omp is doing: omp repaints its
- * status line periodically, so long silences still mean "probably done talking".
- * When `presentation` is present it is authoritative instead: the injected
- * omp-mobile extension reports the agent's own start/end events.
+ * `starting` means the process exists but its first real terminal frame has
+ * not yet been parsed. `streaming` is the recent-byte heuristic; `idle` and
+ * `exited` retain their existing meanings.
  */
-export type RuntimeStatus = "streaming" | "idle" | "exited";
+export type RuntimeStatus = "starting" | "streaming" | "idle" | "exited";
 
 /**
  * Live state reported by the runtime's injected omp-mobile extension over its
@@ -57,10 +55,12 @@ export const MAX_RUNTIME_INPUT_CODE_UNITS = 16_384;
 
 export type ClientMessage =
   | { type: "input"; data: string; id?: string }
+  | { type: "terminalReply"; data: string }
   | { type: "resize"; cols: number; rows: number };
 
 export type ServerMessage =
   | { type: "hello"; runtime: RuntimeInfo; replayBytes: number }
+  | { type: "ready"; runtime: RuntimeInfo }
   | { type: "inputAck"; id: string }
   | {
       type: "exit";
@@ -71,7 +71,6 @@ export type ServerMessage =
        */
       daemonShutdown: boolean;
     };
-
 export type RuntimesResponse = {
   build: string;
   /** Changes on every daemon start; clients read it to tell restart from stop. */
@@ -82,6 +81,38 @@ export type RuntimesResponse = {
 
 /** The client-side view of `GET /api/runtimes`. */
 export type RuntimesPayload = { runtimes: RuntimeInfo[]; generation: string | null; defaultCwd: string | null };
+
+const CSI_DA = /\x1b\[(?:[?>])?\d+(?:;\d+)*c/y;
+const CSI_DSR = /\x1b\[(?:\?)?(?:0|3)n/y;
+const CSI_CPR = /\x1b\[(?:\?)?\d+(?:;\d+)*R/y;
+const CSI_DECRPM = /\x1b\[\?\d+;[0-4]\$y/y;
+const CSI_KEYBOARD = /\x1b\[\?\d+(?:;\d+)*u/y;
+const CSI_WINDOW = /\x1b\[\d+(?:;\d+)*t/y;
+const OSC_COLOR = /\x1b\](?:10|11);rgb:[0-9a-f]{1,4}\/[0-9a-f]{1,4}\/[0-9a-f]{1,4}(?:\x07|\x1b\\)/iy;
+const TERMINAL_REPLY_PATTERNS = [CSI_DA, CSI_DSR, CSI_CPR, CSI_DECRPM, CSI_KEYBOARD, CSI_WINDOW, OSC_COLOR];
+
+/**
+ * Only accept complete terminal capability/status replies generated in
+ * response to queries. These may be concatenated, but no user text or other
+ * escape sequence can be smuggled through the terminalReply channel.
+ */
+export function isTerminalReply(data: string): boolean {
+  if (data.length === 0 || data.length > MAX_RUNTIME_INPUT_CODE_UNITS) return false;
+  let offset = 0;
+  while (offset < data.length) {
+    let matched = false;
+    for (const pattern of TERMINAL_REPLY_PATTERNS) {
+      pattern.lastIndex = offset;
+      if (pattern.exec(data)) {
+        offset = pattern.lastIndex;
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) return false;
+  }
+  return true;
+}
 
 // Everything below crosses a process boundary (HTTP, websocket, localStorage).
 // Validate once here instead of casting and trusting reads at the use site.
@@ -95,9 +126,14 @@ function isRuntimeInfoBase(value: unknown): value is RuntimeInfoBase {
   // status idle, and still attachable; exited is final), so they are required
   // here rather than trusted to be present.
   if (typeof value.alive !== "boolean") return false;
-  if (value.status !== "streaming" && value.status !== "idle" && value.status !== "exited") return false;
   if (value.pid !== null && typeof value.pid !== "number") return false;
   if (value.sessionFile !== null && typeof value.sessionFile !== "string") return false;
+  if (
+    value.status !== "starting" &&
+    value.status !== "streaming" &&
+    value.status !== "idle" &&
+    value.status !== "exited"
+  ) return false;
   return typeof value.cols === "number" && typeof value.rows === "number";
 }
 
@@ -197,6 +233,10 @@ export function parseServerMessage(raw: string): ServerMessage | null {
     return null;
   }
   if (!isRecord(value)) return null;
+  if (value.type === "ready") {
+    const runtime = parseRuntimeInfo(value.runtime);
+    return runtime ? { type: "ready", runtime } : null;
+  }
   if (value.type === "hello") {
     const runtime = parseRuntimeInfo(value.runtime);
     if (!runtime) return null;
@@ -224,6 +264,9 @@ export function parseClientMessage(raw: string): ClientMessage | null {
     if (value.id !== undefined &&
         (typeof value.id !== "string" || value.id.length === 0 || value.id.length > 64)) return null;
     return { type: "input", data: value.data, ...(typeof value.id === "string" ? { id: value.id } : {}) };
+  }
+  if (value.type === "terminalReply" && typeof value.data === "string" && isTerminalReply(value.data)) {
+    return { type: "terminalReply", data: value.data };
   }
   if (value.type === "resize" && typeof value.cols === "number" && typeof value.rows === "number") {
     const cols = Math.max(2, Math.min(500, Math.floor(value.cols)));

@@ -232,8 +232,10 @@ export class RuntimeManager {
       env: {
         ...this.defaults.env,
         // omp only emits its OSC 1337 session-file var when it believes it is
-        // embedded; that var is how a fresh session's file becomes known.
         TERM_PROGRAM: "tern",
+        // Tern identity is required for OMP's OSC session-file discovery; opt
+        // out only of the unsupported native terminal escape protocol.
+        PI_TUI_NATIVE: "0",
         OMP_DESKTOP_RUNTIME: id,
         // Per-runtime IPC identity: the injected omp-mobile extension serves
         // `<state-dir>/<id>.sock`, so the phone reaches exactly this process.

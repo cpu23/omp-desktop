@@ -332,6 +332,8 @@ export default function registerDesktopIdleExtension(host: HostApi): void {
   let socketPath: string | undefined;
   let socketIdentity: SocketIdentity | undefined;
   let pollHandle: unknown;
+  let pendingUnloadTimer: { sessionFile: string; attemptId: string | undefined; context: HostContext; handle: unknown } | undefined;
+  const unloadAttempts = new Map<string, "pending" | "cancelled">();
   let branchSessionKey: string | null = null;
   let branchBlockers: string[] = ["session_branch_unavailable"];
   let registryCache: RegistryCache | undefined;
@@ -617,6 +619,13 @@ export default function registerDesktopIdleExtension(host: HostApi): void {
   }
 
   function stopServer(ctx?: HostContext): void {
+    if (pendingUnloadTimer) {
+      state.cancelPendingUnload(pendingUnloadTimer.sessionFile);
+      if (typeof pendingUnloadTimer.context.clearTimer === "function") {
+        try { pendingUnloadTimer.context.clearTimer(pendingUnloadTimer.handle); } catch {}
+      }
+      pendingUnloadTimer = undefined;
+    }
     if (pollHandle !== undefined && ctx && typeof ctx.clearTimer === "function") {
       try {
         ctx.clearTimer(pollHandle);
@@ -665,7 +674,8 @@ export default function registerDesktopIdleExtension(host: HostApi): void {
           if (request.method === "GET" && url.pathname === "/status") {
             return response(status(currentContext ?? ctx));
           }
-          if (request.method !== "POST" || (url.pathname !== "/unload" && url.pathname !== "/prompt")) {
+          if (request.method !== "POST" ||
+              (url.pathname !== "/unload" && url.pathname !== "/cancel-unload" && url.pathname !== "/prompt")) {
             return response({ kind: "unavailable", reason: "not_found" }, 404);
           }
           const parsed = await readJsonBody(request);
@@ -675,6 +685,38 @@ export default function registerDesktopIdleExtension(host: HostApi): void {
           const sessionFile = input.sessionFile;
           if (!nonEmptyText(sessionFile)) return response({ kind: "conflict", reason: "invalid_session_file" }, 400);
           const activeContext = currentContext ?? ctx;
+
+          if (url.pathname === "/cancel-unload") {
+            const attemptId = input.attemptId;
+            if (!nonEmptyText(attemptId) || attemptId.length > 128) {
+              return response({ kind: "conflict", reason: "invalid_attempt_id" }, 400);
+            }
+            // Never forget an acknowledged cancellation: a delayed request must
+            // not become eligible again. Refuse new entries at the bound.
+            if (!unloadAttempts.has(attemptId) && unloadAttempts.size >= 128) {
+              return response({ kind: "unavailable", reason: "cancellation_capacity" }, 503);
+            }
+            const pending = pendingUnloadTimer;
+            if (pending?.sessionFile === sessionFile && pending.attemptId === attemptId) {
+              if (!state.cancelPendingUnload(sessionFile)) {
+                return response({ kind: "conflict", reason: "unload is already committing" }, 409);
+              }
+              if (typeof pending.context.clearTimer === "function") {
+                try { pending.context.clearTimer(pending.handle); } catch {}
+              }
+              pendingUnloadTimer = undefined;
+            } else {
+              try {
+                if (state.status(observeHost(activeContext, true), Date.now()).unloading) {
+                  return response({ kind: "conflict", reason: "unload is already committing" }, 409);
+                }
+              } catch {
+                return response({ kind: "unavailable", reason: "unload_state_unavailable" }, 503);
+              }
+            }
+            unloadAttempts.set(attemptId, "cancelled");
+            return response({ kind: "accepted" }, 202);
+          }
 
           if (url.pathname === "/prompt") {
             if (!nonEmptyText(input.text)) return response({ kind: "conflict", reason: "invalid_prompt" }, 400);
@@ -727,6 +769,17 @@ export default function registerDesktopIdleExtension(host: HostApi): void {
             }
           }
 
+          const attemptId = input.attemptId;
+          if (attemptId !== undefined && (!nonEmptyText(attemptId) || attemptId.length > 128)) {
+            return response({ kind: "conflict", reason: "invalid_attempt_id" }, 400);
+          }
+          if (nonEmptyText(attemptId) && unloadAttempts.get(attemptId) === "cancelled") {
+            return response({ kind: "conflict", reason: "unload_cancelled" }, 409);
+          }
+          if (nonEmptyText(attemptId) && !unloadAttempts.has(attemptId) && unloadAttempts.size >= 128) {
+            return response({ kind: "unavailable", reason: "cancellation_capacity" }, 503);
+          }
+
           const idleTimeoutMs = input.idleTimeoutMs;
           if (typeof idleTimeoutMs !== "number" || !Number.isSafeInteger(idleTimeoutMs) || idleTimeoutMs <= 0) {
             return response({ kind: "conflict", reason: "invalid_idle_timeout" }, 400);
@@ -734,12 +787,21 @@ export default function registerDesktopIdleExtension(host: HostApi): void {
           const observation = observeHost(activeContext, true);
           const transition = state.beginUnload(sessionFile, idleTimeoutMs, observation, Date.now());
           if (transition.kind === "conflict") return response(transition, 409);
+          // Reserve the cancellation entry before admitting shutdown. Later
+          // cancellations cannot consume the space this attempt requires.
+          if (nonEmptyText(attemptId)) unloadAttempts.set(attemptId, "pending");
           if (typeof activeContext.setTimeout !== "function") {
-            state.cancelPendingUnload();
+            state.cancelPendingUnload(sessionFile);
             return response({ kind: "unavailable", reason: "shutdown_schedule_unavailable" }, 503);
           }
           try {
-            activeContext.setTimeout.call(activeContext, () => {
+            const scheduled = { sessionFile, attemptId: nonEmptyText(attemptId) ? attemptId : undefined, context: activeContext, handle: undefined as unknown };
+            const timerHandle = activeContext.setTimeout.call(activeContext, () => {
+              const pending = pendingUnloadTimer;
+              // A cancelled callback may already be queued; it must not commit
+              // a subsequent unload, even if the host reuses timer handles.
+              if (pending !== scheduled) return;
+              pendingUnloadTimer = undefined;
               try {
                 const shutdownContext = currentContext ?? activeContext;
                 const fresh = observeHost(shutdownContext, true);
@@ -753,8 +815,10 @@ export default function registerDesktopIdleExtension(host: HostApi): void {
                 logError("host graceful shutdown failed");
               }
             }, SHUTDOWN_DELAY_MS);
+            scheduled.handle = timerHandle;
+            pendingUnloadTimer = scheduled;
           } catch {
-            state.cancelPendingUnload();
+            state.cancelPendingUnload(sessionFile);
             return response({ kind: "unavailable", reason: "shutdown_schedule_failed" }, 503);
           }
           return response({ kind: "accepted" }, 202);

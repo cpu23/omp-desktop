@@ -6,6 +6,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import {
+  isTerminalReply,
   MAX_RUNTIME_INPUT_CODE_UNITS,
   parseClientMessage,
   parseRuntimeInfo,
@@ -105,6 +106,20 @@ describe("runtime presentation parsing", () => {
     expect(parseRuntimeInfo(runtime({ cols: "80" }))).toBeNull();
   });
 
+  test("runtime parsing rejects missing or malformed core lifecycle fields", () => {
+    for (const invalid of [
+      { alive: undefined }, { alive: "yes" },
+      { pid: undefined }, { pid: "100" },
+      { sessionFile: undefined }, { sessionFile: {} },
+    ]) {
+      const payload = runtime(invalid);
+      expect(parseRuntimeInfo(payload)).toBeNull();
+      expect(parseRuntimesResponse({ runtimes: [payload] })).toBeNull();
+      expect(parseServerMessage(JSON.stringify({ type: "ready", runtime: payload }))).toBeNull();
+    }
+    expect(parseRuntimeInfo(runtime({ alive: false, pid: null, sessionFile: null, status: "starting" }))).not.toBeNull();
+  });
+
   test("one-shot runtime parsing drops junk presentation too", () => {
     const one = parseRuntimeOne({ runtime: runtime({ presentation: { agentActive: 1 } }) });
     expect(one?.presentation).toBeUndefined();
@@ -117,6 +132,14 @@ describe("runtime presentation parsing", () => {
       expect(hello.runtime.presentation).toBeUndefined();
       expect(hello.replayBytes).toBe(4);
     }
+  });
+
+  test("starting is a valid runtime state and ready control messages parse", () => {
+    const starting = runtime({ status: "starting" });
+    expect(parseRuntimeInfo(starting)?.status).toBe("starting");
+    const ready = parseServerMessage(JSON.stringify({ type: "ready", runtime: runtime({ status: "idle" }) }));
+    expect(ready?.type).toBe("ready");
+    if (ready?.type === "ready") expect(ready.runtime.status).toBe("idle");
   });
 });
 
@@ -133,6 +156,44 @@ describe("runtime input bounds", () => {
     const paired = "😀".repeat(MAX_RUNTIME_INPUT_CODE_UNITS / 2);
     expect(parseClientMessage(JSON.stringify({ type: "input", data: paired }))?.type).toBe("input");
     expect(parseClientMessage(JSON.stringify({ type: "input", data: `${paired}😀` }))).toBeNull();
+  });
+
+  test("terminalReply accepts only bounded concatenated terminal query responses", () => {
+    const responses = [
+      "\x1b[?1;2c",
+      "\x1b[>0;276;0c",
+      "\x1b[0n",
+      "\x1b[?12;34R",
+      "\x1b[?2026;1$y",
+      "\x1b[?1;2u",
+      "\x1b[4;1080;1920t",
+      "\x1b]10;rgb:ffff/eeee/dddd\x1b\\",
+      "\x1b]11;rgb:123/456/789\x07",
+    ];
+    for (const response of responses) {
+      expect(isTerminalReply(response)).toBe(true);
+      expect(parseClientMessage(JSON.stringify({ type: "terminalReply", data: response }))).toEqual({
+        type: "terminalReply",
+        data: response,
+      });
+    }
+    expect(isTerminalReply(responses.join(""))).toBe(true);
+    for (const rejected of [
+      "",
+      "hello",
+      "\x1b[2J",
+      "\x1b[c",
+      "\x1b[5n",
+      "\x1b[?2026;9$y",
+      "\x1b[0nhello",
+      "\x1b]10;rgb:ffff/eeee/dddd\x07text",
+      "\x1b]10;rgb:ffff/eeee/dddd\x07\x1b]12;rgb:ffff/eeee/dddd\x07",
+      "\x1b[4;1080;1920z",
+      "x".repeat(MAX_RUNTIME_INPUT_CODE_UNITS + 1),
+    ]) {
+      expect(isTerminalReply(rejected)).toBe(false);
+      expect(parseClientMessage(JSON.stringify({ type: "terminalReply", data: rejected }))).toBeNull();
+    }
   });
 });
 describe("workspace state version parsing", () => {
