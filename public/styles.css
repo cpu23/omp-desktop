@@ -254,11 +254,12 @@ select:focus-visible {
   padding: 0 0 8px;
 }
 
-/* The workspace title and controls sit above the search field. */
+/* Search replaces the heading row without shifting the session list. */
 .side-search {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  position: relative;
 }
 
 .sidebar-heading {
@@ -267,6 +268,40 @@ select:focus-visible {
   gap: 6px;
   min-width: 0;
 }
+
+#search-row {
+  position: absolute;
+  inset: 0 0 auto;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-left: 8px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--muted);
+}
+
+#search-row[hidden] { display: none; }
+.side-search:has(#search-row:not([hidden])) .sidebar-heading { visibility: hidden; }
+#search-row input { border: 0; padding: 5px 0; background: transparent; }
+#search-row input::-webkit-search-cancel-button { display: none; }
+#search-close {
+  display: grid;
+  place-items: center;
+  flex: 0 0 30px;
+  align-self: stretch;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+}
+#search-close:hover { color: var(--text); }
+#split-layout { margin-left: auto; }
+#split-layout:disabled { cursor: default; opacity: 0.45; }
 
 #sidebar-title {
   flex: 1 1 auto;
@@ -388,6 +423,7 @@ select:focus-visible {
   min-width: 0;
 }
 
+.workspace-menu,
 .workspace-new-session {
   display: inline-grid;
   place-items: center;
@@ -405,16 +441,21 @@ select:focus-visible {
 }
 
 .workspace-heading:hover .workspace-new-session,
-.workspace-heading:focus-within .workspace-new-session {
+.workspace-heading:focus-within .workspace-new-session,
+.workspace-heading:hover .workspace-menu,
+.workspace-heading:focus-within .workspace-menu {
   opacity: 1;
   pointer-events: auto;
 }
 
+.workspace-menu { opacity: 1; pointer-events: auto; }
+.workspace-menu:hover,
 .workspace-new-session:hover {
   background: var(--panel-soft);
   color: var(--text);
 }
 
+.workspace-menu:focus-visible,
 .workspace-new-session:focus-visible {
   outline: 1px solid var(--effort-accent);
   outline-offset: 1px;
@@ -460,7 +501,28 @@ select:focus-visible {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  padding-left: 10px;
+  padding-left: 26px;
+}
+
+.workspace-show-more {
+  align-self: flex-start;
+  padding: 6px 4px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font: 11px var(--mono);
+  cursor: pointer;
+}
+
+.workspace-show-more:hover {
+  color: var(--text);
+  background: var(--panel-soft);
+}
+
+.workspace-show-more:focus-visible {
+  outline: 1px solid var(--effort-accent);
+  outline-offset: 1px;
 }
 
 
@@ -891,7 +953,7 @@ select:focus-visible {
   flex: 0 0 1px;
   position: relative;
   z-index: 3;
-  background: var(--line);
+  background: transparent;
   cursor: col-resize;
   touch-action: none;
   transition: background 90ms linear;

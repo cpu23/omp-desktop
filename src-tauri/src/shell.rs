@@ -169,3 +169,33 @@ pub async fn select_workspace_directory(webview: WebviewWindow) -> Result<Option
         .ok_or_else(|| "the selected directory path is not valid UTF-8".to_owned())?;
     Ok(Some(path.to_owned()))
 }
+
+/// Opens a workspace directory in the system file browser from the loopback desktop page.
+#[tauri::command]
+pub fn show_workspace_folder(webview: WebviewWindow, path: String) -> Result<(), String> {
+    if webview.label() != MAIN_WINDOW {
+        return Err("opening workspace folders is only available in the main window".to_owned());
+    }
+    let current = webview
+        .url()
+        .map_err(|error| format!("cannot read the current page URL: {error}"))?;
+    let port = daemon::daemon_port();
+    if !daemon::is_daemon_url(&current, port)
+        || !current.username().is_empty()
+        || current.password().is_some()
+    {
+        return Err("opening workspace folders is only available from the desktop daemon page".to_owned());
+    }
+    if path.is_empty() || path.contains('\0') {
+        return Err("the workspace folder path is invalid".to_owned());
+    }
+    let directory = std::path::PathBuf::from(path);
+    if !directory.is_absolute() {
+        return Err("the workspace folder path is not absolute".to_owned());
+    }
+    if !directory.is_dir() {
+        return Err(format!("the workspace folder is not available: {}", directory.display()));
+    }
+    open::that_detached(&directory)
+        .map_err(|error| format!("could not open the workspace folder in the file browser: {error}"))
+}

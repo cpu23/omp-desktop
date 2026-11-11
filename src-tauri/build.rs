@@ -3,7 +3,7 @@ fn main() {
         tauri_build::try_build(
             tauri_build::Attributes::new().app_manifest(
                 tauri_build::AppManifest::new()
-                    .commands(&["connect", "select_workspace_directory"]),
+                    .commands(&["connect", "select_workspace_directory", "show_workspace_folder"]),
             ),
         )
         .expect("failed to configure Tauri command permissions");

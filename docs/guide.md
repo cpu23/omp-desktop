@@ -77,11 +77,17 @@ for diagnosis. The shell does not automatically relaunch with another backend or
 ## Sessions, spaces and panes
 
 Create spaces with **+** in the top bar. Each space has its own layout (up to four panes); drag a pane header or
-a sidebar session onto another space's tab to move/open it there. Right-click a pane to split the layout:
-1×1 becomes side-by-side, then 2×2. Panes meet at a single 1px separator with no gutter or duplicate borders;
+a sidebar session onto another space's tab to move/open it there. Right-click a pane and choose **Split**, or use
+the top-right split button: 1×1 becomes side-by-side, then 2×2. The button previews the next layout and disables at
+four panes. Panes meet at a single 1px separator with no gutter or duplicate borders;
 drag on or just beside the separator to resize. In a 2×2 grid, closing one pane leaves an empty
 slot; closing another occupied pane collapses the grid. New panes prepare local drafts; clicking a sidebar session
 opens it in the focused pane. Neither action starts a new agent.
+
+The sidebar's magnifying-glass button opens search over its heading row, with the search icon on the left and
+a close button on the right. Close it with **×** or **Escape** to clear the filter and restore the full list.
+Workspace sessions are indented beneath their folder. The sidebar edge has no permanent border; hover or focus
+its resize handle to reveal it.
 
 Saved conversations render read-only history through `omp render`, with at most two history requests active at once.
 Output is spooled to a private temporary file before streaming to the pane, so large transcripts and inline images
@@ -221,9 +227,17 @@ click the folder-plus **Add workspace** icon to open the system directory choose
 Cancel leaves the list unchanged; choosing the same directory again selects the existing workspace.
 Added workspaces remain visible even without sessions. Selection and collapsed groups persist across reloads
 and are included in the daemon's durable sidebar mirror.
+Workspaces show six sessions initially; when a seventh exists, **Show more (N)** reveals the remaining sessions
+in that workspace and focuses the first newly revealed row. Reloading returns to the six-row default.
+Search shows every matching session without applying this six-row cutoff.
 
 Hover a workspace heading (or focus it with the keyboard) to reveal **+** and start a session in that directory.
 The header **+** uses the selected workspace, falling back to the daemon's default directory when none is selected.
+Each workspace heading also has a **⋯** menu. **Archive workspace** hides that workspace and its sessions from
+both sidebar views, without deleting transcripts or stopping running sessions. The archive preference survives
+reloads and is included in the durable sidebar mirror. Add the same directory again to restore it.
+**Show folder** opens the directory in the operating system's file browser and requires the native desktop shell.
+
 Browser clients can use saved
 workspaces, but adding a directory requires the native desktop shell; the browser reports this rather than
 pretending an upload picker can return an absolute local directory.
@@ -412,7 +426,8 @@ bun run smoke:native -- --images
 
 The full runner uses isolated fixture daemons, profiles and a private D-Bus notification service. It needs
 `WebKitWebDriver`, `dbus-daemon`, Python 3 with PyGObject, AT-SPI (`at-spi2-core` and `gir1.2-atspi-2.0`), Xvfb,
-`xdotool`, `xprop` (`x11-utils`), `wmctrl`, `xclip`, `scrot`, and Openbox; Ubuntu CI installs the driver from `webkit2gtk-driver`.
+`xdotool`, `xprop` (`x11-utils`), `wmctrl`, `xclip`, `scrot`, and Openbox. The driver package is `webkitgtk-webdriver`
+on Ubuntu 26.04; older Ubuntu releases use `webkit2gtk-driver`.
 
 On Ubuntu 24.04, `bwrap: setting up uid map: Permission denied` can indicate AppArmor is blocking the user namespace
 required by WebKit's sandbox. See [Ubuntu bug 2144531](https://bugs.launchpad.net/ubuntu/+source/bubblewrap/+bug/2144531)

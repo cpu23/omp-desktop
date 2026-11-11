@@ -139,6 +139,34 @@ bun test
 bun run scripts/daemon-smoke.ts
 ```
 
+The focused sidebar archive regression uses two Chromium tabs and a real daemon in disposable
+homes, with private state and an OS-selected loopback port. Install the browser with
+`bunx playwright install --with-deps chromium`, then run `bun run smoke:sidebar`.
+It covers controlled overlapping read/merge/write operations, stale-tab saves, independent archives,
+queued archive/re-add ordering, delayed storage events and daemon PUTs, reload, corrupt cold-start
+cache restoration, delayed initial reads with interactive edits, edits queued behind restoration,
+real daemon generation changes during GET/lock waits, valid local preferences, denied/full browser
+storage, unavailable/rejected browser locking, same-window restoration recovery, and explicit re-adds
+in another tab during cold restoration. It needs no
+OMP installation or credentials; the directory picker is stubbed,
+so native-shell behavior is not exercised.
+
+Sidebar persistence and daemon workspace saves require Web Locks (a supported browser on localhost
+or HTTPS). If locking or storage fails, edits stay in memory with a visible warning; a later
+preference change retries them. If initial restoration fails, a local preference change
+retries the daemon read before reopening publication. Initial restore eligibility is captured before
+boot reads; unhydrated edits stay in memory until a compatible baseline is committed. A valid shared
+cache can contain newer actions from another tab. Explicit local width/view/workspace and archive
+edits survive delayed reads and queued restores. Canceled generations cannot adopt or cache state.
+The app does not fall back to an unsafe concurrent write.
+Same-origin daemon saves are also serialized so an older in-flight request cannot replace a newer
+archive snapshot. Reload all open tabs after updating so every writer uses the same lock.
+Independent browser profiles/devices still use the daemon's whole-document last-writer policy.
+
+`bun run scripts/transport-smoke.ts` checks admitted requests with lost, invalid, or HTTP 503 replies,
+draft preservation without automatic resubmission, and repeated successful terminal reconnects.
+It uses isolated Chromium and fixture-owned daemons/PTYs without OMP credentials.
+
 The broader `bun run smoke` exercises the OMP PTY integration and requires OMP 18.13.1+ on `PATH`. For a native Linux
 build, install Rust 1.92+ and the [system packages listed in the guide](docs/guide.md#native-linux-app), then run:
 

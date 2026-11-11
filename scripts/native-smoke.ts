@@ -5,6 +5,7 @@ import { createServer as createNetServer, type AddressInfo } from "node:net";
 import { createServer as createHttpServer } from "node:http";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { pathToFileURL } from "node:url";
 import { isRecord } from "../src/guards";
 import { fakeOmpRecordPath, startTestDaemon, writeTestTranscript, type TestDaemon } from "./fixtures/daemon";
 import { runImageAssertions } from "./fixtures/image-assertions";
@@ -308,6 +309,235 @@ async function installExternalOpener(profile: Profile): Promise<string> {
   await chmod(path, 0o700);
   profile.env.OMP_DESKTOP_OPEN_LOG = log;
   return log;
+}
+
+async function installFolderBrowser(profile: Profile): Promise<string> {
+  const log = join(profile.root, "folder-open.log");
+  const recorder = join(profile.bin, "capture-folder-uri");
+  const desktopId = "omp-native-smoke-file-browser.desktop";
+  const applications = join(profile.env.XDG_DATA_HOME!, "applications");
+  await Promise.all([
+    mkdir(applications, { recursive: true, mode: 0o700 }),
+    mkdir(profile.env.XDG_CONFIG_HOME!, { recursive: true, mode: 0o700 }),
+  ]);
+  await writeFile(
+    recorder,
+    "#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"$OMP_DESKTOP_FOLDER_OPEN_LOG\"\n",
+    { mode: 0o700 },
+  );
+  await chmod(recorder, 0o700);
+  profile.env.OMP_DESKTOP_FOLDER_OPEN_LOG = log;
+  await writeFile(join(applications, desktopId), [
+    "[Desktop Entry]",
+    "Type=Application",
+    "Name=OMP Native Smoke File Browser",
+    `Exec=${recorder} %U`,
+    "MimeType=inode/directory;",
+    "NoDisplay=true",
+    "Terminal=false",
+    "",
+  ].join("\n"));
+  await writeFile(join(profile.env.XDG_CONFIG_HOME!, "mimeapps.list"), [
+    "[Default Applications]",
+    `inode/directory=${desktopId};`,
+    "",
+  ].join("\n"));
+  return log;
+}
+
+async function selectWorkspaceFromNativePicker(
+  driver: WebDriver,
+  profile: Profile,
+  workspacePath: string,
+): Promise<void> {
+  const input = profile.input;
+  if (!input) throw new Error("Workspace picker smoke requires the real X11 input backend.");
+  await driver.clickCss("#add-workspace");
+  const findDialog = (): string | false => {
+    const result = Bun.spawnSync({
+      cmd: [input.xdotool, "search", "--onlyvisible", "--name", "Select workspace directory"],
+      env: input.env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if (result.exitCode !== 0) return false;
+    return new TextDecoder().decode(result.stdout).trim().split(/\s+/).find(Boolean) ?? false;
+  };
+  const dialog = await waitFor("the native workspace directory chooser", findDialog);
+  const runXdotool = (args: string[]): void => {
+    const result = Bun.spawnSync({
+      cmd: [input.timeout, "--signal=TERM", "--kill-after=1s", "5s", input.xdotool, ...args],
+      env: input.env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if (result.exitCode !== 0) {
+      throw new Error(`xdotool ${args[0]} failed while selecting the workspace: ${new TextDecoder().decode(result.stderr)}`);
+    }
+  };
+  runXdotool(["windowraise", dialog]);
+  runXdotool(["windowfocus", "--sync", dialog]);
+  runXdotool(["key", "--clearmodifiers", "ctrl+l"]);
+  await Bun.sleep(150);
+  runXdotool(["type", "--clearmodifiers", "--delay", "0", workspacePath]);
+  runXdotool(["key", "--clearmodifiers", "Return"]);
+  await Bun.sleep(250);
+  if (findDialog()) runXdotool(["key", "--clearmodifiers", "Return"]);
+  await waitFor("the native workspace directory chooser to close", () => !findDialog());
+  await driver.waitFor(async () => await driver.execute<boolean>(`
+    const state = JSON.parse(localStorage.getItem("omp-desktop.sidebar.v1") || "{}");
+    return Array.isArray(state.workspaces) && state.workspaces.includes(arguments[0]) &&
+      (!Array.isArray(state.archivedWorkspaces) || !state.archivedWorkspaces.includes(arguments[0]));
+  `, [workspacePath]), "the native picker to add and unarchive the workspace");
+}
+
+async function testWorkspaceFolderActions(
+  driver: WebDriver,
+  profile: Profile,
+  daemon: TestDaemon,
+  workspacePath: string,
+  transcriptPath: string,
+  fileBrowserLog: string,
+): Promise<void> {
+  const triggerSelector = `#session-list .folder-heading[data-cwd="${workspacePath}"] + .workspace-new-session + .workspace-menu`;
+  const trigger = await driver.find(triggerSelector);
+  await driver.execute("arguments[0].focus();", [trigger]);
+  await driver.keyPress("\uE014");
+  await driver.waitFor(async () => await driver.execute<boolean>(
+    `return !document.querySelector("#workspace-actions-menu")?.hidden &&
+      document.activeElement?.getAttribute("role") === "menuitem";`,
+  ), "keyboard opening the workspace menu and focusing its first action");
+  assert(await driver.attribute(trigger, "aria-expanded") === "true", "Workspace menu trigger did not expose its expanded state.");
+  await driver.keyPress("\uE014");
+  await driver.keyPress("\uE007");
+  const expectedUri = pathToFileURL(workspacePath).href;
+  await waitFor("the native GIO file browser to receive the workspace directory", async () => {
+    const log = await readFile(fileBrowserLog, "utf8").catch(() => "");
+    // GIO may convert a local file URI to a filename before launching the handler.
+    return log.split(/\r?\n/).some((argument) => argument === expectedUri || argument === workspacePath) ? true : false;
+  });
+  assert(await driver.attribute(trigger, "aria-expanded") === "false", "Workspace menu remained expanded after Show folder.");
+
+  const beforeArchive = (await runtimes(daemon.base)).map(({ id, pid }) => [id, pid] as [string, number | null])
+    .sort((a, b) => a[0].localeCompare(b[0]));
+  await driver.click(await driver.find(triggerSelector));
+  const archiveItem = await driver.find("#workspace-actions-menu [role='menuitem']");
+  assert(await driver.elementText(archiveItem) === "Archive workspace", "Workspace menu did not expose Archive workspace first.");
+  await driver.click(archiveItem);
+  await driver.waitFor(async () => await driver.execute<boolean>(`
+    const state = JSON.parse(localStorage.getItem("omp-desktop.sidebar.v1") || "{}");
+    const archived = Array.isArray(state.archivedWorkspaces) && state.archivedWorkspaces.includes(arguments[0]);
+    const hasFolder = Array.from(document.querySelectorAll("#session-list .folder-heading"))
+      .some((heading) => heading.dataset.cwd === arguments[0]);
+    const hasSession = Array.from(document.querySelectorAll("#session-list .row"))
+      .some((row) => row.dataset.sessionFile === arguments[1]);
+    return archived && !hasFolder && !hasSession;
+  `, [workspacePath, transcriptPath]), "archiving the workspace and hiding its session row");
+  assert(await fileExists(transcriptPath), "Workspace archive deleted its saved transcript.");
+  const archivedRemote = await waitFor("workspace archive to reach durable daemon state", async () => {
+    const response = await fetch(`${daemon.base}/api/state`, { signal: AbortSignal.timeout(5_000) });
+    if (!response.ok) return false;
+    const value: unknown = await response.json();
+    if (!isRecord(value) || !isRecord(value.state) || typeof value.state.sidebar !== "string") return false;
+    try {
+      const sidebar: unknown = JSON.parse(value.state.sidebar);
+      return isRecord(sidebar) && Array.isArray(sidebar.archivedWorkspaces) &&
+        sidebar.archivedWorkspaces.includes(workspacePath) ? true : false;
+    } catch {
+      return false;
+    }
+  });
+  assert(archivedRemote, "Workspace archive was not present in the daemon's durable sidebar state.");
+  const currentUrl = await driver.currentUrl();
+  await driver.execute(`localStorage.removeItem("omp-desktop.sidebar.v1");`);
+  await driver.navigate(currentUrl);
+  await driver.waitFor(async () => await driver.execute<boolean>(`
+    if (document.readyState !== "complete") return false;
+    const state = JSON.parse(localStorage.getItem("omp-desktop.sidebar.v1") || "{}");
+    const archived = Array.isArray(state.archivedWorkspaces) && state.archivedWorkspaces.includes(arguments[0]);
+    const hasFolder = Array.from(document.querySelectorAll("#session-list .folder-heading"))
+      .some((heading) => heading.dataset.cwd === arguments[0]);
+    const hasSession = Array.from(document.querySelectorAll("#session-list .row"))
+      .some((row) => row.dataset.sessionFile === arguments[1]);
+    return archived && !hasFolder && !hasSession;
+  `, [workspacePath, transcriptPath]), "restoring the archived workspace from daemon state after reload");
+  assert(await fileExists(transcriptPath), "Reload after workspace archive removed its saved transcript.");
+  const afterReload = (await runtimes(daemon.base)).map(({ id, pid }) => [id, pid] as [string, number | null])
+    .sort((a, b) => a[0].localeCompare(b[0]));
+  assert(JSON.stringify(afterReload) === JSON.stringify(beforeArchive),
+    "Archiving and reloading a workspace changed daemon-owned runtime ids or pids.");
+
+  await selectWorkspaceFromNativePicker(driver, profile, workspacePath);
+  await driver.waitFor(async () => await driver.execute<boolean>(`
+    const hasFolder = Array.from(document.querySelectorAll("#session-list .folder-heading"))
+      .some((heading) => heading.dataset.cwd === arguments[0]);
+    const hasSession = Array.from(document.querySelectorAll("#session-list .row"))
+      .some((row) => row.dataset.sessionFile === arguments[1]);
+    return hasFolder && hasSession;
+  `, [workspacePath, transcriptPath]), "restoring the workspace and its saved session row");
+  const afterReadd = (await runtimes(daemon.base)).map(({ id, pid }) => [id, pid] as [string, number | null])
+    .sort((a, b) => a[0].localeCompare(b[0]));
+  assert(JSON.stringify(afterReadd) === JSON.stringify(beforeArchive),
+    "Re-adding a workspace changed daemon-owned runtime ids or pids.");
+  console.log("ok - workspace menu opens the native file browser, archives durably without deleting sessions or stopping PTYs, and re-add restores it");
+}
+
+async function testWorkspaceSessionLimit(driver: WebDriver, daemon: TestDaemon): Promise<void> {
+  const cwd = join(daemon.root, "session limit fixture");
+  await mkdir(cwd, { recursive: true });
+  const paths: string[] = [];
+  for (let index = 1; index <= 7; index++) {
+    paths.push(await writeTestTranscript(daemon.root, `native-cap-${index}`, {
+      cwd, title: `native cap session ${index}`,
+    }));
+  }
+  // Closing search refreshes the index without waiting for its 30-second poll.
+  await driver.clickCss("#search-open");
+  await driver.clickCss("#search-close");
+  const selector = `.sidebar-folder:has(.folder-heading[data-cwd=${JSON.stringify(cwd)}])`;
+  const snapshot = () => driver.execute<{ paths: string[]; more: string | null }>(`
+    const folder = document.querySelector(arguments[0]);
+    return {
+      paths: Array.from(folder?.querySelectorAll(".row") ?? [], row => row.dataset.sessionFile),
+      more: folder?.querySelector(".workspace-show-more")?.textContent ?? null,
+    };
+  `, [selector]);
+  await driver.waitFor(async () => {
+    const value = await snapshot();
+    return value.paths.length === 6 && value.more === "Show more (1)";
+  }, "seven sessions to show six rows and one Show more button");
+  const capped = await snapshot();
+  assert(new Set(capped.paths).size === 6 && capped.paths.every((path) => paths.includes(path)),
+    "The capped workspace must show six distinct fixture sessions.");
+  if (process.env.OMP_DESKTOP_NATIVE_SCREENSHOT) {
+    await captureShellScreenshot(driver, process.env.OMP_DESKTOP_NATIVE_SCREENSHOT.replace(/\.png$/i, "-session-cap.png"));
+  }
+  const hidden = paths.find((path) => !capped.paths.includes(path))!;
+  await driver.clickCss("#search-open");
+  await driver.sendKeysCss("#search", "native cap session");
+  await driver.waitFor(async () => {
+    const value = await snapshot();
+    return JSON.stringify([...value.paths].sort()) === JSON.stringify([...paths].sort()) && value.more === null;
+  }, "search to expose all seven matching sessions without Show more");
+  await driver.clickCss("#search-close");
+  await driver.waitFor(async () => {
+    const value = await snapshot();
+    return value.paths.length === 6 && !value.paths.includes(hidden) && value.more === "Show more (1)";
+  }, "closing search to restore the six-session cap");
+  await driver.clickCss(`${selector} .workspace-show-more`);
+  await driver.waitFor(async () => {
+    const value = await snapshot();
+    return JSON.stringify([...value.paths].sort()) === JSON.stringify([...paths].sort()) && value.more === null;
+  }, "Show more to reveal the seventh session");
+  assert(await driver.execute<boolean>(`
+    return document.activeElement === document.querySelector(arguments[0])?.querySelectorAll(".row")[6];
+  `, [selector]), "Show more must focus the first newly revealed session.");
+  await driver.clickCss(`${selector} .folder-heading`);
+  await driver.clickCss(`${selector} .folder-heading`);
+  const expanded = await snapshot();
+  assert(JSON.stringify([...expanded.paths].sort()) === JSON.stringify([...paths].sort()) && expanded.more === null,
+    "Collapsing and reopening the folder must retain the revealed sessions.");
+  console.log("ok - workspace caps seven sessions at six, search exposes all matches, and Show more reveals the seventh with keyboard focus");
 }
 
 async function startPrivateBus(runtimeDir: string, home: string): Promise<{ address: string; child: ManagedChild; binary: string }> {
@@ -1095,6 +1325,9 @@ async function testFirstSessionAndPaneWorkload(
   daemon: TestDaemon,
   profile: Profile,
   openLog: string,
+  archiveWorkspacePath: string,
+  archiveTranscriptPath: string,
+  folderBrowserLog: string,
   screenshotPath: string,
   requireGpu: boolean,
 ): Promise<{
@@ -1109,6 +1342,7 @@ async function testFirstSessionAndPaneWorkload(
   const initialRuntimes = await runtimes(base);
   assert(initialRuntimes.length === 0, "A fresh daemon boot created a runtime before the user requested a message.");
   await verifyNativeResize(driver);
+  await selectWorkspaceFromNativePicker(driver, profile, archiveWorkspacePath);
   const beforeSessionIds = new Set(initialRuntimes.map((runtime) => runtime.id));
   await driver.clickCss("#new-session");
   const coldComposer = await driver.waitFor(async () => {
@@ -1154,18 +1388,20 @@ async function testFirstSessionAndPaneWorkload(
 
   await driver.rightClick(await driver.find("#panes .pane"));
   const firstSplitItem = await driver.waitFor(async () => {
-    const item = await driver.find(".pane-menu [role='menuitem']").catch(() => null);
+    const item = await driver.find(".pane-menu:not([hidden]) [role='menuitem']").catch(() => null);
     return item && await driver.displayed(item) ? item : false;
   }, "the first actual pane context menu");
+  assert(await driver.elementText(firstSplitItem) === "Split", "Pane context-menu action must be named Split.");
+  assert(await driver.attribute(await driver.find("#split-layout"), "aria-label") === "Split into 2×1",
+    "The toolbar must preview the side-by-side split for one pane.");
   await driver.click(firstSplitItem);
   await driver.waitFor(async () => await driver.findAll("#panes .pane").then((items) => items.length === 2), "the first pane split");
-  await driver.rightClick(await driver.find("#panes .pane"));
-  const secondSplitItem = await driver.waitFor(async () => {
-    const item = await driver.find(".pane-menu [role='menuitem']").catch(() => null);
-    return item && await driver.displayed(item) ? item : false;
-  }, "the second actual pane context menu");
-  await driver.click(secondSplitItem);
+  assert(await driver.attribute(await driver.find("#split-layout"), "aria-label") === "Split into 2×2",
+    "The toolbar must preview the grid split for two panes.");
+  await driver.clickCss("#split-layout");
   await driver.waitFor(async () => (await driver.findAll("#panes .pane")).length === 4, "the four-pane layout");
+  assert(await driver.execute<boolean>(`return document.querySelector("#split-layout").disabled;`),
+    "The toolbar split button must be disabled at four panes.");
   // Splitting creates cold panes, not agents. Start each new pane through its
   // real composer before testing native multi-runtime keyboard routing.
   const coldPaneIds = await driver.execute<string[]>(`return Array.from(document.querySelectorAll('#panes .pane'))
@@ -1261,6 +1497,7 @@ async function testFirstSessionAndPaneWorkload(
     }
   };
 
+  await driver.clickCss("#search-open");
   await driver.clearCss("#search");
   await driver.sendKeysCss("#search", "native search alpha");
   await waitForSearchState(async () => {
@@ -1273,7 +1510,7 @@ async function testFirstSessionAndPaneWorkload(
       filteredSnapshot.rows[0]!.title === "native search alpha",
     `Search returned unexpected rows: ${JSON.stringify({ before: originalSnapshot, filtered: filteredSnapshot })}`);
 
-  await driver.clearCss("#search");
+  await driver.clickCss("#search-close");
   await waitForSearchState(async () => {
     const snapshot = await searchSnapshot();
     return snapshot.query === "" && JSON.stringify(identities(snapshot.rows)) ===
@@ -1283,6 +1520,15 @@ async function testFirstSessionAndPaneWorkload(
   assert(JSON.stringify(identities(restoredSnapshot.rows)) === JSON.stringify(identities(originalSnapshot.rows)),
     `Clearing search did not restore the original session identities: ${JSON.stringify({ before: originalSnapshot, filtered: filteredSnapshot, after: restoredSnapshot })}`);
   console.log(`ok - session search filters the known transcript and restores identities; snapshots=${JSON.stringify({ before: originalSnapshot, filtered: filteredSnapshot, after: restoredSnapshot })}`);
+  await testWorkspaceFolderActions(
+    driver,
+    profile,
+    daemon,
+    archiveWorkspacePath,
+    archiveTranscriptPath,
+    folderBrowserLog,
+  );
+  await testWorkspaceSessionLimit(driver, daemon);
 
   await driver.clickCss("#new-space");
   await driver.waitFor(async () => await driver.findAll("#space-tabs [role='tab']").then((items) => items.length === 2), "the second workspace space");
@@ -1290,10 +1536,16 @@ async function testFirstSessionAndPaneWorkload(
     `return Array.from(document.querySelectorAll("#space-tabs [role='tab']"), tab => ({ id: tab.dataset.space || "", selected: tab.getAttribute("aria-selected") || "false" }));`,
   );
   assert(spaces.length === 2 && spaces[1]!.selected === "true", "The newly created space was not the displayed selection.");
-  const workspaceWithSecond = await getWorkspace(base);
+  const workspaceWithSecond = await waitFor("the selected second space to reach durable state", async () => {
+    const workspace = await getWorkspace(base);
+    return workspace.activeSpaceId === spaces[1]!.id ? workspace : false;
+  });
   assert(workspaceWithSecond.activeSpaceId === spaces[1]!.id, "Displayed space selection disagrees with the saved active-space id.");
   await driver.click(await driver.find(`#space-tabs [role='tab'][data-space="${spaces[0]!.id}"]`));
-  const workspaceBack = await getWorkspace(base);
+  const workspaceBack = await waitFor("the original space selection to reach durable state", async () => {
+    const workspace = await getWorkspace(base);
+    return workspace.activeSpaceId === spaces[0]!.id ? workspace : false;
+  });
   const selectedAfterBack = await driver.execute<string | null>(
     `return document.querySelector("#space-tabs [role='tab'][aria-selected='true']")?.dataset.space ?? null;`,
   );
@@ -2949,15 +3201,32 @@ async function runNativeSmoke(): Promise<"full" | "images-only" | "policy-only" 
         title: "native search alpha",
         firstPrompt: "fixture-only sidebar search case",
       });
+      const archiveWorkspacePath = join(daemon.root, "workspace archive fixture");
+      await mkdir(archiveWorkspacePath, { recursive: true });
+      const archiveTranscriptPath = await writeTestTranscript(daemon.root, "native-workspace-archive", {
+        title: "native workspace archive",
+        cwd: archiveWorkspacePath,
+      });
       const profile = await createProfile(scratch, "main-profile", runtimeDir);
       const openLog = await installExternalOpener(profile);
+      const folderBrowserLog = await installFolderBrowser(profile);
       profile.env.DBUS_SESSION_BUS_ADDRESS = bus.address;
       const xvfb = await startXvfb(profile);
       inputXvfb = xvfb.child;
       inputDisplay = xvfb.display;
       configureX11Input(profile, xvfb.display);
       shell = await openShell(profile, daemon.port, binary);
-      const workload = await testFirstSessionAndPaneWorkload(shell, daemon, profile, openLog, screenshotPath, requireGpu);
+      const workload = await testFirstSessionAndPaneWorkload(
+        shell,
+        daemon,
+        profile,
+        openLog,
+        archiveWorkspacePath,
+        archiveTranscriptPath,
+        folderBrowserLog,
+        screenshotPath,
+        requireGpu,
+      );
       shell = null;
       const runtimeSnapshot = await runtimes(daemon.base);
       assert(runtimeSnapshot.every((runtime) => runtime.pid !== null && runtime.alive),

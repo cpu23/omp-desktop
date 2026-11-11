@@ -2,8 +2,9 @@ import { trimSelectionHighlight } from "./selection";
 import {
   applySidebarState, onSidebarStateChange, sidebarFolderView, sidebarFolderExpanded,
   toggleSidebarFolder, sidebarWorkspaces, sidebarActiveWorkspace, selectSidebarWorkspace,
-  normalizeDirectoryPath, STORE_KEY as SIDEBAR_KEY,
+  archiveSidebarWorkspace, sidebarWorkspaceArchived, normalizeDirectoryPath, STORE_KEY as SIDEBAR_KEY,
 } from "./sidebar";
+import { showWorkspaceFolder } from "./workspace-picker";
 import { doneIndicator, workingIndicator } from "./working-indicator";
 import { CompletionTracker } from "./completion-tracker";
 import { CompletionNotifications } from "./notifications";
@@ -32,15 +33,21 @@ import {
 import { isTerminalReply, parsePasteResponse, parseRuntimesResponse, parseRuntimeOne, parseServerMessage, parseSessionList, parseStateResponse, type RuntimeInfo, type ServerMessage, type SessionSummaryLike } from "./protocol";
 
 // Sidebar preferences share the durable-save path with panes, pins and font size.
-onSidebarStateChange(() => {
+onSidebarStateChange((persist) => {
   renderSidebar();
-  queueStateSave();
+  if (persist) {
+    // A successful local retry may follow a failed initial read/cache commit.
+    // Re-read the compatible baseline before this fallback cache can publish.
+    if (stateGate === "blocked" && daemonId) void reconcileWorkspaceState();
+    else queueStateSave();
+  }
 });
 
 const statusEl = document.getElementById("status") as HTMLElement;
 const buildEl = document.getElementById("build") as HTMLElement;
 const spaceTabsEl = document.getElementById("space-tabs") as HTMLElement;
 const newSpaceEl = document.getElementById("new-space") as HTMLButtonElement;
+const splitLayoutEl = document.getElementById("split-layout") as HTMLButtonElement;
 const panesEl = document.getElementById("panes") as HTMLElement;
 const sessionListEl = document.getElementById("session-list") as HTMLElement;
 const searchEl = document.getElementById("search") as HTMLInputElement;
@@ -156,8 +163,7 @@ let stateGate: "pending" | "ready" | "blocked" = "pending";
 /** Why publishing is blocked; surfaced when a save is attempted while gated. */
 let stateGateReason = "";
 let stateGateGeneration: string | null = null;
-/** Fingerprint of the last document the daemon accepted, to skip no-op PUTs. */
-let deliveredState = "";
+let stateRestoreAttempt = 0;
 
 function savePins(): void {
   try {
@@ -187,6 +193,8 @@ type SidebarFolderRecord = {
   marker: HTMLElement;
   label: HTMLElement;
   contents: HTMLElement;
+  more: HTMLButtonElement;
+  showAllSessions: boolean;
 };
 
 const sidebarRows = new Map<string, SidebarRowRecord>();
@@ -247,7 +255,7 @@ function closeSessionMenu(): void {
 }
 function showSessionMenu(record: SidebarRowRecord, x: number, y: number): void {
   closePaneMenu();
-  closeSessionMenu();
+  closeWorkspaceMenu();
   const session = record.snapshot;
   const runtime = record.runtime;
   const item = (label: string, icon: keyof typeof SESSION_ICONS, action: () => void, disabled = false): void => {
@@ -319,6 +327,92 @@ sessionMenu.addEventListener("focusout", () => {
 });
 window.addEventListener("blur", closeSessionMenu);
 window.addEventListener("resize", closeSessionMenu);
+
+const workspaceMenu = document.createElement("div");
+workspaceMenu.id = "workspace-actions-menu";
+workspaceMenu.className = "pane-menu";
+workspaceMenu.setAttribute("role", "menu");
+workspaceMenu.hidden = true;
+document.body.append(workspaceMenu);
+let workspaceMenuAnchor: HTMLButtonElement | null = null;
+
+function closeWorkspaceMenu(restoreFocus = false): void {
+  workspaceMenu.hidden = true;
+  workspaceMenu.replaceChildren();
+  workspaceMenuAnchor?.setAttribute("aria-expanded", "false");
+  const anchor = workspaceMenuAnchor;
+  workspaceMenuAnchor = null;
+  if (restoreFocus) anchor?.focus();
+}
+
+function showWorkspaceMenu(cwd: string, anchor: HTMLButtonElement): void {
+  if (!workspaceMenu.hidden && workspaceMenuAnchor === anchor) {
+    closeWorkspaceMenu();
+    return;
+  }
+  closePaneMenu();
+  closeSessionMenu();
+  closeWorkspaceMenu();
+  workspaceMenuAnchor = anchor;
+  anchor.setAttribute("aria-expanded", "true");
+  workspaceMenu.setAttribute("aria-label", `Workspace actions for ${cwd}`);
+  const item = (label: string, action: () => void): void => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.setAttribute("role", "menuitem");
+    button.textContent = label;
+    button.addEventListener("click", action);
+    workspaceMenu.append(button);
+  };
+  item("Archive workspace", () => {
+    closeWorkspaceMenu();
+    archiveSidebarWorkspace(cwd);
+    document.querySelector<HTMLButtonElement>("#add-workspace")?.focus();
+  });
+  item("Show folder", () => {
+    closeWorkspaceMenu(true);
+    void showWorkspaceFolder(cwd).catch((error: unknown) => {
+      const detail = error instanceof Error ? error.message : String(error);
+      setStatus(`Could not open folder: ${detail}`, "warn");
+    });
+  });
+  workspaceMenu.hidden = false;
+  const rect = workspaceMenu.getBoundingClientRect();
+  const anchorRect = anchor.getBoundingClientRect();
+  const x = Math.max(0, Math.min(anchorRect.right - rect.width, innerWidth - rect.width));
+  const y = Math.max(0, Math.min(anchorRect.bottom, innerHeight - rect.height));
+  workspaceMenu.style.left = `${x}px`;
+  workspaceMenu.style.top = `${y}px`;
+  workspaceMenu.querySelector<HTMLButtonElement>('[role="menuitem"]')?.focus();
+}
+
+workspaceMenu.addEventListener("keydown", (event) => {
+  const items = [...workspaceMenu.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not(:disabled)')];
+  const index = items.indexOf(document.activeElement as HTMLButtonElement);
+  if (event.key === "Escape") {
+    event.preventDefault();
+    event.stopPropagation();
+    closeWorkspaceMenu(true);
+  } else if (event.key === "ArrowDown" || event.key === "ArrowUp" || event.key === "Home" || event.key === "End") {
+    event.preventDefault();
+    const next = event.key === "Home" ? 0
+      : event.key === "End" ? items.length - 1
+      : (index + (event.key === "ArrowDown" ? 1 : items.length - 1)) % items.length;
+    items[next]?.focus();
+  }
+});
+document.addEventListener("pointerdown", (event) => {
+  if (!(event.target instanceof Node) || workspaceMenu.contains(event.target)) return;
+  if (event.target instanceof Element && event.target.closest("button.workspace-menu") === workspaceMenuAnchor) return;
+  closeWorkspaceMenu();
+}, true);
+workspaceMenu.addEventListener("focusout", () => {
+  queueMicrotask(() => {
+    if (!workspaceMenu.contains(document.activeElement)) closeWorkspaceMenu();
+  });
+});
+window.addEventListener("blur", () => closeWorkspaceMenu());
+window.addEventListener("resize", () => closeWorkspaceMenu());
 
 function pinButton(currentSession: () => SessionSummaryLike | null): HTMLButtonElement {
   const button = document.createElement("button");
@@ -504,7 +598,6 @@ async function refreshRuntimes(options: { restore?: boolean } = {}): Promise<boo
     stateGate = "pending";
     stateGateGeneration = null;
     stateGateReason = "";
-    deliveredState = "";
     stateQueued = false;
   }
   // A new (or never-seen) generation means the pool this client knew is gone
@@ -1163,12 +1256,12 @@ class Pane {
       if (!res.ok) {
         const message = (await res.text().catch(() => "")).trim() ||
           `The session request failed (HTTP ${res.status}).`;
-        if (isCurrent()) this.#composerStatus.textContent = `${message} Your draft is preserved; submit again to retry.`;
+        if (isCurrent()) this.#composerStatus.textContent = `${message} Your draft is preserved. Check the session before submitting again.`;
         return;
       }
       const runtime = parseRuntimeOne(await res.json().catch(() => null));
       if (!runtime) {
-        if (isCurrent()) this.#composerStatus.textContent = "The daemon returned an invalid session response. Your draft is preserved; submit again to retry.";
+        if (isCurrent()) this.#composerStatus.textContent = "The daemon returned an invalid session response. Your draft is preserved. Check the session before submitting again.";
         return;
       }
       if (path && runtime.sessionFile && runtime.sessionFile !== path) {
@@ -1190,7 +1283,7 @@ class Pane {
       next.drafts = this.binding.drafts;
       this.bind(next);
     } catch {
-      if (isCurrent()) this.#composerStatus.textContent = "The daemon could not be reached; your draft is preserved. Submit again to retry.";
+      if (isCurrent()) this.#composerStatus.textContent = "The request could not be confirmed; your draft is preserved. Check the session before submitting again.";
     } finally {
       if (this.#submissions.get(identity) === submission) this.#submissions.delete(identity);
       this.#updateComposer();
@@ -1522,6 +1615,8 @@ class Pane {
   #unlockStartup(): void {
     window.clearTimeout(this.#startupTimer);
     this.#startupTimer = undefined;
+    // Bound consecutive failed attempts, not a healthy session's lifetime.
+    this.retry = 0;
     this.#rendererReady = true;
     this.#startupDiagnostic = false;
     this.#starting.hidden = true;
@@ -1897,6 +1992,10 @@ splitMenuItem.addEventListener("click", () => {
   splitLayout();
   focusedPane()?.focus();
 });
+splitLayoutEl.addEventListener("click", () => {
+  splitLayout();
+  focusedPane()?.focus();
+});
 panesEl.addEventListener("contextmenu", (event) => {
   const target = event.target instanceof Element ? event.target.closest<HTMLElement>(".pane") : null;
   const pane = target?.dataset.pane ? panes.get(target.dataset.pane) : null;
@@ -1904,9 +2003,7 @@ panesEl.addEventListener("contextmenu", (event) => {
   event.preventDefault();
   pane.focus();
   const count = leaves().length;
-  splitMenuItem.textContent = count >= MAX_PANES
-    ? "Split — maximum 4 panes"
-    : count === 1 ? "Split side by side" : "Split into 2×2";
+  splitMenuItem.textContent = "Split";
   splitMenuItem.disabled = count >= MAX_PANES;
   paneMenu.hidden = false;
   const rect = paneMenu.getBoundingClientRect();
@@ -2343,6 +2440,11 @@ function togglePaneFocus(): void {
 
 function renderLayout(preservePaneFocus = false): void {
   closePaneMenu();
+  const count = leaves().length;
+  splitLayoutEl.disabled = count >= MAX_PANES;
+  splitLayoutEl.title = count >= MAX_PANES ? "Maximum 4 panes" : count === 1 ? "Split into 2×1" : "Split into 2×2";
+  splitLayoutEl.setAttribute("aria-label", splitLayoutEl.title);
+  splitLayoutEl.innerHTML = `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M12 3v18${count === 1 ? "" : "M3 12h18"}"/></svg>`;
   if (!preservePaneFocus) expandedPaneId = null;
   const tree: LayoutNode = expandedPaneId ? { kind: "leaf", pane: expandedPaneId } : layout.tree;
   const ids = leaves(tree);
@@ -2641,6 +2743,8 @@ function reconcileChildren(container: HTMLElement, desired: HTMLElement[]): void
   }
 }
 
+const WORKSPACE_SESSION_LIMIT = 6;
+
 function folderRecord(cwd: string): SidebarFolderRecord {
   const existing = sidebarFolders.get(cwd);
   if (existing) return existing;
@@ -2669,12 +2773,35 @@ function folderRecord(cwd: string): SidebarFolderRecord {
     const pane = focusedPane();
     if (pane) void newSession(pane, true, cwd);
   });
+  const menuButton = document.createElement("button");
+  menuButton.type = "button";
+  menuButton.className = "workspace-menu";
+  menuButton.title = `Workspace actions for ${name}`;
+  menuButton.setAttribute("aria-label", menuButton.title);
+  menuButton.setAttribute("aria-haspopup", "menu");
+  menuButton.setAttribute("aria-controls", workspaceMenu.id);
+  menuButton.setAttribute("aria-expanded", "false");
+  menuButton.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg>';
+  menuButton.addEventListener("click", () => showWorkspaceMenu(cwd, menuButton));
+  menuButton.addEventListener("keydown", (event) => {
+    if (event.key !== "ArrowDown") return;
+    event.preventDefault();
+    showWorkspaceMenu(cwd, menuButton);
+  });
   const header = document.createElement("div");
   header.className = "workspace-heading";
-  header.append(heading, add);
+  header.append(heading, add, menuButton);
   const contents = document.createElement("div");
   contents.className = "folder-sessions";
   contents.id = `sidebar-folder-${++sidebarFolderSeq}`;
+  const more = document.createElement("button");
+  more.type = "button";
+  more.className = "workspace-show-more";
+  more.addEventListener("click", () => {
+    record.showAllSessions = true;
+    renderSidebar();
+    (contents.children[WORKSPACE_SESSION_LIMIT] as HTMLElement | undefined)?.focus();
+  });
   heading.setAttribute("aria-controls", contents.id);
   heading.addEventListener("click", () => {
     selectSidebarWorkspace(cwd);
@@ -2682,7 +2809,7 @@ function folderRecord(cwd: string): SidebarFolderRecord {
     heading.focus();
   });
   element.append(header, contents);
-  const record = { element, heading, marker, label, contents };
+  const record = { element, heading, marker, label, contents, more, showAllSessions: false };
   sidebarFolders.set(cwd, record);
   return record;
 }
@@ -2740,15 +2867,19 @@ function renderSidebar(): void {
     })
     : runtimes;
   // Exited transcripts belong to the same saved-session list, not a stale runtime row.
-  const visibleRuntimes = liveRuntimes.filter((runtime) =>
-    (attachable(runtime) || !runtime.sessionFile) &&
-    (!runtime.sessionFile || !archivedPaths.has(runtime.sessionFile))
-  );
+  const visibleRuntimes = liveRuntimes.filter((runtime) => {
+    const summary = runtime.sessionFile ? sessionSummary(runtime.sessionFile) : undefined;
+    const cwd = summary?.cwd ?? runtime.cwd;
+    return (attachable(runtime) || !runtime.sessionFile) &&
+      (!runtime.sessionFile || !archivedPaths.has(runtime.sessionFile)) &&
+      !sidebarWorkspaceArchived(cwd);
+  });
   const candidates = new Map(pinnedSessions.map((session) => [session.path, session]));
   for (const session of sessions) candidates.set(session.path, session);
   const recent = [...candidates.values()].filter((session) =>
     !liveFiles.has(session.path) &&
     !archivedPaths.has(session.path) &&
+    !sidebarWorkspaceArchived(session.cwd) &&
     (!query || sessionByPath.has(session.path) || `${session.title} ${session.cwd}`.toLowerCase().includes(query)),
   ).sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt) || a.path.localeCompare(b.path));
 
@@ -2797,8 +2928,9 @@ function renderSidebar(): void {
     const bActivity = Date.parse(b.snapshot?.updatedAt ?? b.runtime?.startedAt ?? "") || 0;
     return bActivity - aActivity || aPath.localeCompare(bPath);
   });
+  const visibleWorkspaces = sidebarWorkspaces().filter((cwd) => !sidebarWorkspaceArchived(cwd));
   const desiredTopLevel: HTMLElement[] = [];
-  if (rows.length === 0 && (!folderView || sidebarWorkspaces().length === 0 || query !== "")) {
+  if (rows.length === 0 && (!folderView || visibleWorkspaces.length === 0 || query !== "")) {
     if (!sidebarEmpty) {
       sidebarEmpty = document.createElement("div");
       sidebarEmpty.className = "side-empty";
@@ -2809,7 +2941,7 @@ function renderSidebar(): void {
   }
 
   const rowsByFolder = new Map<string, SidebarRowRecord[]>();
-  for (const cwd of sidebarWorkspaces()) rowsByFolder.set(cwd, []);
+  for (const cwd of visibleWorkspaces) rowsByFolder.set(cwd, []);
   for (const row of rows) {
     const cwd = row.element.dataset.cwd ?? "";
     const folderRows = rowsByFolder.get(cwd) ?? [];
@@ -2821,7 +2953,16 @@ function renderSidebar(): void {
       if (query && folderRows.length === 0 && !cwd.toLowerCase().includes(query)) continue;
       const folder = folderRecord(cwd);
       updateFolder(folder, cwd);
-      reconcileChildren(folder.contents, folderRows.map((row) => row.element));
+      const limited = !query && !folder.showAllSessions && folderRows.length > WORKSPACE_SESSION_LIMIT;
+      const visibleRows = limited ? folderRows.slice(0, WORKSPACE_SESSION_LIMIT) : folderRows;
+      const children = visibleRows.map((row) => row.element);
+      if (limited) {
+        const remaining = folderRows.length - WORKSPACE_SESSION_LIMIT;
+        folder.more.textContent = `Show more (${remaining})`;
+        folder.more.setAttribute("aria-label", `Show ${remaining} more sessions in ${cwd}`);
+        children.push(folder.more);
+      }
+      reconcileChildren(folder.contents, children);
       desiredTopLevel.push(folder.element);
     }
   } else {
@@ -2858,6 +2999,7 @@ function renderSidebar(): void {
     sidebarFolders.delete(cwd);
   }
   reconcileChildren(sessionListEl, desiredTopLevel);
+  if (workspaceMenuAnchor && !workspaceMenuAnchor.isConnected) closeWorkspaceMenu();
 }
 
 function focusedPane(): Pane | null {
@@ -2957,6 +3099,22 @@ function queueStateSave(): void {
 }
 
 async function deliverState(): Promise<void> {
+  try {
+    if (!navigator.locks?.request) throw new Error("browser locking is unavailable; use localhost or HTTPS in a supported browser");
+    // A tab can commit another sidebar edit while a previous mirror is in
+    // flight. Serialize snapshot + PUT across this origin so an older request
+    // cannot arrive last and erase the newly merged archives. Use a separate
+    // lock so network latency never blocks local sidebar persistence.
+    await navigator.locks.request("omp-desktop.workspace-state", deliverStateLocked);
+  } catch (error) {
+    const message = `workspace state not saved: ${error instanceof Error ? error.message : String(error)}`;
+    stateSaveError = message;
+    console.warn("omp-desktop:", message);
+    setStatus(message, "warn");
+  }
+}
+
+async function deliverStateLocked(): Promise<void> {
   if (stateGate !== "ready") {
     // The local cache already holds the change; publishing waits for a compatible
     // read so a partial or fallback document cannot replace the daemon's copy.
@@ -2989,13 +3147,9 @@ async function deliverState(): Promise<void> {
       deliveryGeneration = generation;
       const layoutDocument = workspaceLayoutDocument();
       const sidebar = localStorage.getItem(SIDEBAR_KEY);
-      const fingerprint = JSON.stringify({
-        layout: layoutDocument,
-        pins: pinnedSessions,
-        cellSize,
-        sidebar,
-      });
-      if (fingerprint === deliveredState && !stateSaveError) break;
+      // Do not deduplicate against this tab's last PUT: another tab may have
+      // since published a different snapshot, even when this edit returns to
+      // a value we previously saved. Storage adoption itself never queues PUTs.
       const body = JSON.stringify({
         version: STATE_VERSION,
         savedAt: new Date().toISOString(),
@@ -3030,7 +3184,6 @@ async function deliverState(): Promise<void> {
         if (daemonId !== generation || stateGateGeneration !== generation) break;
         throw new Error(detail || `HTTP ${res.status}`);
       }
-      deliveredState = fingerprint;
       if (stateSaveError) {
         stateSaveError = null;
         setStatus("workspace state saved", "ok");
@@ -3075,19 +3228,24 @@ function mergePins(local: SessionSummaryLike[], remote: SessionSummaryLike[]): S
  */
 async function reconcileWorkspaceState(): Promise<void> {
   const generation = daemonId;
+  const attempt = ++stateRestoreAttempt;
+  const isCurrent = (): boolean => daemonId === generation && stateRestoreAttempt === attempt;
   if (!generation) {
     stateGate = "blocked";
     stateGateGeneration = null;
     stateGateReason = "daemon generation is unavailable";
     return;
   }
+  stateGate = "pending";
+  stateGateGeneration = null;
   const payload = parseStateResponse(await getJson("/api/state"));
-  if (daemonId !== generation) return;
+  if (!isCurrent()) return;
   if (payload === null) {
     // Unreadable copy: publishing stays closed so fallback state cannot replace it.
     stateGate = "blocked";
     stateGateGeneration = null;
     stateGateReason = "the daemon's saved workspace could not be read";
+    setStatus(stateGateReason, "warn");
     return;
   }
   if (payload.kind === "unsupported") {
@@ -3096,6 +3254,21 @@ async function reconcileWorkspaceState(): Promise<void> {
     stateGateGeneration = null;
     stateGateReason = `the state file is version ${String(payload.version)} — update the app to read it`;
     setStatus(`workspace state file is version ${String(payload.version)} — update the app to read it`, "warn");
+    return;
+  }
+  let remoteSidebar: unknown = null;
+  if (payload.kind === "state" && typeof payload.state.sidebar === "string" && payload.state.sidebar.length <= STATE_LIMIT_BYTES) {
+    try { remoteSidebar = JSON.parse(payload.state.sidebar); } catch { /* Malformed preferences are ignored. */ }
+  }
+  // Finish the guarded sidebar transaction before adopting any other fields.
+  // Its lock may span a restart; canceled work must never mutate/cache G1 in G2.
+  const cached = await applySidebarState(remoteSidebar, isCurrent);
+  if (!isCurrent()) return;
+  if (!cached) {
+    stateGate = "blocked";
+    stateGateGeneration = null;
+    stateGateReason = "restored sidebar preferences could not be safely cached";
+    setStatus(stateGateReason, "warn");
     return;
   }
   if (payload.kind === "none") {
@@ -3120,14 +3293,6 @@ async function reconcileWorkspaceState(): Promise<void> {
     }
     const remoteCellSize = typeof state.cellSize === "number" && Number.isFinite(state.cellSize) ? state.cellSize : null;
     if (remoteCellSize !== null && localStorage.getItem(CELL_KEY) === null) setCellSize(remoteCellSize);
-    const remoteSidebar = typeof state.sidebar === "string" && state.sidebar.length <= STATE_LIMIT_BYTES ? state.sidebar : null;
-    if (remoteSidebar && localStorage.getItem(SIDEBAR_KEY) === null) {
-      try {
-        applySidebarState(JSON.parse(remoteSidebar));
-      } catch {
-        // Malformed sidebar preferences are ignored.
-      }
-    }
   }
   // Compatible read and every adopted field in memory: the next publish carries
   // the whole workspace, never a partial one.
