@@ -1395,32 +1395,18 @@ async function testFirstSessionAndPaneWorkload(
   await driver.waitFor(async () => (await driver.findAll("#panes .pane")).length === 4, "the four-pane layout");
   assert(await driver.execute<boolean>(`return document.querySelector("#split-layout").disabled;`),
     "The toolbar split button must be disabled at four panes.");
-  // Splitting creates cold panes, not agents. Start each new pane through its
-  // real composer before testing native multi-runtime keyboard routing.
-  const coldPaneIds = await driver.execute<string[]>(`return Array.from(document.querySelectorAll('#panes .pane'))
-    .filter(pane => { const composer = pane.querySelector('.cold-composer'); return composer && !composer.hidden; })
-    .map(pane => pane.dataset.pane);`);
-  assert(coldPaneIds.length === 3, "Splitting one live pane must leave exactly three cold composers.");
-  assert((await runtimes(base)).length === 1, "Splitting started an agent without explicit submission.");
-  for (const [index, paneId] of coldPaneIds.entries()) {
-    const selector = `#panes .pane[data-pane=${JSON.stringify(paneId)}] .cold-composer`;
-    const before = (await runtimes(base)).length;
-    await driver.sendKeys(await driver.find(`${selector} textarea`), `native-split-${index + 1}`);
-    assert((await runtimes(base)).length === before, "Typing a split-pane draft started an agent.");
-    await driver.sendKeys(await driver.find(`${selector} textarea`), PRIVATE_USE_ENTER);
-    const binding = await driver.waitFor(async () =>
-      (await activePaneBindings(driver, base)).find((entry) => entry.paneId === paneId) ?? false,
-    `explicit submission to bind split pane ${paneId}`);
-    await waitForRuntimePaneReady(driver, base, binding.runtimeId);
-    assert((await runtimes(base)).length === before + 1, "Split-pane submission did not create exactly one runtime.");
-  }
+  // Splitting starts each new pane as a live terminal. Wait for all four panes
+  // to bind distinct runtimes and for each PTY to be created.
   const paneBindings = await driver.waitFor(async () => {
     const bindings = await activePaneBindings(driver, base);
     return bindings.length === 4 && new Set(bindings.map((entry) => entry.runtimeId)).size === 4 ? bindings : false;
-  }, "four distinct pane/runtime bindings");
+  }, "four distinct pane/runtime bindings after split startup");
   const allRuntimes = await waitFor("all four attached pane runtimes", async () => {
     const current = await runtimes(base);
-    return paneBindings.every(({ runtimeId }) => current.some((runtime) => runtime.id === runtimeId && runtime.pid !== null)) ? current : false;
+    return current.length === 4 &&
+      paneBindings.every(({ runtimeId }) => current.some((runtime) => runtime.id === runtimeId && runtime.pid !== null))
+      ? current
+      : false;
   });
   const beforeMarkers = new Map<string, Buffer>();
   for (const runtime of allRuntimes) beforeMarkers.set(runtime.id, await readRecord(daemon.root, runtime.id));
