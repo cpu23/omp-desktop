@@ -27,6 +27,10 @@ let details: (() => SessionDetails) | null = null;
 let showTimer: number | undefined;
 let hideTimer: number | undefined;
 let refreshTimer: number | undefined;
+let pointerAnchor: HTMLElement | null = null;
+let focusedAnchor: HTMLElement | null = null;
+let pointerInsideCard = false;
+const rowDetails = new WeakMap<HTMLElement, () => SessionDetails>();
 
 function relativeActivity(value: string | null): string {
   const timestamp = value === null ? NaN : Date.parse(value);
@@ -39,7 +43,8 @@ function relativeActivity(value: string | null): string {
 }
 
 function refresh(): void {
-  if (!anchor?.isConnected || !details) { hide(); return; }
+  if (!anchor?.isConnected) { restoreConnectedFallback(); return; }
+  if (!details) { hide(); return; }
   const value = details();
   title.textContent = value.title;
   directory.textContent = value.directory;
@@ -57,7 +62,7 @@ function refresh(): void {
   card.style.top = `${Math.max(8, Math.min(row.top, innerHeight - box.height - 8))}px`;
 }
 
-function hide(): void {
+function clearCard(): void {
   window.clearTimeout(showTimer);
   window.clearTimeout(hideTimer);
   window.clearInterval(refreshTimer);
@@ -67,14 +72,70 @@ function hide(): void {
   card.hidden = true;
 }
 
+function showCardFor(row: HTMLElement, readDetails: () => SessionDetails): void {
+  window.clearTimeout(showTimer);
+  window.clearTimeout(hideTimer);
+  window.clearInterval(refreshTimer);
+  anchor?.removeAttribute("aria-describedby");
+  anchor = row;
+  details = readDetails;
+  card.hidden = false;
+  row.setAttribute("aria-describedby", card.id);
+  refresh();
+  if (anchor !== row || card.hidden) return;
+  refreshTimer = window.setInterval(refresh, 30_000);
+}
+
+function restoreConnectedFallback(): void {
+  if (pointerAnchor && !pointerAnchor.isConnected) pointerAnchor = null;
+  if (focusedAnchor && !focusedAnchor.isConnected) focusedAnchor = null;
+  const fallback = focusedAnchor ?? pointerAnchor;
+  const fallbackDetails = fallback ? rowDetails.get(fallback) : undefined;
+  if (!fallback || !fallbackDetails) { hide(); return; }
+  showCardFor(fallback, fallbackDetails);
+}
+
+function hide(): void {
+  clearCard();
+  pointerAnchor = null;
+  focusedAnchor = null;
+  pointerInsideCard = false;
+}
+
 function scheduleHide(): void {
   window.clearTimeout(showTimer);
   window.clearTimeout(hideTimer);
   hideTimer = window.setTimeout(hide, 120);
 }
 
-card.addEventListener("pointerenter", () => window.clearTimeout(hideTimer));
-card.addEventListener("pointerleave", scheduleHide);
+function scheduleHideIfInactive(deferFallback = false): void {
+  if (anchor?.isConnected && (pointerAnchor === anchor || focusedAnchor === anchor || pointerInsideCard)) {
+    window.clearTimeout(hideTimer);
+    return;
+  }
+  const fallback = focusedAnchor ?? pointerAnchor;
+  const fallbackDetails = fallback ? rowDetails.get(fallback) : undefined;
+  if (fallback && fallbackDetails) {
+    if (deferFallback) {
+      window.clearTimeout(showTimer);
+      window.clearTimeout(hideTimer);
+      hideTimer = window.setTimeout(() => scheduleHideIfInactive(), 120);
+      return;
+    }
+    showCardFor(fallback, fallbackDetails);
+    return;
+  }
+  scheduleHide();
+}
+
+card.addEventListener("pointerenter", () => {
+  pointerInsideCard = true;
+  window.clearTimeout(hideTimer);
+});
+card.addEventListener("pointerleave", () => {
+  pointerInsideCard = false;
+  scheduleHideIfInactive();
+});
 document.addEventListener("keydown", (event) => { if (event.key === "Escape") hide(); });
 document.addEventListener("pointerdown", hide, true);
 document.addEventListener("contextmenu", hide, true);
@@ -86,21 +147,36 @@ window.addEventListener("resize", hide);
 
 /** Resolve current row data only when needed; one shared card escapes sidebar clipping. */
 export function wireSessionHover(row: HTMLElement, readDetails: () => SessionDetails): void {
-  const show = (): void => {
-    hide();
+  const show = (source: "pointer" | "focus"): void => {
+    if (source === "pointer") pointerAnchor = row;
+    else focusedAnchor = row;
+    window.clearTimeout(showTimer);
+    window.clearTimeout(hideTimer);
+    window.clearInterval(refreshTimer);
+    anchor?.removeAttribute("aria-describedby");
     anchor = row;
     details = readDetails;
+    card.hidden = true;
     showTimer = window.setTimeout(() => {
+      if (anchor !== row) return;
+      if (!row.isConnected) { restoreConnectedFallback(); return; }
+      if (pointerAnchor !== row && focusedAnchor !== row) { scheduleHideIfInactive(); return; }
       card.hidden = false;
       row.setAttribute("aria-describedby", card.id);
       refresh();
       refreshTimer = window.setInterval(refresh, 30_000);
     }, 350);
   };
-  row.addEventListener("pointerenter", show);
-  row.addEventListener("pointerleave", scheduleHide);
-  row.addEventListener("focusin", show);
+  rowDetails.set(row, readDetails);
+  row.addEventListener("pointerenter", () => show("pointer"));
+  row.addEventListener("pointerleave", () => {
+    if (pointerAnchor === row) pointerAnchor = null;
+    scheduleHideIfInactive(true);
+  });
+  row.addEventListener("focusin", () => show("focus"));
   row.addEventListener("focusout", (event) => {
-    if (!(event.relatedTarget instanceof Node) || !row.contains(event.relatedTarget)) scheduleHide();
+    if (event.relatedTarget instanceof Node && row.contains(event.relatedTarget)) return;
+    if (focusedAnchor === row) focusedAnchor = null;
+    scheduleHideIfInactive();
   });
 }

@@ -40,7 +40,13 @@ async function addLocal(page: Page, path: string): Promise<void> {
   await page.getByRole("button", { name: `Workspace actions for ${path.split("/").pop()}`, exact: true }).waitFor();
 }
 async function archiveLocal(page: Page, name: string): Promise<void> {
-  await page.getByRole("button", { name: `Workspace actions for ${name}`, exact: true }).click();
+  const button = page.getByRole("button", { name: `Workspace actions for ${name}`, exact: true });
+  const box = await button.boundingBox();
+  assert.ok(box, `Workspace actions for ${name} must have a bounding box.`);
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  assert.equal(await button.evaluate((element) => getComputedStyle(element).pointerEvents), "auto",
+    `Workspace actions for ${name} must accept pointer input after heading hover.`);
+  await button.click();
   await page.getByRole("menuitem", { name: "Archive workspace", exact: true }).click();
 }
 async function chooseView(page: Page, view: string): Promise<void> {

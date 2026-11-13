@@ -535,8 +535,10 @@ async function testWorkspaceSessionLimit(driver: WebDriver, daemon: TestDaemon):
   await driver.clickCss(`${selector} .folder-heading`);
   await driver.clickCss(`${selector} .folder-heading`);
   const expanded = await snapshot();
-  assert(JSON.stringify([...expanded.paths].sort()) === JSON.stringify([...paths].sort()) && expanded.more === null,
-    "Collapsing and reopening the folder must retain the revealed sessions.");
+  assert(expanded.paths.length === 6 &&
+    JSON.stringify([...expanded.paths].sort()) === JSON.stringify([...capped.paths].sort()) &&
+    expanded.more === "Show more (1)",
+    "Collapsing and reopening the folder must restore the same six-session preview.");
   console.log("ok - workspace caps seven sessions at six, search exposes all matches, and Show more reveals the seventh with keyboard focus");
 }
 
