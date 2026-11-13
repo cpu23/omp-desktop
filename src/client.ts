@@ -6,6 +6,7 @@ import {
 } from "./sidebar";
 import { showWorkspaceFolder } from "./workspace-picker";
 import { doneIndicator, workingIndicator } from "./working-indicator";
+import { wireSessionHover } from "./session-hover";
 import { CompletionTracker } from "./completion-tracker";
 import { CompletionNotifications } from "./notifications";
 import { Terminal } from "@xterm/xterm";
@@ -2603,6 +2604,12 @@ function createSidebarRow(kind: "runtime" | "session"): SidebarRowRecord {
     actions.append(record.pin);
   }
   element.append(name, sub, actions);
+  wireSessionHover(element, () => ({
+    title: record.snapshot?.title || (record.runtime ? displayTitle(record.runtime) : "New session"),
+    directory: record.snapshot?.cwd || record.runtime?.cwd || "",
+    lastActivity: record.snapshot?.updatedAt ?? record.runtime?.lastActivity ?? record.runtime?.startedAt ?? null,
+    costUsd: record.snapshot?.costUsd ?? null,
+  }));
   element.addEventListener("contextmenu", (event) => {
     event.preventDefault();
     showSessionMenu(record, event.clientX, event.clientY);
@@ -2630,7 +2637,7 @@ function createSidebarRow(kind: "runtime" | "session"): SidebarRowRecord {
 function updateSidebarRowName(
   record: SidebarRowRecord,
   title: string,
-  indicator: "working" | "done" | "none",
+  indicator: "attention" | "working" | "done" | "none",
 ): void {
   const key = `${indicator}\u0000${title}`;
   if (record.nameKey === key) return;
@@ -2645,6 +2652,13 @@ function updateSidebarRowName(
   label.textContent = title;
   record.name.append(label);
   if (indicator === "done") record.name.append(doneIndicator());
+  if (indicator === "attention") {
+    const attention = document.createElement("span");
+    attention.className = "row-attention";
+    attention.setAttribute("role", "img");
+    attention.setAttribute("aria-label", "Needs attention");
+    record.name.append(attention);
+  }
 }
 
 function updateSidebarRowSub(record: SidebarRowRecord, key: string, text: string): void {
@@ -2676,17 +2690,18 @@ function updateRuntimeSidebarRow(
   if (record.element.dataset.cwd !== workspace) record.element.dataset.cwd = workspace;
   const state = !daemonUp ? "Connection unavailable" : !attachable(runtime) ? "Saved · loads on request"
     : runtime.status === "starting" ? "Starting"
+    : runtime.presentation?.pendingAction ? "Needs attention"
     : runtime.presentation?.agentActive ? "Working" : runtime.alive ? "Running" : "Starting";
   record.element.dataset.state = state;
-  const rowTitle = `${title}\n${state}\n${cwd}\n${runtime.sessionFile ?? "(session file not known yet)"}`;
-  if (record.element.title !== rowTitle) record.element.title = rowTitle;
   const accent = runtimeAccent(runtime);
   if (record.element.style.getPropertyValue("--row-accent") !== accent) {
     record.element.style.setProperty("--row-accent", accent);
   }
   const presentation = runtime.presentation;
   const indicator = daemonUp && runtime.status !== "starting" && runtime.alive && presentation
-    ? presentation.agentActive
+    ? presentation.pendingAction
+      ? "attention"
+      : presentation.agentActive
       ? "working"
       : presentation.completion &&
           acknowledgedCompletions.get(runtime.id) !== presentation.completion.identity
@@ -2714,8 +2729,6 @@ function updateRecentSidebarRow(
   const workspace = normalizeDirectoryPath(session.cwd) ?? session.cwd;
   if (record.element.dataset.cwd !== workspace) record.element.dataset.cwd = workspace;
   record.element.dataset.state = "Saved";
-  const rowTitle = `${session.title}\nSaved · loads on request\n${session.cwd}\n${session.path}`;
-  if (record.element.title !== rowTitle) record.element.title = rowTitle;
   const title = workspaceView && (!session.title || session.title === session.cwd) ? "New session" : session.title || session.cwd;
   updateSidebarRowName(record, title, "none");
   const cwd = workspaceView ? "" : session.cwd.replace(/^\/home\/[^/]+/, "~") || "/";

@@ -53,6 +53,8 @@ from your application menu; the daemon above must remain running.
   through the system chooser, starting at your home folder. Empty workspaces remain available after a reload.
 - Running and saved sessions share one list, pinned first then newest conversation activity. Workspace rows
   show titles without repeating their directory; working and unread-completion indicators remain visible.
+  Orange dots mean **Needs attention** (approval, question, plan review, or dialog); green dots remain finished-turn indicators.
+  Hover or keyboard-focus a session for its full title, directory, relative last conversation activity, and recorded USD cost.
 - Use **+** beside a workspace to start a live OMP session there, or select a workspace and use the header **+**.
   The workspace button appears only on heading hover or keyboard focus.
   Workspace action dots also appear only on hover or keyboard focus; their menu includes archive and folder icons.
