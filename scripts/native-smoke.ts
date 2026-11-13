@@ -1385,16 +1385,25 @@ async function testFirstSessionAndPaneWorkload(
     return item && await driver.displayed(item) ? item : false;
   }, "the first actual pane context menu");
   assert(await driver.elementText(firstSplitItem) === "Split", "Pane context-menu action must be named Split.");
-  assert(await driver.attribute(await driver.find("#split-layout"), "aria-label") === "Split into 2×1",
-    "The toolbar must preview the side-by-side split for one pane.");
   await driver.click(firstSplitItem);
   await driver.waitFor(async () => await driver.findAll("#panes .pane").then((items) => items.length === 2), "the first pane split");
-  assert(await driver.attribute(await driver.find("#split-layout"), "aria-label") === "Split into 2×2",
-    "The toolbar must preview the grid split for two panes.");
-  await driver.clickCss("#split-layout");
+  await driver.rightClick(await driver.find("#panes .pane"));
+  const secondSplitItem = await driver.waitFor(async () => {
+    const item = await driver.find(".pane-menu:not([hidden]) [role='menuitem']").catch(() => null);
+    return item && await driver.displayed(item) ? item : false;
+  }, "the pane context menu for the second split");
+  assert(await driver.elementText(secondSplitItem) === "Split", "Pane context-menu action must be named Split.");
+  await driver.click(secondSplitItem);
   await driver.waitFor(async () => (await driver.findAll("#panes .pane")).length === 4, "the four-pane layout");
-  assert(await driver.execute<boolean>(`return document.querySelector("#split-layout").disabled;`),
-    "The toolbar split button must be disabled at four panes.");
+  await driver.rightClick(await driver.find("#panes .pane"));
+  const disabledSplitItem = await driver.waitFor(async () => {
+    const item = await driver.find(".pane-menu:not([hidden]) [role='menuitem']").catch(() => null);
+    return item && await driver.displayed(item) ? item : false;
+  }, "the pane context menu at four panes");
+  assert(await driver.elementText(disabledSplitItem) === "Split", "Pane context-menu action must be named Split.");
+  assert(await driver.execute<boolean>(
+    `return document.querySelector(".pane-menu:not([hidden]) [role='menuitem']").disabled;`,
+  ), "The pane context-menu split action must be disabled at four panes.");
   // Splitting starts each new pane as a live terminal. Wait for all four panes
   // to bind distinct runtimes and for each PTY to be created.
   const paneBindings = await driver.waitFor(async () => {
@@ -1510,18 +1519,18 @@ async function testFirstSessionAndPaneWorkload(
   await testWorkspaceSessionLimit(driver, daemon);
 
   await driver.clickCss("#new-space");
-  await driver.waitFor(async () => await driver.findAll("#space-tabs [role='tab']").then((items) => items.length === 2), "the second workspace space");
+  await driver.waitFor(async () => await driver.findAll("#space-tabs [role='tab']").then((items) => items.length === 2), "the second workspace tab");
   const spaces = await driver.execute<Array<{ id: string; selected: string }>>(
     `return Array.from(document.querySelectorAll("#space-tabs [role='tab']"), tab => ({ id: tab.dataset.space || "", selected: tab.getAttribute("aria-selected") || "false" }));`,
   );
-  assert(spaces.length === 2 && spaces[1]!.selected === "true", "The newly created space was not the displayed selection.");
-  const workspaceWithSecond = await waitFor("the selected second space to reach durable state", async () => {
+  assert(spaces.length === 2 && spaces[1]!.selected === "true", "The newly created tab was not the displayed selection.");
+  const workspaceWithSecond = await waitFor("the selected second tab to reach durable state", async () => {
     const workspace = await getWorkspace(base);
     return workspace.activeSpaceId === spaces[1]!.id ? workspace : false;
   });
-  assert(workspaceWithSecond.activeSpaceId === spaces[1]!.id, "Displayed space selection disagrees with the saved active-space id.");
+  assert(workspaceWithSecond.activeSpaceId === spaces[1]!.id, "Displayed tab selection disagrees with the saved active-space id.");
   await driver.click(await driver.find(`#space-tabs [role='tab'][data-space="${spaces[0]!.id}"]`));
-  const workspaceBack = await waitFor("the original space selection to reach durable state", async () => {
+  const workspaceBack = await waitFor("the original tab selection to reach durable state", async () => {
     const workspace = await getWorkspace(base);
     return workspace.activeSpaceId === spaces[0]!.id ? workspace : false;
   });
@@ -1529,13 +1538,13 @@ async function testFirstSessionAndPaneWorkload(
     `return document.querySelector("#space-tabs [role='tab'][aria-selected='true']")?.dataset.space ?? null;`,
   );
   assert(selectedAfterBack === spaces[0]!.id && workspaceBack.activeSpaceId === spaces[0]!.id,
-    "Space selection and durable active-space id diverged after switching back.");
+    "Tab selection and durable active-space id diverged after switching back.");
   const bindingsAfterSwitch = await activePaneBindings(driver, base);
   assert(bindingsAfterSwitch.length === 4 && new Set(bindingsAfterSwitch.map((item) => item.runtimeId)).size === 4,
-    "Returning to the original space did not preserve all four pane/runtime bindings.");
+    "Returning to the original tab did not preserve all four pane/runtime bindings.");
   await testClipboardAndFileDrop(profile, daemon, shell);
   await testNavigationPolicy(shell, daemon, openLog);
-  console.log("ok - space controls, visible selection, and daemon-saved pane/runtime bindings agree");
+  console.log("ok - tab controls, visible selection, and daemon-saved pane/runtime bindings agree");
 
   const paneToClose = paneBindings[2]!;
   const runtimeCountBeforeClose = (await runtimes(base)).length;
@@ -1705,11 +1714,11 @@ async function verifyPersistentNormalProfileAndNotifications(
     let destinationSpaceId: string;
     if (alternateSpace) {
       const alternateIndex = originalWorkspace.spaces.indexOf(alternateSpace) + 1;
-      const tabName = `Space ${alternateIndex}`;
+      const tabName = `Tab ${alternateIndex}`;
       const alternateTab = walkAccessibilityTree(initialTree).find((node) =>
         node.role.toLowerCase() === "page tab" && node.name === tabName,
       );
-      assert(alternateTab, `Saved live-bound alternate space ${tabName} has no accessible tab.`);
+      assert(alternateTab, `Saved live-bound alternate tab ${tabName} has no accessible tab.`);
       clickAccessible(shell, alternateTab);
       await waitForAccessibleTree(shell, "real X11 click to select the existing live-bound space tab", (tree) =>
         walkAccessibilityTree(tree).some((node) =>
@@ -1717,14 +1726,14 @@ async function verifyPersistentNormalProfileAndNotifications(
         ));
       destinationSpaceId = alternateSpace.id;
     } else {
-      const newSpace = accessibleButton(initialTree, "New space");
-      if (!newSpace) throw new Error(`Normal GTK space control is missing from AT-SPI:\n${normalTreeSummary(initialTree)}`);
-      clickAccessible(shell, newSpace);
-      await waitForAccessibleTree(shell, "real X11 click to add and select a native GTK space tab", (tree) => {
+      const newTab = accessibleButton(initialTree, "New tab");
+      if (!newTab) throw new Error(`Normal GTK New tab control is missing from AT-SPI:\n${normalTreeSummary(initialTree)}`);
+      clickAccessible(shell, newTab);
+      await waitForAccessibleTree(shell, "real X11 click to add and select a native GTK tab", (tree) => {
         const tabs = walkAccessibilityTree(tree).filter((node) => node.role.toLowerCase() === "page tab");
         return tabs.length === originalWorkspace.spaces.length + 1 && tabs.some((node) => node.states.includes("selected"));
       });
-      const createdWorkspace = await waitFor("normal GTK New space control to activate an empty space", async () => {
+      const createdWorkspace = await waitFor("normal GTK New tab control to activate an empty tab", async () => {
         const workspace = await getWorkspace(daemon.base);
         return workspace.activeSpaceId !== originalWorkspace.activeSpaceId &&
           workspace.spaces.length === originalWorkspace.spaces.length + 1 ? workspace : false;
