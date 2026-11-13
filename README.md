@@ -1,7 +1,7 @@
 # OMP Desktop
 
 Use [OMP](https://omp.sh) coding sessions in a browser or native desktop window. Linux uses a GTK4/WebKitGTK 6
-shell; macOS and Windows retain Tauri. Organize chats into spaces with up to four terminal panes; switch between
+shell; macOS and Windows retain Tauri. Organize chats into tabs, each with up to four terminal panes; switch between
 live and saved sessions. Closing a pane or window does not stop its session.
 
 ![OMP Desktop workspace with an illustrative saved release-review conversation](docs/images/workspace-v0.1.5.png)
@@ -29,10 +29,11 @@ from your application menu; the daemon above must remain running.
 
 > The desktop API has no authentication. Keep it on loopback. Setup does not change your OMP configuration.
 
-## Spaces and files
+## Tabs and files
 
-- Click **+** to add a space. Drag a pane or sidebar session onto another space's tab to move/open it there.
-- Drag a space tab left or right to reorder spaces. The active space stays selected, and the order is saved across restarts.
+- Click **+** to add a tab. The compact tab bar keeps the **+** background transparent until hover or keyboard focus.
+- Drag a pane or sidebar session onto another tab to move/open it there. Drag tabs left or right to reorder; the active
+  tab stays selected, and the order is saved across restarts.
 - Drop files onto a pane to insert their paths without submitting. Native drops preserve original paths for all
   file types; file contents are not uploaded.
 - Closing a pane only detaches its view. Output continues in the daemon; use the sidebar stop action to end a
@@ -52,8 +53,13 @@ from your application menu; the daemon above must remain running.
   through the system chooser, starting at your home folder. Empty workspaces remain available after a reload.
 - Running and saved sessions share one list, pinned first then newest conversation activity. Workspace rows
   show titles without repeating their directory; working and unread-completion indicators remain visible.
+  Orange dots mean **Needs attention** (approval, question, plan review, or dialog); green dots remain finished-turn indicators.
+  Hover or keyboard-focus a session for its full title, directory, relative last conversation activity, and recorded USD cost.
 - Use **+** beside a workspace to start a live OMP session there, or select a workspace and use the header **+**.
   The workspace button appears only on heading hover or keyboard focus.
+  Workspace action dots also appear only on hover or keyboard focus; their menu includes archive and folder icons.
+  Session pin/stop controls overlay the title on an opaque hover background instead of reserving title space.
+  **Show more** expands the six-session preview. It resets when the workspace is collapsed or the app is reloaded.
   Each submitted request accepts at most 16 unique image attachments and 32 MiB of image data in total; repeated paths are encoded once.
 - Opening a running session reattaches; opening a saved one reads its history without loading an agent.
   Opening a saved session or clicking its pane focuses the draft. **Enter** creates or resumes the agent;
@@ -70,6 +76,8 @@ from your application menu; the daemon above must remain running.
 - Right-click a session for an icon menu: **Edit title**, **Pin/Unpin**, **Unload session**, and **Archive**.
   Unload stops the runtime while preserving its transcript. Archive stops the runtime and persistently hides the session from the sidebar without deleting its transcript.
   Archived sessions cannot be resumed through Desktop, including from an existing pane; their transcript files remain on disk.
+  Action menus use consistently sized outline icons and spaced, rounded rows. The top-right split-layout button has been
+  removed; the pane's right-click menu still shows the split-layout icon for **Split**.
 - Press **Ctrl+Shift+E** (macOS browser: **⌘⇧E**) to cycle split layouts. Press **Ctrl+Shift+F** (**⌘⇧F**) to
   expand the selected pane; press again to restore the split without restarting its session.
 - Open the gear beside search for Appearance, Notifications, Sessions, and grouped Keyboard shortcuts.
@@ -84,8 +92,8 @@ from your application menu; the daemon above must remain running.
 
 ## v0.1.5
 
-- Keep app shortcuts active in saved-session draft composers, so Alt+1–9 still switches spaces after closing or opening tabs.
-  `bun run scripts/space-hotkeys-smoke.ts` checks space renumbering, draft retention and editor isolation in Chromium.
+- Keep app shortcuts active in saved-session draft composers, so Alt+1–9 still selects tabs after tabs are closed or opened.
+  `bun run scripts/space-hotkeys-smoke.ts` checks tab renumbering, draft retention and editor isolation in Chromium.
 - Keep terminal Ctrl+C from exiting OMP: map an unselected Ctrl+C to Escape and preserve selection copying.
 - Gate session input on real terminal readiness rather than process creation or a timeout. Preserve failed cold
   drafts even if initialization finishes later, and disable unsupported Tern native rendering to avoid its fallback animation race.

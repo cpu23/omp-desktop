@@ -14,6 +14,7 @@
     "app:install": "bun run app:build && bun run scripts/install-app.ts",
     "smoke": "bun run scripts/smoke.ts",
     "smoke:sidebar": "bun run scripts/sidebar-smoke.ts",
+    "smoke:session-hover": "bun run scripts/session-hover-smoke.ts",
     "smoke:images": "bun run scripts/image-smoke.ts",
     "smoke:native": "bun scripts/native-smoke.ts",
     "release:check": "bun run scripts/release-check.ts",

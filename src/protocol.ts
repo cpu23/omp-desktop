@@ -26,6 +26,8 @@ export type RuntimePresentation = {
   agentActive: boolean;
   /** Last finished turn of the currently observed session; null when none is known. */
   completion: { identity: string; completedAt: number } | null;
+  /** An outstanding user interaction from the extension's lightweight status. */
+  pendingAction?: { id: string; kind: "approval" | "ask" | "plan" | "dialog"; title: string };
 };
 
 export type RuntimeInfo = {
@@ -163,7 +165,14 @@ export function parsePresentation(value: unknown): RuntimePresentation | null {
       completion = { identity, completedAt };
     }
   }
-  return { accent, agentActive: value.agentActive, completion };
+  const action = value.pendingAction;
+  const pendingAction: RuntimePresentation["pendingAction"] = isRecord(action) &&
+    typeof action.id === "string" && action.id.length > 0 &&
+    (action.kind === "approval" || action.kind === "ask" || action.kind === "plan" || action.kind === "dialog") &&
+    typeof action.title === "string"
+    ? { id: action.id, kind: action.kind, title: action.title }
+    : undefined;
+  return { accent, agentActive: value.agentActive, completion, ...(pendingAction ? { pendingAction } : {}) };
 }
 
 /**
