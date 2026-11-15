@@ -4,7 +4,9 @@ Use [OMP](https://omp.sh) coding sessions in a browser or native desktop window.
 shell; macOS and Windows retain Tauri. Organize chats into spaces with up to four terminal panes; switch between
 live and saved sessions. Closing a pane or window does not stop its session.
 
-![OMP Desktop workspace with an illustrative saved release-review conversation](docs/images/workspace-v0.1.5.png)
+![OMP Desktop showing three workspaces, six demo sessions, three tabs, and a two-pane split with GPT-6 Luna conversations](docs/images/workspace-split-luna.png)
+
+Captured from the shared browser client at 3200 × 2000 using its DOM renderer fallback; demo conversations generated with GPT-6 Luna.
 
 ## Requirements
 
