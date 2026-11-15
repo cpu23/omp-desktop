@@ -6,8 +6,6 @@ live and saved sessions. Closing a pane or window does not stop its session.
 
 ![OMP Desktop showing three workspaces, six demo sessions, three tabs, and a two-pane split with GPT-6 Luna conversations](docs/images/workspace-split-luna.png)
 
-Captured from the shared browser client at 3200 × 2000 using its DOM renderer fallback; demo conversations generated with GPT-6 Luna.
-
 ## Requirements
 
 - Bun 1.3+, Git and OMP 18.13.1+ on `PATH`; run `omp` once to complete provider setup.
