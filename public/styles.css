@@ -116,7 +116,7 @@ select:focus-visible {
 
 .space-bar {
   display: flex;
-  flex: 0 0 38px;
+  flex: 0 0 30px;
   align-items: stretch;
   gap: 6px;
   padding: 4px 8px 0;
@@ -218,6 +218,9 @@ select:focus-visible {
   min-width: 32px;
   padding: 0 10px;
   font-size: 16px;
+  background: transparent;
+  border-color: transparent;
+  border-radius: 6px;
 }
 
 .space-tab:hover,
@@ -225,6 +228,11 @@ select:focus-visible {
   color: var(--text);
   border-color: var(--dim);
 }
+#new-space:hover,
+#new-space:focus-visible {
+  background: var(--panel-soft);
+}
+
 
 #panes {
   flex: 1;
@@ -300,8 +308,6 @@ select:focus-visible {
   cursor: pointer;
 }
 #search-close:hover { color: var(--text); }
-#split-layout { margin-left: auto; }
-#split-layout:disabled { cursor: default; opacity: 0.45; }
 
 #sidebar-title {
   flex: 1 1 auto;
@@ -448,7 +454,6 @@ select:focus-visible {
   pointer-events: auto;
 }
 
-.workspace-menu { opacity: 1; pointer-events: auto; }
 .workspace-menu:hover,
 .workspace-new-session:hover {
   background: var(--panel-soft);
@@ -489,6 +494,10 @@ select:focus-visible {
 
 .folder-heading.active {
   color: var(--accent);
+}
+
+.folder-marker {
+  color: var(--dim);
 }
 
 .folder-label {
@@ -1038,8 +1047,8 @@ body.session-dragging * {
 }
 
 .folder-sessions .row {
-  grid-template-columns: minmax(0, 1fr) auto;
-  grid-template-areas: "name actions";
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: "name";
   align-content: center;
   gap: 6px;
   flex: 0 0 34px;
@@ -1052,10 +1061,9 @@ body.session-dragging * {
 }
 
 .folder-sessions .row .row-actions {
-  position: static;
-  grid-area: actions;
-  justify-self: end;
-  background: transparent;
+  top: 50%;
+  right: 4px;
+  transform: translateY(-50%);
 }
 
 .folder-sessions .row .row-actions button {
@@ -1198,12 +1206,56 @@ body.session-dragging * {
   animation-play-state: paused;
 }
 
+.row-attention,
 .row-done {
   flex: 0 0 6px;
   width: 6px;
   height: 6px;
   border-radius: 50%;
   background: var(--success);
+}
+
+.row-attention {
+  background: var(--warn);
+}
+
+.session-hover-card {
+  position: fixed;
+  z-index: 90;
+  width: max-content;
+  max-width: min(360px, calc(100vw - 16px));
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel-raised);
+  color: var(--text);
+  box-shadow: 0 6px 24px #0008;
+  font: 12px/1.5 var(--mono);
+  overflow-wrap: anywhere;
+}
+
+.session-hover-card[hidden] { display: none; }
+
+.session-hover-title {
+  font-weight: 700;
+}
+
+.session-hover-directory {
+  margin-top: 5px;
+  color: var(--muted);
+}
+
+.session-hover-metadata {
+  display: flex;
+  justify-content: space-between;
+  gap: 24px;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 11px;
 }
 
 .row .sub {
@@ -1471,11 +1523,6 @@ body.session-dragging * {
   flex-shrink: 0;
   gap: 3px;
 }
-.session-menu button {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
 .session-menu input {
   width: min(320px, 70vw);
   margin: 4px;
@@ -1484,26 +1531,35 @@ body.session-dragging * {
 .pane-menu {
   position: fixed;
   z-index: 100;
-  padding: 4px;
+  padding: 6px;
   max-width: 100vw;
   background: var(--panel-raised);
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: 12px;
   box-shadow: 0 4px 16px #0008;
 }
 
 .pane-menu button {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 10px;
   width: 100%;
-  padding: 8px 12px;
+  min-height: 38px;
+  padding: 9px 10px;
   border: 0;
-  border-radius: 3px;
+  border-radius: 6px;
   background: transparent;
   color: var(--text);
-  font: 12px var(--mono);
+  font: 14px/20px system-ui, sans-serif;
   text-align: left;
   cursor: pointer;
 }
+.pane-menu button svg {
+  flex: 0 0 16px;
+  width: 16px;
+  height: 16px;
+}
+
 
 .pane-menu button:hover:not(:disabled),
 .pane-menu button:focus-visible {

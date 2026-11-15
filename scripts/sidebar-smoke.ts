@@ -95,8 +95,17 @@ async function add(page: Page, path: string): Promise<void> {
   await page.getByRole("button", { name: `Workspace actions for ${path.split("/").pop()}`, exact: true }).waitFor();
   await mirrored(page);
 }
+async function openWorkspaceMenu(page: Page, name: string): Promise<void> {
+  const button = page.getByRole("button", { name: `Workspace actions for ${name}`, exact: true });
+  const box = await button.boundingBox();
+  assert.ok(box, `Workspace actions for ${name} must have a bounding box.`);
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  assert.equal(await button.evaluate((element) => getComputedStyle(element).pointerEvents), "auto",
+    `Workspace actions for ${name} must accept pointer input after heading hover.`);
+  await button.click();
+}
 async function archive(page: Page, name: string): Promise<void> {
-  await page.getByRole("button", { name: `Workspace actions for ${name}`, exact: true }).click();
+  await openWorkspaceMenu(page, name);
   await page.getByRole("menuitem", { name: "Archive workspace", exact: true }).click();
   await mirrored(page);
 }
@@ -210,7 +219,7 @@ async function sequentialRegressions(): Promise<void> {
   for (const [reads, writes] of [[false, true], [true, true], [true, false]] as const) {
     await add(a, alpha);
     await faultStorage(a, reads, writes);
-    await a.getByRole("button", { name: "Workspace actions for alpha", exact: true }).click();
+    await openWorkspaceMenu(a, "alpha");
     await a.getByRole("menuitem", { name: "Archive workspace", exact: true }).click();
     await add(b, beta);
     await a.locator("#sidebar-resizer").press("ArrowRight");
@@ -221,7 +230,7 @@ async function sequentialRegressions(): Promise<void> {
     await archive(b, "beta");
     await a.locator("#sidebar-resizer").press("ArrowLeft");
     assert.equal(await visible(a, "alpha"), true);
-    await a.getByRole("button", { name: "Workspace actions for alpha", exact: true }).click();
+    await openWorkspaceMenu(a, "alpha");
     await a.getByRole("menuitem", { name: "Archive workspace", exact: true }).click();
     await a.evaluate(() => window.restoreSidebarStorage!());
     await resize(a);
@@ -277,7 +286,7 @@ try {
       await release.promise;
       await route.fulfill({ status: 200, body: "released" });
     });
-    await a.getByRole("button", { name: "Workspace actions for alpha", exact: true }).click();
+    await openWorkspaceMenu(a, "alpha");
     await a.evaluate((key) => {
       const get = Storage.prototype.getItem;
       Storage.prototype.getItem = function (name) {
@@ -295,7 +304,7 @@ try {
     try {
       await Promise.race([entered.promise, Bun.sleep(10_000).then(() => { throw new Error("read barrier not reached"); })]);
       const writes = await b.evaluate(() => window.sidebarTest.writes);
-      await b.getByRole("button", { name: "Workspace actions for beta", exact: true }).click();
+      await openWorkspaceMenu(b, "beta");
       await b.getByRole("menuitem", { name: "Archive workspace", exact: true }).click();
       await waitFor(async () => b.evaluate(async (writes) => {
         const locks = await navigator.locks.query();
@@ -335,7 +344,7 @@ try {
     await waitFor(() => b.evaluate(() => !!window.releaseSidebarLock), "test lock holder");
     try {
       for (const page of [a, b]) {
-        await page.getByRole("button", { name: "Workspace actions for alpha", exact: true }).click();
+        await openWorkspaceMenu(page, "alpha");
         await page.getByRole("menuitem", { name: "Archive workspace", exact: true }).click();
       }
       // The last re-add must remain last even though A already has an older
@@ -368,11 +377,11 @@ try {
       }
       await route.continue();
     });
-    await a.getByRole("button", { name: "Workspace actions for alpha", exact: true }).click();
+    await openWorkspaceMenu(a, "alpha");
     const archiveA = a.getByRole("menuitem", { name: "Archive workspace", exact: true }).click();
     try {
       await Promise.race([entered.promise, Bun.sleep(10_000).then(() => { throw new Error("PUT barrier not reached"); })]);
-      await b.getByRole("button", { name: "Workspace actions for beta", exact: true }).click();
+      await openWorkspaceMenu(b, "beta");
       await b.getByRole("menuitem", { name: "Archive workspace", exact: true }).click();
       await waitFor(async () => (await local(b)).archivedWorkspaces.length === 2, "local commit while the older PUT is held");
       await waitFor(async () => b.evaluate(async () => {
@@ -400,7 +409,7 @@ try {
         } });
         window.restoreSidebarLocks = () => { Object.defineProperty(navigator, "locks", { configurable: true, value: locks }); };
       }, failure);
-      await a.getByRole("button", { name: "Workspace actions for alpha", exact: true }).click();
+      await openWorkspaceMenu(a, "alpha");
       await a.getByRole("menuitem", { name: "Archive workspace", exact: true }).click();
       await a.locator("#workspace-picker-status").filter({ hasText: "only kept in this window" }).waitFor();
       assert.equal(await visible(a, "alpha"), false);

@@ -12,15 +12,15 @@ export const HOTKEY_ACTIONS = [
   { id: "splitLayout", label: "Split layout", defaultValue: "Ctrl+Shift+E; Meta+Shift+E" },
   { id: "closePane", label: "Close focused pane", defaultValue: "Ctrl+Shift+X; Meta+Shift+X" },
   { id: "togglePaneFocus", label: "Toggle pane focus", defaultValue: "Ctrl+Shift+F; Meta+Shift+F" },
-  { id: "selectSpace1", label: "Select space 1", defaultValue: "Alt+1" },
-  { id: "selectSpace2", label: "Select space 2", defaultValue: "Alt+2" },
-  { id: "selectSpace3", label: "Select space 3", defaultValue: "Alt+3" },
-  { id: "selectSpace4", label: "Select space 4", defaultValue: "Alt+4" },
-  { id: "selectSpace5", label: "Select space 5", defaultValue: "Alt+5" },
-  { id: "selectSpace6", label: "Select space 6", defaultValue: "Alt+6" },
-  { id: "selectSpace7", label: "Select space 7", defaultValue: "Alt+7" },
-  { id: "selectSpace8", label: "Select space 8", defaultValue: "Alt+8" },
-  { id: "selectSpace9", label: "Select space 9", defaultValue: "Alt+9" },
+  { id: "selectSpace1", label: "Select tab 1", defaultValue: "Alt+1" },
+  { id: "selectSpace2", label: "Select tab 2", defaultValue: "Alt+2" },
+  { id: "selectSpace3", label: "Select tab 3", defaultValue: "Alt+3" },
+  { id: "selectSpace4", label: "Select tab 4", defaultValue: "Alt+4" },
+  { id: "selectSpace5", label: "Select tab 5", defaultValue: "Alt+5" },
+  { id: "selectSpace6", label: "Select tab 6", defaultValue: "Alt+6" },
+  { id: "selectSpace7", label: "Select tab 7", defaultValue: "Alt+7" },
+  { id: "selectSpace8", label: "Select tab 8", defaultValue: "Alt+8" },
+  { id: "selectSpace9", label: "Select tab 9", defaultValue: "Alt+9" },
 ] as const;
 
 export type HotkeyAction = (typeof HOTKEY_ACTIONS)[number]["id"];
@@ -393,7 +393,7 @@ export function initializeHotkeys(runAction: (action: HotkeyAction) => void): vo
 
   if (list) {
     const groups = new Map<string, HTMLElement>();
-    for (const label of ["Panes", "Spaces", "Terminal text"]) {
+    for (const label of ["Panes", "Tabs", "Terminal text"]) {
       const group = document.createElement("details");
       group.className = "shortcut-group";
       group.open = label === "Panes";
@@ -432,7 +432,7 @@ export function initializeHotkeys(runAction: (action: HotkeyAction) => void): vo
       });
       editor.append(input, clear);
       row.append(labelElement, editor);
-      const group = id.startsWith("font") ? "Terminal text" : id.startsWith("selectSpace") ? "Spaces" : "Panes";
+      const group = id.startsWith("font") ? "Terminal text" : id.startsWith("selectSpace") ? "Tabs" : "Panes";
       groups.get(group)!.append(row);
       inputs.set(id, input);
     }

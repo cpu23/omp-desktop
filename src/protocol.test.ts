@@ -101,6 +101,27 @@ describe("runtime presentation parsing", () => {
     }
   });
 
+  test("pending user interactions survive parsing without losing completion state", () => {
+    for (const kind of ["approval", "ask", "plan", "dialog"] as const) {
+      const pendingAction = { id: "interaction-1", kind, title: "Review required" };
+      const completion = { identity: "gen:1", completedAt: 1000 };
+      const parsed = parseRuntimeInfo(runtime({
+        presentation: { agentActive: true, pendingAction, completion },
+      }));
+      expect(parsed?.presentation?.pendingAction).toEqual(pendingAction);
+      expect(parsed?.presentation?.completion).toEqual(completion);
+    }
+  });
+
+  test("invalid pending actions cannot create attention state or discard valid activity", () => {
+    for (const pendingAction of [null, {}, { id: "", kind: "ask", title: "Question" },
+      { id: "a", kind: "unknown", title: "Question" }, { id: "a", kind: "approval" }]) {
+      const parsed = parseRuntimeInfo(runtime({ presentation: { agentActive: true, pendingAction } }));
+      expect(parsed?.presentation?.pendingAction).toBeUndefined();
+      expect(parsed?.presentation?.agentActive).toBe(true);
+    }
+  });
+
   test("core runtime fields stay strict; presentation leniency does not loosen them", () => {
     expect(parseRuntimesResponse({ runtimes: [runtime({ status: "busy" })] })).toBeNull();
     expect(parseRuntimeInfo(runtime({ cols: "80" }))).toBeNull();

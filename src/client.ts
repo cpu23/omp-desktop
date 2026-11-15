@@ -6,6 +6,7 @@ import {
 } from "./sidebar";
 import { showWorkspaceFolder } from "./workspace-picker";
 import { doneIndicator, workingIndicator } from "./working-indicator";
+import { wireSessionHover } from "./session-hover";
 import { CompletionTracker } from "./completion-tracker";
 import { CompletionNotifications } from "./notifications";
 import { Terminal } from "@xterm/xterm";
@@ -47,7 +48,6 @@ const statusEl = document.getElementById("status") as HTMLElement;
 const buildEl = document.getElementById("build") as HTMLElement;
 const spaceTabsEl = document.getElementById("space-tabs") as HTMLElement;
 const newSpaceEl = document.getElementById("new-space") as HTMLButtonElement;
-const splitLayoutEl = document.getElementById("split-layout") as HTMLButtonElement;
 const panesEl = document.getElementById("panes") as HTMLElement;
 const sessionListEl = document.getElementById("session-list") as HTMLElement;
 const searchEl = document.getElementById("search") as HTMLInputElement;
@@ -212,13 +212,14 @@ const SESSION_ICONS = {
   archive: '<path d="M3 3h18v5H3zM5 8v13h14V8M10 12h4"/>',
   save: '<path d="m5 12 4 4L19 6"/>',
   cancel: '<path d="m6 6 12 12M6 18 18 6"/>',
+  folder: '<path d="M3 7V5h6l2 2h10v3M3 10h19l-3 10H2L3 10Z"/>',
 };
 function iconButton(label: string, icon: keyof typeof SESSION_ICONS): HTMLButtonElement {
   const button = document.createElement("button");
   button.type = "button";
   button.title = label;
   button.setAttribute("aria-label", label);
-  button.innerHTML = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">${SESSION_ICONS[icon]}</svg>`;
+  button.innerHTML = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${SESSION_ICONS[icon]}</svg>`;
   return button;
 }
 
@@ -356,20 +357,19 @@ function showWorkspaceMenu(cwd: string, anchor: HTMLButtonElement): void {
   workspaceMenuAnchor = anchor;
   anchor.setAttribute("aria-expanded", "true");
   workspaceMenu.setAttribute("aria-label", `Workspace actions for ${cwd}`);
-  const item = (label: string, action: () => void): void => {
-    const button = document.createElement("button");
-    button.type = "button";
+  const item = (label: string, icon: keyof typeof SESSION_ICONS, action: () => void): void => {
+    const button = iconButton(label, icon);
     button.setAttribute("role", "menuitem");
-    button.textContent = label;
+    button.append(document.createTextNode(label));
     button.addEventListener("click", action);
     workspaceMenu.append(button);
   };
-  item("Archive workspace", () => {
+  item("Archive workspace", "archive", () => {
     closeWorkspaceMenu();
     archiveSidebarWorkspace(cwd);
     document.querySelector<HTMLButtonElement>("#add-workspace")?.focus();
   });
-  item("Show folder", () => {
+  item("Show folder", "folder", () => {
     closeWorkspaceMenu(true);
     void showWorkspaceFolder(cwd).catch((error: unknown) => {
       const detail = error instanceof Error ? error.message : String(error);
@@ -1992,10 +1992,6 @@ splitMenuItem.addEventListener("click", () => {
   splitLayout();
   focusedPane()?.focus();
 });
-splitLayoutEl.addEventListener("click", () => {
-  splitLayout();
-  focusedPane()?.focus();
-});
 panesEl.addEventListener("contextmenu", (event) => {
   const target = event.target instanceof Element ? event.target.closest<HTMLElement>(".pane") : null;
   const pane = target?.dataset.pane ? panes.get(target.dataset.pane) : null;
@@ -2003,7 +1999,8 @@ panesEl.addEventListener("contextmenu", (event) => {
   event.preventDefault();
   pane.focus();
   const count = leaves().length;
-  splitMenuItem.textContent = "Split";
+  splitMenuItem.innerHTML = splitLayoutIcon(count);
+  splitMenuItem.append(document.createTextNode("Split"));
   splitMenuItem.disabled = count >= MAX_PANES;
   paneMenu.hidden = false;
   const rect = paneMenu.getBoundingClientRect();
@@ -2231,17 +2228,17 @@ function renderSpaceTabs(): void {
     tab.dataset.space = id;
     tab.type = "button";
     tab.setAttribute("role", "tab");
-    tab.textContent = `Space ${++index}`;
+    tab.textContent = `Tab ${++index}`;
     tab.setAttribute("aria-selected", String(id === activeSpaceId));
     tab.tabIndex = id === activeSpaceId ? 0 : -1;
-    tab.title = "Drag to reorder spaces";
+    tab.title = "Drag to reorder tabs";
     tab.addEventListener("click", () => switchSpace(id));
     const close = document.createElement("button");
     close.className = "space-close";
     close.type = "button";
     close.textContent = "×";
-    close.title = `Close Space ${index} (sessions keep running)`;
-    close.setAttribute("aria-label", `Close Space ${index}`);
+    close.title = `Close Tab ${index} (sessions keep running)`;
+    close.setAttribute("aria-label", `Close Tab ${index}`);
     close.addEventListener("click", () => closeSpace(id));
     group.append(tab, close);
     spaceTabsEl.append(group);
@@ -2438,13 +2435,12 @@ function togglePaneFocus(): void {
   pane.focus();
 }
 
+function splitLayoutIcon(count: number): string {
+  return `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M12 3v18${count === 1 ? "" : "M3 12h18"}"/></svg>`;
+}
+
 function renderLayout(preservePaneFocus = false): void {
   closePaneMenu();
-  const count = leaves().length;
-  splitLayoutEl.disabled = count >= MAX_PANES;
-  splitLayoutEl.title = count >= MAX_PANES ? "Maximum 4 panes" : count === 1 ? "Split into 2×1" : "Split into 2×2";
-  splitLayoutEl.setAttribute("aria-label", splitLayoutEl.title);
-  splitLayoutEl.innerHTML = `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M12 3v18${count === 1 ? "" : "M3 12h18"}"/></svg>`;
   if (!preservePaneFocus) expandedPaneId = null;
   const tree: LayoutNode = expandedPaneId ? { kind: "leaf", pane: expandedPaneId } : layout.tree;
   const ids = leaves(tree);
@@ -2608,6 +2604,12 @@ function createSidebarRow(kind: "runtime" | "session"): SidebarRowRecord {
     actions.append(record.pin);
   }
   element.append(name, sub, actions);
+  wireSessionHover(element, () => ({
+    title: record.snapshot?.title || (record.runtime ? displayTitle(record.runtime) : "New session"),
+    directory: record.snapshot?.cwd || record.runtime?.cwd || "",
+    lastActivity: record.snapshot?.updatedAt ?? record.runtime?.lastActivity ?? record.runtime?.startedAt ?? null,
+    costUsd: record.snapshot?.costUsd ?? null,
+  }));
   element.addEventListener("contextmenu", (event) => {
     event.preventDefault();
     showSessionMenu(record, event.clientX, event.clientY);
@@ -2635,7 +2637,7 @@ function createSidebarRow(kind: "runtime" | "session"): SidebarRowRecord {
 function updateSidebarRowName(
   record: SidebarRowRecord,
   title: string,
-  indicator: "working" | "done" | "none",
+  indicator: "attention" | "working" | "done" | "none",
 ): void {
   const key = `${indicator}\u0000${title}`;
   if (record.nameKey === key) return;
@@ -2650,6 +2652,13 @@ function updateSidebarRowName(
   label.textContent = title;
   record.name.append(label);
   if (indicator === "done") record.name.append(doneIndicator());
+  if (indicator === "attention") {
+    const attention = document.createElement("span");
+    attention.className = "row-attention";
+    attention.setAttribute("role", "img");
+    attention.setAttribute("aria-label", "Needs attention");
+    record.name.append(attention);
+  }
 }
 
 function updateSidebarRowSub(record: SidebarRowRecord, key: string, text: string): void {
@@ -2681,17 +2690,18 @@ function updateRuntimeSidebarRow(
   if (record.element.dataset.cwd !== workspace) record.element.dataset.cwd = workspace;
   const state = !daemonUp ? "Connection unavailable" : !attachable(runtime) ? "Saved · loads on request"
     : runtime.status === "starting" ? "Starting"
+    : runtime.presentation?.pendingAction ? "Needs attention"
     : runtime.presentation?.agentActive ? "Working" : runtime.alive ? "Running" : "Starting";
   record.element.dataset.state = state;
-  const rowTitle = `${title}\n${state}\n${cwd}\n${runtime.sessionFile ?? "(session file not known yet)"}`;
-  if (record.element.title !== rowTitle) record.element.title = rowTitle;
   const accent = runtimeAccent(runtime);
   if (record.element.style.getPropertyValue("--row-accent") !== accent) {
     record.element.style.setProperty("--row-accent", accent);
   }
   const presentation = runtime.presentation;
   const indicator = daemonUp && runtime.status !== "starting" && runtime.alive && presentation
-    ? presentation.agentActive
+    ? presentation.pendingAction
+      ? "attention"
+      : presentation.agentActive
       ? "working"
       : presentation.completion &&
           acknowledgedCompletions.get(runtime.id) !== presentation.completion.identity
@@ -2719,8 +2729,6 @@ function updateRecentSidebarRow(
   const workspace = normalizeDirectoryPath(session.cwd) ?? session.cwd;
   if (record.element.dataset.cwd !== workspace) record.element.dataset.cwd = workspace;
   record.element.dataset.state = "Saved";
-  const rowTitle = `${session.title}\nSaved · loads on request\n${session.cwd}\n${session.path}`;
-  if (record.element.title !== rowTitle) record.element.title = rowTitle;
   const title = workspaceView && (!session.title || session.title === session.cwd) ? "New session" : session.title || session.cwd;
   updateSidebarRowName(record, title, "none");
   const cwd = workspaceView ? "" : session.cwd.replace(/^\/home\/[^/]+/, "~") || "/";
@@ -2816,6 +2824,7 @@ function folderRecord(cwd: string): SidebarFolderRecord {
 
 function updateFolder(record: SidebarFolderRecord, cwd: string): void {
   const expanded = sidebarFolderExpanded(cwd);
+  if (!expanded) record.showAllSessions = false;
   const marker = expanded
     ? '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M3 8V5h6l2 2h10v3M3 10h19l-3 10H2L3 10Z"/></svg>'
     : '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M3 7V5h6l2 2h10v13H3V7Z"/></svg>';

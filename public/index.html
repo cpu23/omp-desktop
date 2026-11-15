@@ -8,7 +8,7 @@
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
-    <!-- Space tabs sit above the pane workspace. #status remains in the sidebar
+    <!-- Tabs sit above the pane workspace. #status remains in the sidebar
          so connection failures stay visible, and #build stays in the DOM (hidden)
          for the client's bundle-reload check. The resizer is wired by
          src/sidebar.ts; motion settings are wired by src/working-indicator.ts;
@@ -193,10 +193,9 @@
         title="Drag to resize · double-click to reset"
       ></div>
       <section id="workspace">
-        <nav class="space-bar" aria-label="Browser spaces">
-          <div id="space-tabs" role="tablist" aria-label="Spaces"></div>
-          <button id="new-space" type="button" title="New space" aria-label="New space">+</button>
-          <button id="split-layout" class="sidebar-toggle" type="button" title="Split into 2×1" aria-label="Split into 2×1"></button>
+        <nav class="space-bar" aria-label="Browser tabs">
+          <div id="space-tabs" role="tablist" aria-label="Tabs"></div>
+          <button id="new-space" type="button" title="New tab" aria-label="New tab">+</button>
         </nav>
         <main id="panes"></main>
       </section>

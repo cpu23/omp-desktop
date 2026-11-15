@@ -74,15 +74,16 @@ the shell defaults `WEBKIT_FORCE_DMABUF_RENDERER=1` unless a conflicting WebKit 
 Explicit nonempty environment values are respected; set `WEBKIT_FORCE_DMABUF_RENDERER=0` to disable the default
 for diagnosis. The shell does not automatically relaunch with another backend or renderer after graphics failure.
 
-## Sessions, spaces and panes
+## Sessions, tabs and panes
 
-Create spaces with **+** in the top bar. Each space has its own layout (up to four panes); drag a pane header or
-a sidebar session onto another space's tab to move/open it there. Right-click a pane and choose **Split**, or use
-the top-right split button: 1×1 becomes side-by-side, then 2×2. The button previews the next layout and disables at
-four panes. Panes meet at a single 1px separator with no gutter or duplicate borders;
-drag on or just beside the separator to resize. In a 2×2 grid, closing one pane leaves an empty
-slot; closing another occupied pane collapses the grid. New-session controls and newly split panes
-start regular live OMP terminals immediately, without a first message. Clicking a saved sidebar session opens its read-only history.
+Create tabs with **+** in the top bar. The tab bar is compact, and the **+** button's background appears only on hover
+or keyboard focus. Each tab has its own layout (up to four panes); drag a pane header or a sidebar session onto another
+tab to move/open it there. Right-click a pane and choose **Split**, or press **Ctrl+Shift+E** (macOS browser: **⌘⇧E**)
+to cycle layouts: 1×1 becomes side-by-side, then 2×2. The **Split** menu item is disabled when four panes are open.
+Panes meet at a single 1px separator with no gutter or duplicate borders; drag on or just beside the separator to
+resize. In a 2×2 grid, closing one pane leaves an empty slot; closing another occupied pane collapses the grid.
+New-session controls and newly split panes start regular live OMP terminals immediately, without a first message.
+Clicking a saved sidebar session opens its read-only history.
 
 The sidebar's magnifying-glass button opens search over its heading row, with the search icon on the left and
 a close button on the right. Close it with **×** or **Escape** to clear the filter and restore the full list.
@@ -107,7 +108,7 @@ The 10-second diagnostic changes the status text only; it never unlocks an unini
 Desktop sets `PI_TUI_NATIVE=0` because xterm does not implement Tern Surface Protocol. This avoids the unsupported
 native-rendering fallback race without disabling native-shell GPU acceleration.
 
-Closing a pane or space only detaches its view; execution continues. For live runtimes, the daemon keeps a
+Closing a pane or tab only detaches its view; execution continues. For live runtimes, the daemon keeps a
 terminal-state mirror and restores its screen,
 scrolling margins (DECSTBM) and cursor visibility when a pane reconnects, along with up to 20,000 history rows and
 retained inline images. Replay follows the producer's resize history instead of parsing a truncated raw-output tail
@@ -153,9 +154,9 @@ as well as ledger writes.
 Bun's frozen-lockfile install applies the checked-in `bun-pty@0.4.11` patch automatically. It releases native
 PTY handles after genuine exits, preserving final output without synthesizing a second exit event.
 
-Spaces, focus and pane layouts are stored in the browser profile and mirrored in the daemon's workspace state.
+Tabs, focus and pane layouts are stored in the browser profile and mirrored in the daemon's workspace state.
 Browser and native profiles do not share local settings, but the daemon workspace mirror can restore layout,
-pins and settings if webview storage is lost. The live-process limit is shared across spaces (default 16).
+pins and settings if webview storage is lost. The live-process limit is shared across tabs (default 16).
 The client bundle and stylesheet are built at daemon startup; restart the daemon to apply changes, which also
 ends its PTY children. Only ledgered live sessions resume on its next start; unloaded conversations remain cold.
 Production assets are minified, gzip-compressed and cache-validated; fingerprinted URLs are immutable, while HTML
@@ -228,7 +229,7 @@ Cancel leaves the list unchanged; choosing the same directory again selects the 
 Added workspaces remain visible even without sessions. Selection and collapsed groups persist across reloads
 and are included in the daemon's durable sidebar mirror.
 Workspaces show six sessions initially; when a seventh exists, **Show more (N)** reveals the remaining sessions
-in that workspace and focuses the first newly revealed row. Reloading returns to the six-row default.
+in that workspace and focuses the first newly revealed row. It resets when the workspace is collapsed or the app is reloaded.
 Search shows every matching session without applying this six-row cutoff.
 
 Hover a workspace heading (or focus it with the keyboard) to reveal **+** and start a session in that directory.
@@ -254,7 +255,7 @@ match the sidebar controls; they appear on hover or keyboard focus. Pinning upda
 closing a pane only detaches its view and does not stop the session.
 
 Settings separates **Appearance**, **Notifications**, **Sessions**, and **Keyboard shortcuts**. Shortcut editors
-are grouped into Panes, Spaces, and Terminal text; expand a group to edit its bindings, then save.
+are grouped into Panes, Tabs, and Terminal text; expand a group to edit its bindings, then save.
 
 The sidebar supports search, pins and opt-in completion notifications. Working/completion indicators and
 per-session accents come from the optional extension, not terminal output. Notifications default to off,
@@ -274,7 +275,7 @@ file replacement invalidate the accumulated total; this assumes OMP's append-onl
 Externally rewriting interior bytes while also growing a file is not guaranteed to invalidate an incremental total.
 Concurrent listings share indexing work, and responses are capped at 200 rows without narrowing search coverage.
 
-Set a custom **Session limit** in Settings. The limit is shared by all windows and spaces and is saved by the
+Set a custom **Session limit** in Settings. The limit is shared by all windows and tabs and is saved by the
 daemon, not just the browser profile. A saved change that differs from the running limit shows **Restart now**;
 restart when current work has finished. Restarting interrupts running work and loses unsaved input, then resumes
 ledgered live sessions from their transcripts. Reverting the setting to the running value removes the restart prompt.
@@ -288,7 +289,7 @@ Default shortcuts:
 
 | Action | Keys |
 | --- | --- |
-| Select space 1–9 | `Alt+1` through `Alt+9` |
+| Select tab 1–9 | `Alt+1` through `Alt+9` |
 | Increase font | `Ctrl+=`, `Ctrl+Plus`, `Meta+=`, `Meta+Plus` |
 | Decrease font | `Ctrl+-`, `Ctrl+Shift+Minus`, `Meta+-`, `Meta+Shift+Minus` |
 | Reset font | `Ctrl+0`, `Meta+0` |
@@ -301,12 +302,12 @@ for alternative bindings (for example, `Ctrl+K, Ctrl+1`). The first press must i
 sequences time out after one second. Bindings are stored in the local browser/app profile.
 
 App shortcuts work in both live terminals and saved-session draft composers. Alt+1–9 follows the current
-left-to-right tab order after closing or reordering spaces. Settings, search and title editors retain normal editing keys.
+left-to-right tab order after closing or reordering tabs. Settings, search and title editors retain normal editing keys.
 
 Toggle pane focus expands the selected terminal to fill the workspace; press the same shortcut again to restore
 the split layout and its divider ratios. Other sessions keep running with their existing processes. This
-temporary presentation does not change the saved layout; switching spaces, changing the layout, or reloading
-returns to the split view. A single-pane space is unchanged by the toggle.
+temporary presentation does not change the saved layout; switching tabs, changing the layout, or reloading
+returns to the split view. A single-pane tab is unchanged by the toggle.
 
 ## Configuration
 
@@ -316,7 +317,7 @@ All variables are optional. Defaults below assume a single-user machine.
 | --- | --- | --- |
 | `OMP_DESKTOP_HOST` | `127.0.0.1` | Daemon listen address; keep it on loopback because the API has no authentication. |
 | `OMP_DESKTOP_PORT` | `4180` | Daemon and native-shell port. |
-| `OMP_DESKTOP_MAX_RUNTIMES` | `16` | Initial process limit across all spaces; a custom limit saved in Settings takes precedence. |
+| `OMP_DESKTOP_MAX_RUNTIMES` | `16` | Initial process limit across all tabs; a custom limit saved in Settings takes precedence. |
 | `OMP_DESKTOP_IDLE_TIMEOUT_MINUTES` | `60` | Idle-unload grace period; nonnegative whole minutes, `0` disables. A custom idle timeout saved in Settings takes precedence and applies without restart. |
 | `OMP_DESKTOP_REPLAY_ROWS_PER_RUNTIME` | `20000` | Per-runtime scrollback ceiling, subject to the shared cell budget. |
 | `OMP_DESKTOP_REPLAY_CELLS_TOTAL` | `33554432` | Aggregate terminal cells, including both visible buffers and granted scrollback. |
